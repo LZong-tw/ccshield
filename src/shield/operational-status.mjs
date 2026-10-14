@@ -1,6 +1,7 @@
 import { readShieldAssetsProvision, readShieldIdentity, readShieldPolicyState, shieldPaths } from "./paths.mjs";
 import { ensureShieldReady, inspectShieldService } from "./service.mjs";
 import { shieldLauncherDescriptors } from "./launchers.mjs";
+import { readEnv } from "../compat-env.mjs";
 
 const LANES = Object.freeze(["subscription", "managed"]);
 const HEALTH = new Set(["healthy", "unavailable"]);
@@ -30,7 +31,7 @@ export async function readShieldOperationalStatus({
     return readLaneStatus({ lane, audit: auditState, paths, inspectService, readIdentity, readPolicy, readAssets, ensureReady });
   }));
   const descriptors = safeLauncherDescriptors(launcherDescriptors({
-    subscriptionShield: env?.AIRKIT_SHIELD_SUBSCRIPTION === "1",
+    subscriptionShield: readEnv(env ?? {}, "CCSHIELD_SUBSCRIPTION") === "1",
   }));
   return {
     state: lanes.some((lane) => lane.state === "protected") ? "protected" : "unavailable",

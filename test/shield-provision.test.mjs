@@ -8,13 +8,13 @@ import test from "node:test";
 import { provisionShieldAssets } from "../src/shield/provision.mjs";
 import { assertShieldAssetsProvision, readShieldAssetsProvision, shieldPaths } from "../src/shield/paths.mjs";
 
-const policyPath = "/opt/airkit/policy.json";
-const gitleaksPath = "/opt/airkit/gitleaks";
-const gitleaksRulesPath = "/opt/airkit/gitleaks-rules.toml";
-const privacyPath = "/opt/airkit/privacy-filter.json";
-const workerPath = "/opt/airkit/privacy-worker";
-const adapterPath = "/opt/airkit/opf-adapter.mjs";
-const tokenizerPath = "/opt/airkit/tiktoken-cache/fb374d419588a4632f3f557e76b4b70aebbca790";
+const policyPath = "/opt/ccshield/policy.json";
+const gitleaksPath = "/opt/ccshield/gitleaks";
+const gitleaksRulesPath = "/opt/ccshield/gitleaks-rules.toml";
+const privacyPath = "/opt/ccshield/privacy-filter.json";
+const workerPath = "/opt/ccshield/privacy-worker";
+const adapterPath = "/opt/ccshield/opf-adapter.mjs";
+const tokenizerPath = "/opt/ccshield/tiktoken-cache/fb374d419588a4632f3f557e76b4b70aebbca790";
 const bytes = {
   [policyPath]: Buffer.from(JSON.stringify({ manifest: { version: "policy-1" } })),
   [gitleaksPath]: Buffer.from("gitleaks fixture"),
@@ -91,7 +91,7 @@ test("asset provision rejects unsafe, drifted, or protocol-invalid preinstalled 
 });
 
 test("explicit write stores a private canonical asset provision record", async () => {
-  const homeDir = await mkdtemp(join(tmpdir(), "airkit-shield-provision-"));
+  const homeDir = await mkdtemp(join(tmpdir(), "ccshield-provision-"));
   const paths = shieldPaths({ homeDir, uid: process.getuid?.() });
   try {
     const written = await provisionShieldAssets({
@@ -113,7 +113,7 @@ test("explicit write stores a private canonical asset provision record", async (
 });
 
 test("OPF provision pins its model, source, helper, tokenizer and worker arguments", async () => {
-  const homeDir = await realpath(await mkdtemp(join(tmpdir(), "airkit-shield-checkpoint-")));
+  const homeDir = await realpath(await mkdtemp(join(tmpdir(), "ccshield-checkpoint-")));
   const checkpointPath = join(homeDir, "model");
   const sourcePath = join(homeDir, "source");
   const checkpointSha256 = createHash("sha256")
@@ -130,7 +130,7 @@ test("OPF provision pins its model, source, helper, tokenizer and worker argumen
   const privacyManifest = {
     ...JSON.parse(bytes[privacyPath]), checkpoint, source, adapter, tokenizer,
     worker: { ...JSON.parse(bytes[privacyPath]).worker, args: [
-      "--python", "/opt/airkit/python", "--checkpoint", checkpoint.path,
+      "--python", "/opt/ccshield/python", "--checkpoint", checkpoint.path,
       "--checkpoint-sha256", checkpoint.sha256, "--checkpoint-version", checkpoint.version,
       "--opf-source", source.path, "--opf-source-sha256", source.sha256,
       "--adapter-sha256", adapter.sha256,

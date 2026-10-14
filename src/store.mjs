@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmodSync, closeSync, constants, mkdirSync, openSync } from "node:fs";
+import { chmodSync, closeSync, constants, existsSync, mkdirSync, openSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { decryptValue, encryptValue } from "./crypto.mjs";
@@ -200,6 +200,23 @@ export function openShieldStore({
   // Run retention at open so a daemon restart alone is enough to enforce it.
   store.purgeExpiredEvidence();
   return Object.freeze(store);
+}
+
+// Health for `doctor`: read-only, needs no key, never creates or migrates.
+export function inspectShieldStore({ databasePath, migrations = SHIELD_MIGRATIONS, Database = LazyDatabaseSync } = {}) {
+  if (typeof databasePath !== "string" || !existsSync(databasePath)) return Object.freeze({ state: "missing" });
+  let db;
+  try {
+    db = new Database(databasePath, { readOnly: true });
+    db.exec("PRAGMA busy_timeout = 2000");
+    assertReadable(db);
+    verifyLedger(db, migrations);
+    return Object.freeze({ state: "healthy" });
+  } catch (error) {
+    return Object.freeze({ state: "unavailable", code: error?.code ?? "CCSHIELD_STORE_ERROR" });
+  } finally {
+    db?.close();
+  }
 }
 
 function queryTable(db, table, { sessionId, action, requestId, since, limit }) {

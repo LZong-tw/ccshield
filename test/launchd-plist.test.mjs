@@ -6,7 +6,7 @@ const plist = (...args) => `<?xml version="1.0"?>
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.airkit.shield</string>
+  <string>com.ccshield</string>
   <key>ProgramArguments</key>
   <array>
     ${args.map((arg) => `<string>${arg}</string>`).join("\n    ")}
@@ -17,9 +17,9 @@ const plist = (...args) => `<?xml version="1.0"?>
 test("plist drift names the program path that differs", () => {
   const message = describePlistDrift(
     plist("/usr/bin/node", "/repo/oss/src/shieldd.mjs"),
-    plist("/usr/bin/node", "/pkg/node_modules/airkit/src/shieldd.mjs"),
+    plist("/usr/bin/node", "/pkg/node_modules/@untionglim/shield/src/shieldd.mjs"),
   );
-  assert.equal(message, 'installed job runs "/repo/oss/src/shieldd.mjs", this runtime expects "/pkg/node_modules/airkit/src/shieldd.mjs"');
+  assert.equal(message, 'installed job runs "/repo/oss/src/shieldd.mjs", this runtime expects "/pkg/node_modules/@untionglim/shield/src/shieldd.mjs"');
 });
 
 test("plist drift decodes escaped arguments and reports missing ones", () => {

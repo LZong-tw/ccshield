@@ -4,8 +4,8 @@ import test from "node:test";
 
 import { createGitleaksScanner } from "../src/shield/gitleaks.mjs";
 
-const executable = "/opt/airkit/gitleaks";
-const rulesPath = "/opt/airkit/gitleaks-rules.toml";
+const executable = "/opt/ccshield/gitleaks";
+const rulesPath = "/opt/ccshield/gitleaks-rules.toml";
 const executableBytes = Buffer.from("gitleaks executable fixture");
 const rulesBytes = Buffer.from("[rules]\nfixture = true\n");
 const privateKey = "-----BEGIN PRIVATE KEY-----\\nfixture-secret-must-not-escape\\n-----END PRIVATE KEY-----";

@@ -1,3 +1,8 @@
+import { AIRKIT_LAUNCHER_ENDPOINT_ENV, readEnv } from "../compat-env.mjs";
+
+// AirKit's launcher catalog (airclaude, cclaude-*, Headroom wrappers). Kept so AirKit can
+// call these helpers through the package API.
+// TODO(P5): let AirKit pass its catalog in instead of hard-coding it here.
 const PROTECTED_LAUNCHERS = Object.freeze([
   Object.freeze({
     matches: (value) => value === "airclaude",
@@ -43,12 +48,12 @@ const DECLARED_BYPASSES = Object.freeze({
 const HEADROOM_LAUNCHER_MARKERS = Object.freeze({
   "headroom/hr-airclaude/v1": Object.freeze({
     launcher: "hr-airclaude",
-    endpointEnv: "AIRCLAUDE_PROVIDER_BASE_URL",
+    endpointEnv: AIRKIT_LAUNCHER_ENDPOINT_ENV.provider,
     path: "/v1/chat/completions",
   }),
   "headroom/hr-claude-web/v1": Object.freeze({
     launcher: "hr-claude-web",
-    endpointEnv: "AIRCLAUDE_ANTHROPIC_PROVIDER_BASE_URL",
+    endpointEnv: AIRKIT_LAUNCHER_ENDPOINT_ENV.anthropicProvider,
     path: "/v1/messages",
   }),
 });
@@ -59,7 +64,7 @@ const HEADROOM_LAUNCHER_MARKERS = Object.freeze({
 // markers fail closed instead of silently misreporting the launcher identity.
 export function resolveShieldLauncherMarker(env = {}) {
   if (!env || typeof env !== "object" || Array.isArray(env)) throw new TypeError("shield launcher environment is invalid");
-  const marker = env.AIRKIT_SHIELD_LAUNCHER;
+  const marker = readEnv(env, "CCSHIELD_LAUNCHER");
   if (marker === undefined) return "airclaude";
   const contract = HEADROOM_LAUNCHER_MARKERS[marker];
   if (!contract) throw new Error("shield launcher marker is invalid");
@@ -71,7 +76,7 @@ export function resolveShieldLauncherMarker(env = {}) {
 }
 
 function hasUnexpectedHeadroomOverride(env, expectedEnv) {
-  return ["AIRCLAUDE_PROVIDER_BASE_URL", "AIRCLAUDE_ANTHROPIC_PROVIDER_BASE_URL"]
+  return Object.values(AIRKIT_LAUNCHER_ENDPOINT_ENV)
     .some((key) => key !== expectedEnv && env[key] !== undefined && env[key] !== "");
 }
 

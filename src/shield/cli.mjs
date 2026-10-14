@@ -36,7 +36,7 @@ export async function runShieldCli(argv = [], dependencies = {}) {
   }
   const shield = dependencies.shield ?? await createDefaultShieldDependencies(dependencies);
   const handler = SHIELD_COMMANDS[command];
-  if (!handler) throw new Error(`unknown shield command: ${argv.join(" ") || "(none)"}`);
+  if (!handler) throw new Error(`unknown ccshield command: ${argv.join(" ") || "(none)"}`);
   const result = await handler(rest, shield);
   stdout.write(renderShieldResult(command, result));
   if (Number.isInteger(result?.exitCode)) return result.exitCode;
@@ -45,12 +45,12 @@ export async function runShieldCli(argv = [], dependencies = {}) {
 
 const SHIELD_COMMANDS = Object.freeze({
   install: (argv, shield) => shield.install(parseInstall(argv)),
-  uninstall: (argv, shield) => shield.uninstall(parseInstall(argv, "shield uninstall")),
-  start: (argv, shield) => shield.start(parseLaneCommand(argv, "shield start")),
-  stop: (argv, shield) => shield.stop(parseLaneCommand(argv, "shield stop")),
-  status: (argv, shield) => shield.status(parseLaneCommand(argv, "shield status")),
-  doctor: (argv, shield) => shield.doctor(parseLaneCommand(argv, "shield doctor")),
-  policy: (argv, shield) => argv[0] === "status" ? shield.policyStatus(parseLaneCommand(argv.slice(1), "shield policy status")) : shield.policyInstall(parsePolicyInstall(argv)),
+  uninstall: (argv, shield) => shield.uninstall(parseInstall(argv, "ccshield uninstall")),
+  start: (argv, shield) => shield.start(parseLaneCommand(argv, "ccshield start")),
+  stop: (argv, shield) => shield.stop(parseLaneCommand(argv, "ccshield stop")),
+  status: (argv, shield) => shield.status(parseLaneCommand(argv, "ccshield status")),
+  doctor: (argv, shield) => shield.doctor(parseLaneCommand(argv, "ccshield doctor")),
+  policy: (argv, shield) => argv[0] === "status" ? shield.policyStatus(parseLaneCommand(argv.slice(1), "ccshield policy status")) : shield.policyInstall(parsePolicyInstall(argv)),
   privacy: (argv, shield) => shield.privacyProvision(parsePrivacyProvision(argv)),
   launch: (argv, shield) => {
     const launch = parseLaunch(argv);
@@ -72,7 +72,11 @@ async function createDefaultShieldDependencies(dependencies) {
   const ensureReady = dependencies.ensureShieldReady ?? ensureShieldReady;
   const readOperational = dependencies.readShieldOperationalStatus ?? readShieldOperationalStatus;
   const readStatus = dependencies.shieldStatus ?? shieldStatus;
-  const readAuditHealth = dependencies.readAuditHealth ?? (async () => (await import("../audit/cli.mjs")).readAuditHealth({ env }));
+  const readAuditHealth = dependencies.readAuditHealth ?? (async ({ paths: lanePaths }) => {
+    const { inspectShieldStore } = await import("../store.mjs");
+    return inspectShieldStore({ databasePath: lanePaths.auditDatabasePath }).state === "healthy" ? "healthy" : "unavailable";
+  });
+  const inspectKey = dependencies.inspectMasterKey ?? (async () => (await import("../keys.mjs")).inspectMasterKey({ env }));
   const createLease = dependencies.createShieldDestinationLease ?? createShieldDestinationLease;
   const renewLease = dependencies.renewShieldDestinationLease ?? renewShieldDestinationLease;
   const revokeLease = dependencies.revokeShieldDestinationLease ?? revokeShieldDestinationLease;
@@ -122,10 +126,18 @@ async function createDefaultShieldDependencies(dependencies) {
       return await shieldStatus({ paths: shieldPaths({ env, lane }), io: dependencies.io, runLaunchctl: dependencies.runLaunchctl });
     },
     async doctor({ lane }) {
-      const status = await readStatus({ paths: shieldPaths({ env, lane }), io: dependencies.io, runLaunchctl: dependencies.runLaunchctl });
-      const operational = await readOperational({ env, audit: await readAuditHealth() });
+      const lanePaths = shieldPaths({ env, lane });
+      const status = await readStatus({ paths: lanePaths, io: dependencies.io, runLaunchctl: dependencies.runLaunchctl });
+      const operational = await readOperational({ env, audit: await readAuditHealth({ paths: lanePaths }) });
       const selected = operational.lanes?.find((entry) => entry.lane === lane);
-      return { ...status, state: status.state === "healthy" && selected?.state !== "protected" ? "degraded" : status.state, operational, checked: true };
+      const key = await inspectKey();
+      return {
+        ...status,
+        state: status.state === "healthy" && selected?.state !== "protected" ? "degraded" : status.state,
+        operational,
+        masterKey: { source: key.source, ...(key.warning ? { warning: key.warning } : {}) },
+        checked: true,
+      };
     },
     async privacyProvision({ bundlePath, gitleaksPath, gitleaksRulesPath, policyBundlePath, lane = "subscription", write }) {
       const lanePaths = shieldPaths({ env, lane });
@@ -240,7 +252,7 @@ function parseLaunch(argv) {
   const pxpipe = beforeBoundary.includes("--pxpipe");
   const validTarget = targetIndex < 0 || (targetIndex + 1 < boundary && isLoopbackTarget(targetOrigin));
   if (laneIndex < 0 || !lane || boundary < 0 || boundary === argv.length - 1 || (lane !== "subscription" && lane !== "managed") || !validTarget || beforeBoundary.some((value) => !["--lane", lane, "--target", targetOrigin, "--pxpipe"].includes(value))) {
-    throw new Error("usage: shield launch --lane subscription|managed [--target http://127.0.0.1:port | --pxpipe] -- command [args...]");
+    throw new Error("usage: ccshield launch --lane subscription|managed [--target http://127.0.0.1:port | --pxpipe] -- command [args...]");
   }
   if (lane === "managed" && (targetOrigin || pxpipe)) throw new Error("managed Shield launch requires AirKit lease lifecycle");
   if (pxpipe && targetOrigin) throw new Error("shield launch accepts --target or --pxpipe, not both");
@@ -249,7 +261,7 @@ function parseLaunch(argv) {
 
 function isLoopbackTarget(value) { try { const url = new URL(value); return url.protocol === "http:" && url.hostname === "127.0.0.1" && Number.isInteger(Number(url.port)) && Number(url.port) > 0 && url.pathname === "/" && !url.search && !url.hash; } catch { return false; } }
 
-function parseInstall(argv, command = "shield install") {
+function parseInstall(argv, command = "ccshield install") {
   let write = false;
   let lane = null;
   for (let index = 0; index < argv.length; index += 1) {
@@ -268,7 +280,7 @@ function parseLaneCommand(argv, command) {
   throw new Error(`usage: ${command} [--lane subscription|managed]`);
 }
 
-const PRIVACY_PROVISION_USAGE = "usage: shield privacy provision --bundle /absolute/privacy-manifest --gitleaks /absolute/gitleaks --gitleaks-rules /absolute/gitleaks-rules.toml [--policy-bundle /absolute/policy-bundle] [--write]";
+const PRIVACY_PROVISION_USAGE = "usage: ccshield privacy provision --bundle /absolute/privacy-manifest --gitleaks /absolute/gitleaks --gitleaks-rules /absolute/gitleaks-rules.toml [--policy-bundle /absolute/policy-bundle] [--write]";
 
 function parsePrivacyProvision(argv) {
   if (argv[0] !== "provision") throw new Error(PRIVACY_PROVISION_USAGE);
@@ -289,7 +301,7 @@ function parsePrivacyProvision(argv) {
 }
 
 function parsePolicyInstall(argv) {
-  if (argv[0] !== "install") throw new Error("usage: shield policy install --bundle /absolute/policy-bundle --public-key /absolute/policy-public-key [--write]");
+  if (argv[0] !== "install") throw new Error("usage: ccshield policy install --bundle /absolute/policy-bundle --public-key /absolute/policy-public-key [--write]");
   const write = argv.includes("--write");
   const names = ["--bundle", "--public-key", "--lane"];
   const values = Object.fromEntries(names.map((name) => [name, null]));
@@ -297,17 +309,17 @@ function parsePolicyInstall(argv) {
     const token = argv[index];
     if (token === "--write") continue;
     if (!names.includes(token) || values[token] !== null || typeof argv[index + 1] !== "string" || argv[index + 1].startsWith("--")) {
-      throw new Error("usage: shield policy install --bundle /absolute/policy-bundle --public-key /absolute/policy-public-key [--write]");
+      throw new Error("usage: ccshield policy install --bundle /absolute/policy-bundle --public-key /absolute/policy-public-key [--write]");
     }
     values[token] = argv[index + 1];
     index += 1;
   }
-  if (!values["--bundle"] || !values["--public-key"] || (values["--lane"] !== null && !["subscription", "managed"].includes(values["--lane"]))) throw new Error("usage: shield policy install --bundle /absolute/policy-bundle --public-key /absolute/policy-public-key [--write]");
+  if (!values["--bundle"] || !values["--public-key"] || (values["--lane"] !== null && !["subscription", "managed"].includes(values["--lane"]))) throw new Error("usage: ccshield policy install --bundle /absolute/policy-bundle --public-key /absolute/policy-public-key [--write]");
   return { bundlePath: values["--bundle"], publicKeyPath: values["--public-key"], lane: values["--lane"] ?? "subscription", write };
 }
 
 function renderShieldHelp() {
-  return `Commands:\n  shield install [--lane subscription|managed] [--write]\n  shield uninstall [--lane subscription|managed] [--write]\n  shield start [--lane subscription|managed]\n  shield stop [--lane subscription|managed]\n  shield status [--lane subscription|managed]\n  shield doctor [--lane subscription|managed]\n  shield policy <status [--lane subscription|managed]|install --bundle /absolute/policy-bundle --public-key /absolute/policy-public-key [--lane subscription|managed] [--write]>\n  shield privacy provision --bundle /absolute/privacy-manifest --gitleaks /absolute/gitleaks --gitleaks-rules /absolute/gitleaks-rules.toml [--policy-bundle /absolute/policy-bundle] [--lane subscription|managed] [--write]\n  shield launch --lane subscription|managed [--target http://127.0.0.1:port] -- command [args...]\n`;
+  return `Commands:\n  ccshield install [--lane subscription|managed] [--write]\n  ccshield uninstall [--lane subscription|managed] [--write]\n  ccshield start [--lane subscription|managed]\n  ccshield stop [--lane subscription|managed]\n  ccshield status [--lane subscription|managed]\n  ccshield doctor [--lane subscription|managed]\n  ccshield policy <status [--lane subscription|managed]|install --bundle /absolute/policy-bundle --public-key /absolute/policy-public-key [--lane subscription|managed] [--write]>\n  ccshield privacy provision --bundle /absolute/privacy-manifest --gitleaks /absolute/gitleaks --gitleaks-rules /absolute/gitleaks-rules.toml [--policy-bundle /absolute/policy-bundle] [--lane subscription|managed] [--write]\n  ccshield launch --lane subscription|managed [--target http://127.0.0.1:port] -- command [args...]\n`;
 }
 
 function renderShieldResult(command, result = {}) {

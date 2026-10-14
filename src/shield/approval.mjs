@@ -97,7 +97,7 @@ function racePrompt({ prompt, signal, clock, timeoutMs }) {
 
 function formatPrompt({ destinationClass, reasonCodes }) {
   return [
-    "AirKit Shield: approval required",
+    "ccshield: approval required",
     `Reason: ${reasonCodes.join(", ")} → ${destinationClass}`,
     "Scope: this request only; no source content was stored",
     "Approve? [y/N] ",

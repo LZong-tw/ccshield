@@ -13,20 +13,20 @@ const sentinel = "privacy-raw-sentinel-must-not-escape";
 const provision = {
   privacy: {
     version: "privacy-1",
-    worker: { command: "/opt/airkit/privacy-worker", args: ["--stdio"], sha256: "a".repeat(64) },
+    worker: { command: "/opt/ccshield/privacy-worker", args: ["--stdio"], sha256: "a".repeat(64) },
   },
 };
 const opfProvision = {
   privacy: {
     ...provision.privacy,
-    checkpoint: { path: "/opt/airkit/model", sha256: "b".repeat(64), version: "opf-2026-09" },
-    source: { path: "/opt/airkit/opf-source", sha256: "c".repeat(64), version: "opf-source-1" },
-    adapter: { path: "/opt/airkit/opf-adapter.mjs", sha256: "d".repeat(64) },
-    tokenizer: { path: "/opt/airkit/tiktoken-cache/fb374d419588a4632f3f557e76b4b70aebbca790", sha256: "e".repeat(64), version: "o200k_base" },
+    checkpoint: { path: "/opt/ccshield/model", sha256: "b".repeat(64), version: "opf-2026-09" },
+    source: { path: "/opt/ccshield/opf-source", sha256: "c".repeat(64), version: "opf-source-1" },
+    adapter: { path: "/opt/ccshield/opf-adapter.mjs", sha256: "d".repeat(64) },
+    tokenizer: { path: "/opt/ccshield/tiktoken-cache/fb374d419588a4632f3f557e76b4b70aebbca790", sha256: "e".repeat(64), version: "o200k_base" },
   },
 };
 opfProvision.privacy.worker = { ...opfProvision.privacy.worker, args: [
-  "--python", "/opt/airkit/python", "--checkpoint", opfProvision.privacy.checkpoint.path,
+  "--python", "/opt/ccshield/python", "--checkpoint", opfProvision.privacy.checkpoint.path,
   "--checkpoint-sha256", opfProvision.privacy.checkpoint.sha256, "--checkpoint-version", opfProvision.privacy.checkpoint.version,
   "--opf-source", opfProvision.privacy.source.path, "--opf-source-sha256", opfProvision.privacy.source.sha256,
   "--adapter-sha256", opfProvision.privacy.adapter.sha256,
@@ -1064,7 +1064,7 @@ test("privacy startup can exceed the scan deadline without disabling scan fail-c
 });
 
 test("OPF worker runs through the current Node interpreter instead of its executable shebang", async (t) => {
-  const directory = await realpath(await mkdtemp(join(tmpdir(), "airkit-opf-interpreter-")));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "ccshield-opf-interpreter-")));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const workerPath = join(directory, "worker.mjs");
   await writeFile(workerPath, `#!/usr/bin/false\nprocess.stdin.on("data", (chunk) => {\n  const request = JSON.parse(String(chunk).trim());\n  process.stdout.write(JSON.stringify({ type: "health", id: request.id, protocol: request.protocol, version: "privacy-1" }) + "\\n");\n});\n`);
@@ -1086,7 +1086,7 @@ test("OPF worker runs through the current Node interpreter instead of its execut
 });
 
 test("checkpoint startup digest and per-scan metadata detect same-size inode replacement", async (t) => {
-  const directory = await realpath(await mkdtemp(join(tmpdir(), "airkit-privacy-attest-")));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "ccshield-privacy-attest-")));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const model = join(directory, "model.bin");
   const bytes = Buffer.from("synthetic-model");

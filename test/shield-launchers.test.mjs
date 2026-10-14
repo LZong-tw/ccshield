@@ -39,14 +39,14 @@ test("declared direct client bypasses are visible and undeclared helpers fail cl
 test("Headroom launcher markers require their exact loopback compatibility override", () => {
   assert.equal(
     resolveShieldLauncherMarker({
-      AIRKIT_SHIELD_LAUNCHER: "headroom/hr-airclaude/v1",
+      CCSHIELD_LAUNCHER: "headroom/hr-airclaude/v1",
       AIRCLAUDE_PROVIDER_BASE_URL: "http://127.0.0.1:8804/v1/chat/completions",
     }),
     "hr-airclaude",
   );
   assert.equal(
     resolveShieldLauncherMarker({
-      AIRKIT_SHIELD_LAUNCHER: "headroom/hr-claude-web/v1",
+      CCSHIELD_LAUNCHER: "headroom/hr-claude-web/v1",
       AIRCLAUDE_ANTHROPIC_PROVIDER_BASE_URL: "http://127.0.0.1:8807/v1/messages",
     }),
     "hr-claude-web",
@@ -55,10 +55,10 @@ test("Headroom launcher markers require their exact loopback compatibility overr
 
 test("spoofed or malformed Headroom launcher markers fail closed", () => {
   for (const env of [
-    { AIRKIT_SHIELD_LAUNCHER: "headroom/hr-airclaude/v1" },
-    { AIRKIT_SHIELD_LAUNCHER: "headroom/hr-airclaude/v1", AIRCLAUDE_PROVIDER_BASE_URL: "http://localhost:8804/v1/chat/completions" },
-    { AIRKIT_SHIELD_LAUNCHER: "headroom/hr-claude-web/v1", AIRCLAUDE_ANTHROPIC_PROVIDER_BASE_URL: "http://127.0.0.1:8807/v1/chat/completions" },
-    { AIRKIT_SHIELD_LAUNCHER: "headroom/hr-airclaude/v2", AIRCLAUDE_PROVIDER_BASE_URL: "http://127.0.0.1:8804/v1/chat/completions" },
+    { CCSHIELD_LAUNCHER: "headroom/hr-airclaude/v1" },
+    { CCSHIELD_LAUNCHER: "headroom/hr-airclaude/v1", AIRCLAUDE_PROVIDER_BASE_URL: "http://localhost:8804/v1/chat/completions" },
+    { CCSHIELD_LAUNCHER: "headroom/hr-claude-web/v1", AIRCLAUDE_ANTHROPIC_PROVIDER_BASE_URL: "http://127.0.0.1:8807/v1/chat/completions" },
+    { CCSHIELD_LAUNCHER: "headroom/hr-airclaude/v2", AIRCLAUDE_PROVIDER_BASE_URL: "http://127.0.0.1:8804/v1/chat/completions" },
   ]) {
     assert.throws(() => resolveShieldLauncherMarker(env), /shield launcher marker/i);
   }

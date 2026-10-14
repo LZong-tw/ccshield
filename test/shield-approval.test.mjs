@@ -78,7 +78,7 @@ test("expired grants cannot be consumed", async () => {
 });
 
 test("launcher-owned approval channel consumes a capability once and never exposes a grant", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "airkit-shield-approval-"));
+  const directory = await mkdtemp(join(tmpdir(), "ccshield-approval-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const broker = createApprovalBroker({
     tty: { interactive: true, write() {}, prompt: async () => "y" },
@@ -92,7 +92,7 @@ test("launcher-owned approval channel consumes a capability once and never expos
 });
 
 test("launcher-owned approval channel blocks headless and mismatched capabilities", async (t) => {
-  const directory = await mkdtemp(join(tmpdir(), "airkit-shield-approval-"));
+  const directory = await mkdtemp(join(tmpdir(), "ccshield-approval-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const channel = await createApprovalChannel({ broker: createApprovalBroker({ tty: null, clock: fixedClock() }), directory, capability: "c".repeat(32) });
   t.after(() => channel.close());

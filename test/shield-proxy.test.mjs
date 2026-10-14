@@ -877,7 +877,7 @@ test("proxy obtains one approval through the launcher-registered private channel
     request.resume();
     response.end('{"ok":true}');
   });
-  const directory = await mkdtemp(join(tmpdir(), "airkit-shield-approval-"));
+  const directory = await mkdtemp(join(tmpdir(), "ccshield-approval-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const channel = await createApprovalChannel({
     directory,
@@ -900,7 +900,7 @@ test("proxy obtains one approval through the launcher-registered private channel
 test("proxy blocks a client-spoofed approval socket even when it reports approval", async (t) => {
   let upstreamCalls = 0;
   const upstream = await startFixture(t, (_request, response) => { upstreamCalls += 1; response.end(); });
-  const directory = await mkdtemp(join(tmpdir(), "airkit-shield-approval-"));
+  const directory = await mkdtemp(join(tmpdir(), "ccshield-approval-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const channel = await createApprovalChannel({
     directory,

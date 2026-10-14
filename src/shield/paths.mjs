@@ -3,16 +3,18 @@ import { chmod, lstat, mkdir, open, readFile, rename, unlink } from "node:fs/pro
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
-const SHIELD_LABEL = "com.airkit.shield";
+import { readEnv } from "../compat-env.mjs";
+
+const SHIELD_LABEL = "com.ccshield";
 const defaultIo = { chmod, constants, lstat, mkdir, open, readFile, rename, unlink };
 const canonicalShieldPaths = new WeakSet();
 
-export function shieldPaths({ env = process.env, homeDir = homeFromEnv(env), uid = env.AIRKIT_GUI_UID ?? env.UID ?? process.getuid?.(), lane = "subscription", rootDir, configPath, identityPath, socketPath, launchAgentPath } = {}) {
+export function shieldPaths({ env = process.env, homeDir = homeFromEnv(env), uid = readEnv(env, "CCSHIELD_GUI_UID") ?? env.UID ?? process.getuid?.(), lane = "subscription", rootDir, configPath, identityPath, socketPath, launchAgentPath } = {}) {
   assertLane(lane);
   const home = absolutePath(homeDir, "homeDir");
-  const canonicalRoot = join(home, ".local", "state", "airkit-shield", lane);
-  const root = absolutePath(rootDir ?? env.AIRKIT_SHIELD_ROOT_DIR ?? canonicalRoot, "rootDir");
-  if (resolve(root) !== resolve(canonicalRoot)) throw new Error("rootDir must be the canonical AirKit Shield state directory");
+  const canonicalRoot = join(home, ".local", "share", "ccshield", lane);
+  const root = absolutePath(rootDir ?? readEnv(env, "CCSHIELD_ROOT_DIR") ?? canonicalRoot, "rootDir");
+  if (resolve(root) !== resolve(canonicalRoot)) throw new Error("rootDir must be the canonical ccshield state directory");
   const serviceLabel = `${SHIELD_LABEL}.${lane}`;
   const paths = {
     lane,
@@ -246,8 +248,8 @@ function assertWritablePaths(paths) {
   if (!canonicalShieldPaths.has(paths)) {
     throw new Error("shield paths must be a canonical object returned by shieldPaths");
   }
-  if ((paths.lane !== "subscription" && paths.lane !== "managed") || paths.serviceLabel !== `${SHIELD_LABEL}.${paths.lane}` || paths.configPath !== join(paths.rootDir, "config.json") || paths.identityPath !== join(paths.rootDir, "identity.json") || paths.policyStatePath !== join(paths.rootDir, "policy-state.json") || paths.policyBundlePath !== join(paths.rootDir, "policy-bundle.json") || paths.policyPublicKeyPath !== join(paths.rootDir, "policy-public.pem") || paths.assetsProvisionPath !== join(paths.rootDir, "assets-provision.json") || paths.socketPath !== join(paths.rootDir, "shield.sock")) {
-    throw new Error("shield paths must use the canonical AirKit Shield state layout");
+  if ((paths.lane !== "subscription" && paths.lane !== "managed") || paths.serviceLabel !== `${SHIELD_LABEL}.${paths.lane}` || paths.configPath !== join(paths.rootDir, "config.json") || paths.identityPath !== join(paths.rootDir, "identity.json") || paths.policyStatePath !== join(paths.rootDir, "policy-state.json") || paths.policyBundlePath !== join(paths.rootDir, "policy-bundle.json") || paths.policyPublicKeyPath !== join(paths.rootDir, "policy-public.pem") || paths.assetsProvisionPath !== join(paths.rootDir, "assets-provision.json") || paths.socketPath !== join(paths.rootDir, "shield.sock") || paths.auditDatabasePath !== join(paths.rootDir, "audit.sqlite")) {
+    throw new Error("shield paths must use the canonical ccshield state layout");
   }
 }
 
@@ -257,13 +259,13 @@ function assertLane(lane) {
 
 function assertCanonicalPolicyStatePath(paths) {
   if (!canonicalShieldPaths.has(paths) || paths.policyStatePath !== join(paths.rootDir, "policy-state.json")) {
-    throw new Error("shield policy state paths must use the canonical AirKit Shield state layout");
+    throw new Error("shield policy state paths must use the canonical ccshield state layout");
   }
 }
 
 function assertCanonicalAssetsProvisionPath(paths) {
   if (!canonicalShieldPaths.has(paths) || paths.assetsProvisionPath !== join(paths.rootDir, "assets-provision.json")) {
-    throw new Error("shield asset provision paths must use the canonical AirKit Shield state layout");
+    throw new Error("shield asset provision paths must use the canonical ccshield state layout");
   }
 }
 

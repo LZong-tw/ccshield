@@ -46,7 +46,8 @@ export async function runShieldStatusline({
   deadlineMs = STATUSLINE_DEADLINE_MS,
 } = {}) {
   const state = await withStatuslineDeadline(readShieldStatuslineState({ env, readOperationalStatus }), deadlineMs);
-  const runner = runSubagentStatusLine ?? (await import("../subagent-observability.mjs")).runSubagentStatusLine;
+  // AirKit injects its subagent statusline renderer (P5); standalone, print the suffix as the line.
+  const runner = runSubagentStatusLine ?? (async ({ output: sink, statuslineSuffix }) => { sink.write(`${statuslineSuffix.replace(/^ · /, "")}\n`); });
   return runner({ env, input, output, statuslineSuffix: shieldStatuslineSuffix(state) });
 }
 

@@ -23,7 +23,7 @@ const config = {
     destinationClass: "subscription",
     interactive: false,
   },
-  gitleaks: { executable: "/opt/airkit/gitleaks", sha256: "b".repeat(64), ruleBundle: { path: "/opt/airkit/rules.toml", sha256: "c".repeat(64), version: "rules-1", commandProfile: { versionArgs: ["version"], scanArgs: ["stdin", "--config", "{rules}", "--report-format", "json", "--report-path", "-", "--redact"] } } },
+  gitleaks: { executable: "/opt/ccshield/gitleaks", sha256: "b".repeat(64), ruleBundle: { path: "/opt/ccshield/rules.toml", sha256: "c".repeat(64), version: "rules-1", commandProfile: { versionArgs: ["version"], scanArgs: ["stdin", "--config", "{rules}", "--report-format", "json", "--report-path", "-", "--redact"] } } },
 };
 
 const paths = {
@@ -652,13 +652,13 @@ test("daemon blocks every privacy worker failure before a real upstream fetch", 
 function assetsProvision() {
   return {
     version: 1,
-    bundle: { version: "policy-1", sha256: "a".repeat(64), path: "/opt/airkit/policy.json" },
+    bundle: { version: "policy-1", sha256: "a".repeat(64), path: "/opt/ccshield/policy.json" },
     gitleaks: {
       sha256: "b".repeat(64),
-      path: "/opt/airkit/gitleaks",
-      rules: { path: "/opt/airkit/rules.toml", sha256: "c".repeat(64), version: "rules-1" },
+      path: "/opt/ccshield/gitleaks",
+      rules: { path: "/opt/ccshield/rules.toml", sha256: "c".repeat(64), version: "rules-1" },
     },
-    privacy: { version: "privacy-1", sha256: "c".repeat(64), path: "/opt/airkit/privacy.json", worker: { command: "/opt/airkit/privacy-worker", args: ["--stdio"], sha256: "d".repeat(64) } },
+    privacy: { version: "privacy-1", sha256: "c".repeat(64), path: "/opt/ccshield/privacy.json", worker: { command: "/opt/ccshield/privacy-worker", args: ["--stdio"], sha256: "d".repeat(64) } },
   };
 }
 

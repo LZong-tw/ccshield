@@ -28,8 +28,8 @@ const identity = {
 
 test("Shield identity is private and loopback-only", () => {
   const paths = shieldPaths({ homeDir: "/tmp/home", uid: 501 });
-  assert.equal(paths.rootDir, "/tmp/home/.local/state/airkit-shield/subscription");
-  assert.equal(paths.launchdTarget, "gui/501/com.airkit.shield.subscription");
+  assert.equal(paths.rootDir, "/tmp/home/.local/share/ccshield/subscription");
+  assert.equal(paths.launchdTarget, "gui/501/com.ccshield.subscription");
   assert.throws(() => assertShieldIdentity({ origin: "https://proxy.example" }), /loopback/);
 });
 
@@ -70,7 +70,7 @@ test("missing identity is reported as null", async () => {
 });
 
 test("identity writes use a private directory and atomic 0600 replacement", async () => {
-  const homeDir = await mkdtemp("/tmp/airkit-shield-");
+  const homeDir = await mkdtemp("/tmp/ccshield-");
   const paths = shieldPaths({ homeDir, uid: 501 });
   try {
     await writeShieldIdentity({ paths, identity });
@@ -83,7 +83,7 @@ test("identity writes use a private directory and atomic 0600 replacement", asyn
 });
 
 test("Shield configuration writes use managed private state and atomic 0600 replacement", async () => {
-  const homeDir = await mkdtemp("/tmp/airkit-shield-");
+  const homeDir = await mkdtemp("/tmp/ccshield-");
   const paths = shieldPaths({ homeDir, uid: 501 });
   const config = {
     capability,
@@ -103,8 +103,8 @@ test("Shield configuration writes use managed private state and atomic 0600 repl
 });
 
 test("identity writes reject a pre-existing symlink state root", async () => {
-  const homeDir = await mkdtemp("/tmp/airkit-shield-");
-  const targetDir = await mkdtemp("/tmp/airkit-shield-target-");
+  const homeDir = await mkdtemp("/tmp/ccshield-");
+  const targetDir = await mkdtemp("/tmp/ccshield-target-");
   const paths = shieldPaths({ homeDir, uid: 501 });
   try {
     await mkdir(join(paths.rootDir, ".."), { recursive: true });
@@ -118,12 +118,12 @@ test("identity writes reject a pre-existing symlink state root", async () => {
 });
 
 test("identity writes reject a symlink in the canonical ancestor chain", async () => {
-  const homeDir = await mkdtemp("/tmp/airkit-shield-");
-  const targetDir = await mkdtemp("/tmp/airkit-shield-target-");
+  const homeDir = await mkdtemp("/tmp/ccshield-");
+  const targetDir = await mkdtemp("/tmp/ccshield-target-");
   const paths = shieldPaths({ homeDir, uid: 501 });
   try {
     await mkdir(join(homeDir, ".local"), { recursive: true });
-    await symlink(targetDir, join(homeDir, ".local", "state"));
+    await symlink(targetDir, join(homeDir, ".local", "share"));
     await assert.rejects(writeShieldIdentity({ paths, identity }), /symlink/);
   } finally {
     await rm(homeDir, { recursive: true, force: true });
@@ -132,7 +132,7 @@ test("identity writes reject a symlink in the canonical ancestor chain", async (
 });
 
 test("identity writes reject a state directory owned by another uid", async () => {
-  const homeDir = await mkdtemp("/tmp/airkit-shield-");
+  const homeDir = await mkdtemp("/tmp/ccshield-");
   const paths = shieldPaths({ homeDir, uid: 501 });
   const realLstat = lstat;
   try {
@@ -152,8 +152,8 @@ test("identity writes reject a state directory owned by another uid", async () =
 });
 
 test("identity writes reject caller paths outside the canonical layout", async () => {
-  const homeDir = await mkdtemp("/tmp/airkit-shield-");
-  const identityPath = join(homeDir, ".local", "state", "airkit-shield", "subscription", "other.json");
+  const homeDir = await mkdtemp("/tmp/ccshield-");
+  const identityPath = join(homeDir, ".local", "share", "ccshield", "subscription", "other.json");
   const paths = shieldPaths({ homeDir, uid: 501, identityPath });
   try {
     await assert.rejects(writeShieldIdentity({ paths, identity }), /canonical/);
@@ -162,11 +162,11 @@ test("identity writes reject caller paths outside the canonical layout", async (
   }
 });
 
-test("identity writes reject a complete forged paths object rooted outside AirKit state", async () => {
-  const homeDir = await mkdtemp("/tmp/airkit-shield-");
-  const externalHome = await mkdtemp("/tmp/airkit-shield-forged-");
+test("identity writes reject a complete forged paths object rooted outside ccshield state", async () => {
+  const homeDir = await mkdtemp("/tmp/ccshield-");
+  const externalHome = await mkdtemp("/tmp/ccshield-forged-");
   const canonicalPaths = shieldPaths({ homeDir, uid: 501 });
-  const forgedRoot = join(externalHome, ".local", "state", "airkit-shield");
+  const forgedRoot = join(externalHome, ".local", "share", "ccshield");
   const forgedPaths = {
     rootDir: forgedRoot,
     configPath: join(forgedRoot, "config.json"),
@@ -188,7 +188,7 @@ test("identity writes reject a complete forged paths object rooted outside AirKi
         throw error;
       },
     );
-    assert.equal(externalIdentityExists, false, "writer must not create identity files outside canonical AirKit state");
+    assert.equal(externalIdentityExists, false, "writer must not create identity files outside canonical ccshield state");
     assert.match(writeError?.message ?? "", /shieldPaths/);
   } finally {
     await rm(homeDir, { recursive: true, force: true });
@@ -197,7 +197,7 @@ test("identity writes reject a complete forged paths object rooted outside AirKi
 });
 
 test("policy binding invalidation succeeds on a lane that has never bound one", async () => {
-  const homeDir = await mkdtemp("/tmp/airkit-shield-");
+  const homeDir = await mkdtemp("/tmp/ccshield-");
   const paths = shieldPaths({ homeDir, uid: 501 });
   try {
     await mkdir(paths.rootDir, { recursive: true, mode: 0o700 });
@@ -211,7 +211,7 @@ test("policy binding invalidation succeeds on a lane that has never bound one", 
 });
 
 test("identity temporary file uses exclusive no-follow open flags", async () => {
-  const homeDir = await mkdtemp("/tmp/airkit-shield-");
+  const homeDir = await mkdtemp("/tmp/ccshield-");
   const paths = shieldPaths({ homeDir, uid: 501 });
   const calls = [];
   try {

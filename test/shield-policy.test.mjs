@@ -281,7 +281,7 @@ test("OPA owns restricted-data blocks and internal subscription approval decisio
 });
 
 test("policy state exposes only version and detector versions", async () => {
-  const homeDir = await mkdtemp(join(tmpdir(), "airkit-policy-state-"));
+  const homeDir = await mkdtemp(join(tmpdir(), "ccshield-policy-state-"));
   const paths = shieldPaths({ homeDir, uid: process.getuid?.() });
   try {
     const { readShieldPolicyState, writeShieldPolicyState } = await import("../src/shield/paths.mjs");

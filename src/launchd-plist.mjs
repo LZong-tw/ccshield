@@ -1,5 +1,5 @@
 // Explains why an installed launchd plist differs from the one this runtime would write.
-// The common cause is a job installed by a different AirKit checkout or package, so the
+// The common cause is a job installed by a different ccshield checkout, package or an older AirKit install, so the
 // message names both program paths instead of leaving the operator to diff the files.
 export function describePlistDrift(existing, expected) {
   const found = programArguments(existing);

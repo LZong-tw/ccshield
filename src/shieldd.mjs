@@ -219,7 +219,7 @@ function resolveDestinationClass(config) {
 }
 
 function parseConfigPath(argv) {
-  if (argv.length !== 2 || argv[0] !== "--config" || !argv[1]) throw new Error("usage: airkit-shieldd --config <private-config-path>");
+  if (argv.length !== 2 || argv[0] !== "--config" || !argv[1]) throw new Error("usage: shieldd --config <private-config-path>");
   return argv[1];
 }
 
@@ -231,6 +231,6 @@ async function assertPrivateConfig(path) {
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   main().catch(() => {
-    process.stderr.write("AIRKIT_SHIELDD code=AIRKIT_SHIELDD_BOOT_FAILED\n", () => process.exit(1));
+    process.stderr.write("CCSHIELDD code=CCSHIELDD_BOOT_FAILED\n", () => process.exit(1));
   });
 }

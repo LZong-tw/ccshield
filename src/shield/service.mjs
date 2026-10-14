@@ -8,6 +8,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { promisify } from "node:util";
 import { describePlistDrift } from "../launchd-plist.mjs";
+import { envNamesFor } from "../compat-env.mjs";
 
 import { readShieldIdentity, readShieldPolicyState, shieldPaths, writeShieldConfig } from "./paths.mjs";
 import { classifyShieldRequest } from "./classify.mjs";
@@ -15,7 +16,7 @@ import { createApprovalBroker } from "./approval.mjs";
 import { approvalChannelRegistration, createApprovalChannel } from "./approval-channel.mjs";
 
 const execFileAsync = promisify(execFile);
-export const SHIELD_SERVICE_LABEL = "com.airkit.shield";
+export const SHIELD_SERVICE_LABEL = "com.ccshield";
 const SUBSCRIPTION_TARGET_ORIGIN = "https://api.anthropic.com";
 const UNKNOWN_REMOTE_HASH = "0".repeat(64);
 
@@ -106,7 +107,7 @@ export async function startShieldService(options = {}) {
     else throw error;
   }
   if (missing) {
-    throw new Error("shield service is not installed; run 'airkit shield install --write' before start");
+    throw new Error("shield service is not installed; run 'ccshield install --write' before start");
   }
   await ensurePathDrift(plan, io);
   await launch(runLaunchctl, ["bootstrap", plan.domain, plan.plistPath], true);
@@ -409,7 +410,9 @@ export function buildShieldChildEnv(ready, env = process.env) {
     CLAUDE_AGENT_API_BASE_URL: ready.origin,
     ANTHROPIC_CUSTOM_HEADERS: [...keptHeaders, `x-airkit-shield: ${ready.capability}`].join("\n"),
   };
-  for (const key of ["AIRKIT_SHIELD_CONTROL_CAPABILITY", "AIRKIT_SHIELD_APPROVAL_CAPABILITY", "AIRKIT_SHIELD_APPROVAL_SOCKET", "AIRKIT_SHIELD_CAPABILITY"]) delete childEnv[key];
+  for (const name of ["CCSHIELD_CONTROL_CAPABILITY", "CCSHIELD_APPROVAL_CAPABILITY", "CCSHIELD_APPROVAL_SOCKET", "CCSHIELD_CAPABILITY"]) {
+    for (const key of envNamesFor(name)) delete childEnv[key];
+  }
   return childEnv;
 }
 
@@ -452,7 +455,7 @@ function assertNoShieldEndpointSettings(settings, shieldOrigin) {
 
 async function createLauncherApprovalChannel({ broker }) {
   if (!isInteractiveApprovalTty()) return null;
-  const directory = await mkdtemp(resolve(tmpdir(), "airkit-shield-approval-"));
+  const directory = await mkdtemp(resolve(tmpdir(), "ccshield-approval-"));
   const channel = await createApprovalChannel({ broker, directory });
   return Object.freeze({ ...channel, close: async () => { await channel.close(); await rm(directory, { recursive: true, force: true }); } });
 }

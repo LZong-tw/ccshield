@@ -77,7 +77,7 @@ test("daemon CLI exits on boot failure and prints only its fixed diagnostic even
     "--import", "data:text/javascript,setInterval(() => {}, 1000)",
     daemonPath, "--config", fixture.paths.configPath,
   ], {
-    env: { HOME: fixture.homeDir, PATH: emptyBin, AIRKIT_SHIELD_ROOT_DIR: fixture.paths.rootDir },
+    env: { HOME: fixture.homeDir, PATH: emptyBin, CCSHIELD_ROOT_DIR: fixture.paths.rootDir },
     stdio: ["ignore", "pipe", "pipe"],
   });
   t.after(() => child.kill("SIGKILL"));
@@ -89,14 +89,14 @@ test("daemon CLI exits on boot failure and prints only its fixed diagnostic even
 
   assert.deepEqual(result, { code: 1, signal: null }, "boot failure must terminate rather than retain background handles");
   assert.equal(stdout, "");
-  assert.equal(stderr, "AIRKIT_SHIELDD code=AIRKIT_SHIELDD_BOOT_FAILED\n");
+  assert.equal(stderr, "CCSHIELDD code=CCSHIELDD_BOOT_FAILED\n");
   const workerPid = Number(await readFile(fixture.workerPidPath, "utf8"));
   assert.equal(await waitForProcessExit(workerPid), true);
   await assert.rejects(readFile(fixture.paths.identityPath), { code: "ENOENT" });
 });
 
 async function startupFixture(t) {
-  const homeDir = await realpath(await mkdtemp(join(tmpdir(), "airkit-shield-boot-")));
+  const homeDir = await realpath(await mkdtemp(join(tmpdir(), "ccshield-boot-")));
   const paths = shieldPaths({ homeDir, env: {} });
   const workerPidPath = join(homeDir, "worker.pid");
   t.after(async () => {

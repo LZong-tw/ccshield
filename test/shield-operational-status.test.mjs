@@ -84,7 +84,7 @@ test("operational Shield status does not claim protection when the live readines
 test("operational Shield status reports the Headroom subscription route as protected only when enabled", async () => {
   let descriptorOptions;
   await readShieldOperationalStatus({
-    env: { AIRKIT_SHIELD_SUBSCRIPTION: "1" },
+    env: { CCSHIELD_SUBSCRIPTION: "1" },
     shieldPaths: ({ lane }) => ({ lane }),
     inspectService: async () => ({ installed: false, loaded: false, active: false }),
     readIdentity: async () => null,
@@ -102,7 +102,7 @@ test("operational Shield status fails closed for broken local state and never re
   const result = await readShieldOperationalStatus({
     audit: "unavailable",
     shieldPaths: ({ lane }) => ({ lane }),
-    inspectService: async () => { throw new Error("/Users/private/com.airkit.shield.plist"); },
+    inspectService: async () => { throw new Error("/Users/private/com.ccshield.plist"); },
     readIdentity: async () => ({ pid: 1, capability: "must-not-render", origin: "http://127.0.0.1:8811" }),
     readPolicy: async () => { throw new Error("policy invalid"); },
     readAssets: async () => { throw new Error("privacy invalid"); },
