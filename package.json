@@ -6,6 +6,10 @@
   "bin": {
     "ccshield": "src/cli.mjs"
   },
+  "exports": {
+    ".": "./src/index.mjs",
+    "./package.json": "./package.json"
+  },
   "files": [
     "src/",
     "README.md",

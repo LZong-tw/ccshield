@@ -20,15 +20,22 @@ export async function readShieldOperationalStatus({
   ensureReady = ensureShieldReady,
   launcherDescriptors = shieldLauncherDescriptors,
 } = {}) {
-  const auditState = HEALTH.has(audit) ? audit : "unavailable";
+  // `audit` is one state for every lane, or a per-lane function now that each lane owns its store.
+  const auditFor = async (lane, paths) => {
+    let value = audit;
+    if (typeof audit === "function") {
+      try { value = await audit({ lane, paths }); } catch { value = "unavailable"; }
+    }
+    return HEALTH.has(value) ? value : "unavailable";
+  };
   const lanes = await Promise.all(LANES.map(async (lane) => {
     let paths;
     try {
       paths = resolvePaths({ env, lane });
     } catch {
-      return unavailableLane(lane, auditState);
+      return unavailableLane(lane, await auditFor(lane, null));
     }
-    return readLaneStatus({ lane, audit: auditState, paths, inspectService, readIdentity, readPolicy, readAssets, ensureReady });
+    return readLaneStatus({ lane, audit: await auditFor(lane, paths), paths, inspectService, readIdentity, readPolicy, readAssets, ensureReady });
   }));
   const descriptors = safeLauncherDescriptors(launcherDescriptors({
     subscriptionShield: readEnv(env ?? {}, "CCSHIELD_SUBSCRIPTION") === "1",
