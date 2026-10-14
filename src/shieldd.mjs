@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import "./quiet-sqlite.mjs";
+
 import { execFile } from "node:child_process";
 import { stat, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -17,9 +19,7 @@ import { createDecisionCache } from "./shield/decision-cache.mjs";
 import { defaultShieldLauncherContext, readShieldConfig } from "./shield/service.mjs";
 import { createShieldDecisionRecorder } from "./shield/audit.mjs";
 import { createMasterKeyProvider } from "./audit/keychain.mjs";
-import { resolveAuditPaths } from "./audit/paths.mjs";
-import { createEncryptedSpool } from "./audit/spool.mjs";
-import { createAuditClient } from "./audit/transport.mjs";
+import { openShieldStore } from "./store.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -65,14 +65,18 @@ export async function startShieldDaemon({
   if (scanner?.version !== policy.detectorVersions.gitleaks) throw new Error("shield gitleaks version does not match policy metadata");
   let privacy;
   let shield;
+  let recorder;
   const close = async () => {
     try { await shield?.close(); }
-    finally { await privacy?.close?.(); }
+    finally {
+      try { await privacy?.close?.(); }
+      finally { await recorder?.close?.(); }
+    }
   };
   try {
     privacy = await createPrivacy({ provision: assets });
     if (privacy?.version !== policy.detectorVersions.privacy) throw new Error("shield privacy version does not match policy metadata");
-    const recorder = await createDecisionRecorder({ config, paths, policy, assets });
+    recorder = await createDecisionRecorder({ config, paths, policy, assets });
     if (typeof recorder?.recordShieldDecision !== "function") throw new Error("shield audit recorder is unavailable");
     const decide = async ({ body, launcherContext: requestLauncherContext = null }) => {
       const launcherContext = {
@@ -156,17 +160,28 @@ export async function startShieldDaemon({
   return Object.freeze({ shield: Object.freeze({ ...shield, close }), policy, scanner, privacy });
 }
 
-export async function createDefaultDecisionRecorder({ env = process.env, auditPaths = resolveAuditPaths({ env }), readCapability = readFile, masterKeyProvider, createClient = createAuditClient, createSpool = createEncryptedSpool } = {}) {
-  const capabilityPath = env.AIRKIT_AUDIT_CAPABILITY_FILE ?? join(auditPaths.rootDir, "capability");
-  const capability = (await readCapability(capabilityPath, "utf8")).trim();
-  if (!/^[A-Za-z0-9._-]{32,512}$/.test(capability)) throw new Error("shield audit capability is unavailable");
+const RETENTION_SWEEP_MS = 60 * 60 * 1000;
+
+export async function createDefaultDecisionRecorder({ config = {}, paths, env = process.env, masterKeyProvider, openStore = openShieldStore } = {}) {
+  if (!paths?.auditDatabasePath) throw new TypeError("shield audit store path is required");
   const provider = masterKeyProvider ?? createRuntimeMasterKeyProvider(env);
   const masterKey = await provider.get();
-  const spool = createSpool({ paths: auditPaths, masterKey });
-  const state = await spool.stats();
-  if (state?.atCapacity === true) throw new Error("shield audit spool is at capacity");
-  const client = createClient({ socketPath: env.AIRKIT_AUDIT_SOCKET_PATH ?? auditPaths.socketPath, capability, timeoutMs: 750 });
-  return createShieldDecisionRecorder({ client, spool, masterKey });
+  const store = openStore({
+    databasePath: paths.auditDatabasePath,
+    masterKey,
+    ...(config.auditRetentionDays === undefined ? {} : { retentionDays: config.auditRetentionDays }),
+  });
+  // The store purges at open; this keeps a long-lived daemon inside the window too.
+  const sweep = setInterval(() => { try { store.purgeExpiredEvidence(); } catch { /* the next write reports a broken store */ } }, RETENTION_SWEEP_MS);
+  sweep.unref();
+  const recorder = createShieldDecisionRecorder({ store });
+  return Object.freeze({
+    ...recorder,
+    close: async () => {
+      clearInterval(sweep);
+      store.close();
+    },
+  });
 }
 
 function createRuntimeMasterKeyProvider(env) {

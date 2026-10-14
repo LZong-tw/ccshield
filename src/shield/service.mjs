@@ -248,6 +248,12 @@ export async function readShieldConfig({ paths, io = defaultIo } = {}) {
     result.launcherContext = config.launcherContext;
   }
   if (config.gitleaks !== undefined) result.gitleaks = config.gitleaks;
+  if (config.auditRetentionDays !== undefined) {
+    if (!Number.isInteger(config.auditRetentionDays) || config.auditRetentionDays < 1 || config.auditRetentionDays > 3650) {
+      throw new Error("shield configuration auditRetentionDays must be a whole number of days between 1 and 3650");
+    }
+    result.auditRetentionDays = config.auditRetentionDays;
+  }
   return result;
 }
 

@@ -25,6 +25,7 @@ export function shieldPaths({ env = process.env, homeDir = homeFromEnv(env), uid
     policyPublicKeyPath: childPath(join(root, "policy-public.pem"), root, "policyPublicKeyPath"),
     assetsProvisionPath: childPath(join(root, "assets-provision.json"), root, "assetsProvisionPath"),
     socketPath: childPath(socketPath ?? join(root, "shield.sock"), root, "socketPath"),
+    auditDatabasePath: childPath(join(root, "audit.sqlite"), root, "auditDatabasePath"),
     launchAgentPath: launchAgentPath ?? join(home, "Library", "LaunchAgents", `${serviceLabel}.plist`),
     launchdDomain: `gui/${numericUid(uid)}`,
   };

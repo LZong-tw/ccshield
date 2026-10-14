@@ -77,9 +77,9 @@ async function createDefaultShieldDependencies(dependencies) {
   const renewLease = dependencies.renewShieldDestinationLease ?? renewShieldDestinationLease;
   const revokeLease = dependencies.revokeShieldDestinationLease ?? revokeShieldDestinationLease;
   const launchChild = dependencies.launchShieldChild ?? launchShieldChild;
-  const createDecisionRecorder = dependencies.createDecisionRecorder ?? (async () => {
+  const createDecisionRecorder = dependencies.createDecisionRecorder ?? (async ({ paths: lanePaths }) => {
     const { createDefaultDecisionRecorder } = await import("../shieldd.mjs");
-    return createDefaultDecisionRecorder({ env });
+    return createDefaultDecisionRecorder({ env, paths: lanePaths });
   });
   const common = { paths, nodePath, daemonPath, env, ...(dependencies.io ? { io: dependencies.io } : {}), ...(dependencies.runLaunchctl ? { runLaunchctl: dependencies.runLaunchctl } : {}) };
   return {
@@ -144,16 +144,21 @@ async function createDefaultShieldDependencies(dependencies) {
       const { loadShieldPolicy } = await import("./policy.mjs");
       const preview = await installPolicy({ bundlePath, publicKeyPath, paths: lanePaths, loadPolicy: loadShieldPolicy });
       if (!write) return { state: "preview", version: preview.version, detectorVersions: preview.detectorVersions, write: false, restarted: false };
-      const recorder = await createDecisionRecorder();
+      const recorder = await createDecisionRecorder({ paths: lanePaths });
       if (typeof recorder?.recordShieldPolicyTransition !== "function") {
         throw new Error("shield policy transition audit recorder is unavailable");
       }
-      const result = await transitionShieldPolicy({
-        ...common,
-        paths: lanePaths,
-        installPolicy: () => installPolicy({ bundlePath, publicKeyPath, write: true, paths: lanePaths, loadPolicy: loadShieldPolicy }),
-        recordShieldPolicyTransition: recorder.recordShieldPolicyTransition,
-      });
+      let result;
+      try {
+        result = await transitionShieldPolicy({
+          ...common,
+          paths: lanePaths,
+          installPolicy: () => installPolicy({ bundlePath, publicKeyPath, write: true, paths: lanePaths, loadPolicy: loadShieldPolicy }),
+          recordShieldPolicyTransition: recorder.recordShieldPolicyTransition,
+        });
+      } finally {
+        await recorder.close?.();
+      }
       return { state: "degraded", version: result.version, detectorVersions: result.detectorVersions, write: true };
     },
     async policyStatus({ lane }) {

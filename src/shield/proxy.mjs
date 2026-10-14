@@ -270,7 +270,12 @@ async function handleShieldRequest({ request, response, capability, controlCapab
     auditDecision.override = permitted;
   }
   try {
-    await recordShieldDecision(auditDecision);
+    // A redaction is only auditable with the text it replaced; the store encrypts both sides.
+    if (decision?.action === "redact") {
+      await recordShieldDecision(auditDecision, { originalText: inspection.body.toString("utf8"), redactedText: forwardBody.toString("utf8") });
+    } else {
+      await recordShieldDecision(auditDecision);
+    }
   } catch {
     fail("audit", "audit_unavailable", inspection.bytes);
     await finish(response, { status: 503, code: "shield_unavailable" });

@@ -1,12 +1,15 @@
-import { createAuditEvent, validateAuditEvent } from "../audit/event.mjs";
-import { encryptAuditValue } from "../audit/crypto.mjs";
+import { randomUUID } from "node:crypto";
 
+export const SHIELD_EVENT_SCHEMA = "ccshield.audit/v1";
+const EVENT_KINDS = new Set(["shield_decision", "shield_policy_transition"]);
+const EVENT_KEYS = ["event_id", "event_kind", "logical_request_id", "observed_at", "payload", "schema", "session_id"];
+const MAX_EVIDENCE_CHARS = 16 * 1024 * 1024;
 const ACTIONS = new Set(["allow", "block", "redact", "require_approval", "unavailable", "unauthorized", "transition"]);
 const LANES = new Set(["managed", "subscription", "unknown"]);
 const DESTINATION_CLASSES = new Set(["managed", "subscription", "unknown"]);
 const DECISION_KEYS = ["action", "bundleVersion", "decisionSource", "destinationClass", "detectorVersions", "elapsedMs", "lane", "override", "reasonCodes", "requestId", "transformCount"];
 const DECISION_SOURCES = new Set(["evaluated", "cache_hit", "coalesced"]);
-// Optional on decisions only; omitted keys stay absent so pre-media auditd keeps accepting the event.
+// Optional on decisions only; omitted keys stay absent and store as NULL.
 const MEDIA_KEYS = Object.freeze({
   imageVersion: "image_version",
   imageCount: "image_count",
@@ -14,6 +17,10 @@ const MEDIA_KEYS = Object.freeze({
   documentCount: "document_count",
   mediaOutcome: "media_outcome",
 });
+const MEDIA_COUNT_KEYS = ["imageCount", "imageTransformCount", "documentCount"];
+const MEDIA_OUTCOMES = new Set(["none", "blocked_document", "blocked_source", "blocked_scan", "blocked_secret", "scanned"]);
+// Set by provisioning from the worker source digest; anything else could smuggle an id or secret into the row.
+const IMAGE_VERSION = /^image-[0-9a-f]{12}$/;
 
 export function buildShieldDecisionEvent(decision, { now = () => new Date() } = {}) {
   return buildShieldEvent("shield_decision", decision, { now });
@@ -27,12 +34,12 @@ function buildShieldEvent(eventKind, decision, { now }) {
   const metadata = assertShieldDecisionMetadata(decision, { media: eventKind === "shield_decision" });
   const observedAt = now();
   if (!(observedAt instanceof Date) || Number.isNaN(observedAt.getTime())) throw new TypeError("shield audit clock is invalid");
-  const event = createAuditEvent({
-    source: "airkit-shield",
-    source_version: "1",
-    logical_request_id: metadata.requestId,
-    client: "airkit-shield",
+  const event = {
+    schema: SHIELD_EVENT_SCHEMA,
+    event_id: randomUUID(),
     event_kind: eventKind,
+    logical_request_id: metadata.requestId,
+    session_id: metadata.sessionId ?? null,
     observed_at: observedAt.toISOString(),
     payload: {
       lane: metadata.lane,
@@ -50,87 +57,86 @@ function buildShieldEvent(eventKind, decision, { now }) {
         .filter(([key]) => Object.hasOwn(metadata, key))
         .map(([key, column]) => [column, metadata[key]])),
     },
-  });
-  // The ack path has no spool to validate for us; refuse here rather than let auditd reject it later.
-  validateAuditEvent(event);
-  return event;
+  };
+  validateShieldEvent(event);
+  return Object.freeze(event);
 }
 
-export function createShieldDecisionRecorder({ client = null, spool = null, masterKey = null, now } = {}) {
-  if (client !== null && typeof client?.send !== "function") throw new TypeError("shield audit client is invalid");
-  if (client !== null && (masterKey === null || masterKey === undefined)) throw new TypeError("shield audit transport requires a master key");
-  if (spool !== null && (typeof spool?.stats !== "function" || typeof spool?.enqueue !== "function")) {
-    throw new TypeError("shield audit spool is invalid");
-  }
+// The store is the only sink. A failed write throws so the proxy fails closed
+// instead of forwarding a request it could not account for.
+export function createShieldDecisionRecorder({ store, now } = {}) {
+  if (typeof store?.recordEvent !== "function") throw new TypeError("shield audit store is invalid");
+  let healthy = true;
+
+  const persist = (event, evidence) => {
+    try {
+      store.recordEvent(event, evidence);
+      healthy = true;
+      return Object.freeze({ durable: "store", eventId: event.event_id });
+    } catch {
+      healthy = false;
+      throw unavailable();
+    }
+  };
 
   return Object.freeze({
     async isReady() {
-      if (!spool) return client !== null;
-      try {
-        return (await spool.stats())?.atCapacity !== true;
-      } catch {
-        return false;
-      }
+      return healthy;
     },
-    async recordShieldDecision(decision) {
-      return persistShieldEvent(buildShieldDecisionEvent(decision, { now }), { client, spool, masterKey });
+    // `evidence` holds the original and forwarded text of a redacted request.
+    // It is encrypted at rest and is never part of the metadata event.
+    async recordShieldDecision(decision, evidence = null) {
+      const event = buildShieldDecisionEvent(decision, { now });
+      return persist(event, normalizeEvidence(evidence));
     },
     async recordShieldPolicyTransition(transition) {
-      return persistShieldEvent(buildShieldPolicyTransitionEvent(transition, { now }), { client, spool, masterKey });
+      return persist(buildShieldPolicyTransitionEvent(transition, { now }), null);
     },
   });
 }
 
-async function persistShieldEvent(event, { client, spool, masterKey }) {
-  if (client) {
-    try {
-      const ack = await client.send(encryptShieldDecisionEvent(event, masterKey));
-      if (ack?.status === "committed" || ack?.status === "duplicate") return Object.freeze({ durable: "ack" });
-    } catch {
-      // A trusted encrypted spool may provide the only durable fallback.
-    }
-  }
-  if (!spool) throw unavailable();
-  try {
-    const state = await spool.stats();
-    if (state?.atCapacity === true) throw unavailable();
-    const entry = await spool.enqueue(event);
-    if (entry?.event?.event_id !== event.event_id) throw unavailable();
-    return Object.freeze({ durable: "spool" });
-  } catch (error) {
-    if (error?.code === "AIRKIT_SHIELD_AUDIT_UNAVAILABLE") throw error;
-    throw unavailable();
-  }
+export async function recordShieldDecision(decision, dependencies, evidence = null) {
+  return createShieldDecisionRecorder(dependencies).recordShieldDecision(decision, evidence);
 }
 
-function encryptShieldDecisionEvent(event, masterKey) {
-  return Object.freeze({
-    event_id: event.event_id,
-    encrypted: encryptAuditValue({
-      masterKey,
-      purpose: "request-evidence/v1",
-      identity: event.event_id,
-      plaintext: Buffer.from(JSON.stringify(event), "utf8"),
-    }),
-  });
+export function validateShieldEvent(event) {
+  if (!isPlainObject(event) || !hasAllowedKeys(event, EVENT_KEYS, [])
+    || event.schema !== SHIELD_EVENT_SCHEMA || !EVENT_KINDS.has(event.event_kind)
+    || typeof event.event_id !== "string" || !/^[0-9a-f-]{36}$/.test(event.event_id)
+    || typeof event.logical_request_id !== "string" || event.logical_request_id.length === 0
+    || !(event.session_id === null || (typeof event.session_id === "string" && /^[A-Za-z0-9._-]{1,128}$/.test(event.session_id)))
+    || typeof event.observed_at !== "string" || Number.isNaN(Date.parse(event.observed_at))
+    || !isPlainObject(event.payload)) {
+    throw new TypeError("shield audit event is invalid");
+  }
+  return event;
 }
 
-export async function recordShieldDecision(decision, dependencies) {
-  return createShieldDecisionRecorder(dependencies).recordShieldDecision(decision);
+function normalizeEvidence(evidence) {
+  if (evidence === null || evidence === undefined) return null;
+  if (!isPlainObject(evidence) || !hasAllowedKeys(evidence, [], ["originalText", "redactedText"])) {
+    throw new TypeError("shield audit evidence is invalid");
+  }
+  for (const value of Object.values(evidence)) {
+    if (typeof value !== "string" || value.length > MAX_EVIDENCE_CHARS) throw new TypeError("shield audit evidence is invalid");
+  }
+  return Object.keys(evidence).length === 0 ? null : evidence;
 }
 
 export function assertShieldDecisionMetadata(value, { media = false } = {}) {
   const normalized = isPlainObject(value) && !Object.hasOwn(value, "decisionSource")
     ? { ...value, decisionSource: "evaluated" }
     : value;
-  if (!isPlainObject(normalized) || !hasAllowedKeys(normalized, DECISION_KEYS, media ? Object.keys(MEDIA_KEYS) : [])
+  if (!isPlainObject(normalized) || !hasAllowedKeys(normalized, DECISION_KEYS, ["sessionId", ...(media ? Object.keys(MEDIA_KEYS) : [])])
+    || (Object.hasOwn(normalized, "sessionId") && (typeof normalized.sessionId !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(normalized.sessionId)))
     || typeof normalized.requestId !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(normalized.requestId)
     || !LANES.has(normalized.lane) || !DESTINATION_CLASSES.has(normalized.destinationClass)
     || typeof normalized.bundleVersion !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(normalized.bundleVersion)
     || !isVersionMap(normalized.detectorVersions) || !ACTIONS.has(normalized.action)
     || !validReasonCodes(normalized.reasonCodes) || !Number.isInteger(normalized.transformCount) || normalized.transformCount < 0 || normalized.transformCount > 1_000_000
     || !DECISION_SOURCES.has(normalized.decisionSource)
-    || typeof normalized.override !== "boolean" || !Number.isFinite(normalized.elapsedMs) || normalized.elapsedMs < 0 || normalized.elapsedMs > 3_600_000) {
+    || typeof normalized.override !== "boolean" || !Number.isFinite(normalized.elapsedMs) || normalized.elapsedMs < 0 || normalized.elapsedMs > 3_600_000
+    || !validMedia(normalized)) {
     throw new TypeError("shield decision metadata is invalid");
   }
   return Object.freeze({
@@ -145,6 +151,7 @@ export function assertShieldDecisionMetadata(value, { media = false } = {}) {
     decisionSource: normalized.decisionSource,
     override: normalized.override,
     elapsedMs: normalized.elapsedMs,
+    ...(Object.hasOwn(normalized, "sessionId") ? { sessionId: normalized.sessionId } : {}),
     ...Object.fromEntries(Object.keys(MEDIA_KEYS)
       .filter((key) => Object.hasOwn(normalized, key))
       .map((key) => [key, normalized[key]])),
@@ -153,13 +160,27 @@ export function assertShieldDecisionMetadata(value, { media = false } = {}) {
 
 function unavailable() {
   const error = new Error("shield audit is unavailable");
-  error.code = "AIRKIT_SHIELD_AUDIT_UNAVAILABLE";
+  error.code = "CCSHIELD_AUDIT_UNAVAILABLE";
   return error;
 }
 
 function hasAllowedKeys(value, required, optional) {
   const allowed = new Set([...required, ...optional]);
   return required.every((key) => Object.hasOwn(value, key)) && Object.keys(value).every((key) => allowed.has(key));
+}
+
+// Media fields describe counts only, never content: no URLs, file ids, bytes or OCR text.
+function validMedia(value) {
+  const has = (key) => Object.hasOwn(value, key);
+  return (!has("imageVersion") || (typeof value.imageVersion === "string" && IMAGE_VERSION.test(value.imageVersion)))
+    && MEDIA_COUNT_KEYS.every((key) => !has(key) || isCount(value[key]))
+    && (!has("mediaOutcome") || MEDIA_OUTCOMES.has(value.mediaOutcome))
+    && !(value.mediaOutcome?.startsWith?.("blocked_") && value.action !== "block")
+    && !(has("imageTransformCount") && value.imageTransformCount > value.transformCount);
+}
+
+function isCount(value) {
+  return Number.isInteger(value) && value >= 0 && value <= 1_000_000;
 }
 
 function validReasonCodes(value) {
