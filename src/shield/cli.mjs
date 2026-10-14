@@ -72,10 +72,7 @@ async function createDefaultShieldDependencies(dependencies) {
   const ensureReady = dependencies.ensureShieldReady ?? ensureShieldReady;
   const readOperational = dependencies.readShieldOperationalStatus ?? readShieldOperationalStatus;
   const readStatus = dependencies.shieldStatus ?? shieldStatus;
-  const readAuditHealth = dependencies.readAuditHealth ?? (async ({ paths: lanePaths }) => {
-    const { inspectShieldStore } = await import("../store.mjs");
-    return inspectShieldStore({ databasePath: lanePaths.auditDatabasePath }).state === "healthy" ? "healthy" : "unavailable";
-  });
+  const readAuditHealth = dependencies.readAuditHealth ?? (async (options) => (await import("../store.mjs")).readAuditHealth(options));
   const inspectKey = dependencies.inspectMasterKey ?? (async () => (await import("../keys.mjs")).inspectMasterKey({ env }));
   const createLease = dependencies.createShieldDestinationLease ?? createShieldDestinationLease;
   const renewLease = dependencies.renewShieldDestinationLease ?? renewShieldDestinationLease;

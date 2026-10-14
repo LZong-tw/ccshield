@@ -219,6 +219,15 @@ export function inspectShieldStore({ databasePath, migrations = SHIELD_MIGRATION
   }
 }
 
+// Status surfaces only distinguish a usable store from everything else.
+export function readAuditHealth({ paths, Database = LazyDatabaseSync } = {}) {
+  try {
+    return inspectShieldStore({ databasePath: paths?.auditDatabasePath, Database }).state === "healthy" ? "healthy" : "unavailable";
+  } catch {
+    return "unavailable";
+  }
+}
+
 function queryTable(db, table, { sessionId, action, requestId, since, limit }) {
   const where = [];
   const values = [];

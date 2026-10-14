@@ -1,6 +1,6 @@
 import { readShieldOperationalStatus } from "./shield/operational-status.mjs";
 import { shieldStatuslineState, shieldStatuslineSuffix } from "./shield/statusline-state.mjs";
-import { inspectShieldStore } from "./store.mjs";
+import { readAuditHealth } from "./store.mjs";
 
 const UNAVAILABLE = Object.freeze({ state: "unavailable", lanes: [] });
 
@@ -9,7 +9,7 @@ const UNAVAILABLE = Object.freeze({ state: "unavailable", lanes: [] });
 // reports both lanes unavailable.
 export async function readShieldStatus({
   env = process.env,
-  audit = laneStoreHealth,
+  audit = readAuditHealth,
   readOperationalStatus = readShieldOperationalStatus,
 } = {}) {
   let operational;
@@ -24,8 +24,4 @@ export async function readShieldStatus({
     statusline,
     statuslineSuffix: shieldStatuslineSuffix(statusline),
   });
-}
-
-function laneStoreHealth({ paths }) {
-  return inspectShieldStore({ databasePath: paths?.auditDatabasePath }).state === "healthy" ? "healthy" : "unavailable";
 }
