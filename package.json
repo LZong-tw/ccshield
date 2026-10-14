@@ -24,6 +24,12 @@
     "node": ">=22.13.0"
   },
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LZong-tw/ccshield.git"
+  },
+  "homepage": "https://github.com/LZong-tw/ccshield#readme",
+  "bugs": "https://github.com/LZong-tw/ccshield/issues",
   "author": "LZong, Lim, Un-tiong <lzong.tw@gmail.com>",
   "dependencies": {
     "@open-policy-agent/opa-wasm": "1.8.0"
