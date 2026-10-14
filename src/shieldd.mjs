@@ -2,11 +2,8 @@
 
 import "./quiet-sqlite.mjs";
 
-import { execFile } from "node:child_process";
-import { stat, readFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 
 import { readShieldAssetsProvision, shieldPathsForConfigPath, writeShieldIdentity, writeShieldPolicyState } from "./shield/paths.mjs";
 import { classifyShieldRequest } from "./shield/classify.mjs";
@@ -18,10 +15,8 @@ import { createShieldFailure as shieldFailure, startShieldProxy } from "./shield
 import { createDecisionCache } from "./shield/decision-cache.mjs";
 import { defaultShieldLauncherContext, readShieldConfig } from "./shield/service.mjs";
 import { createShieldDecisionRecorder } from "./shield/audit.mjs";
-import { createMasterKeyProvider } from "./audit/keychain.mjs";
+import { getMasterKey } from "./keys.mjs";
 import { openShieldStore } from "./store.mjs";
-
-const execFileAsync = promisify(execFile);
 
 async function main() {
   const configPath = parseConfigPath(process.argv.slice(2));
@@ -164,7 +159,7 @@ const RETENTION_SWEEP_MS = 60 * 60 * 1000;
 
 export async function createDefaultDecisionRecorder({ config = {}, paths, env = process.env, masterKeyProvider, openStore = openShieldStore } = {}) {
   if (!paths?.auditDatabasePath) throw new TypeError("shield audit store path is required");
-  const provider = masterKeyProvider ?? createRuntimeMasterKeyProvider(env);
+  const provider = masterKeyProvider ?? { get: async () => (await getMasterKey({ env })).key };
   const masterKey = await provider.get();
   const store = openStore({
     databasePath: paths.auditDatabasePath,
@@ -182,26 +177,6 @@ export async function createDefaultDecisionRecorder({ config = {}, paths, env = 
       store.close();
     },
   });
-}
-
-function createRuntimeMasterKeyProvider(env) {
-  const repoRoot = resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
-  const keychainHelperPath = env.AIRKIT_AUDIT_KEYCHAIN_HELPER ?? join(repoRoot, "native", "airkit-audit-keychain.swift");
-  return createMasterKeyProvider({
-    env,
-    keychainHelperPath,
-    runSecurity: (request) => runCommand(env.AIRKIT_SECURITY_PATH ?? "security", request),
-    runKeychainHelper: (request) => runCommand(env.AIRKIT_SWIFT_PATH ?? "swift", request),
-  });
-}
-
-async function runCommand(command, request) {
-  try {
-    const result = await execFileAsync(command, request?.args ?? [], { input: request?.input, timeout: 10_000, maxBuffer: 4 * 1024 });
-    return { status: 0, stdout: result.stdout, stderr: result.stderr };
-  } catch (error) {
-    return { status: typeof error?.code === "number" ? error.code : 1, stdout: error?.stdout ?? "", stderr: error?.stderr ?? "" };
-  }
 }
 
 function assertGitleaksAsset(gitleaks, asset) {
