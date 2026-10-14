@@ -1,0 +1,8 @@
+ccshield (@untionglim/shield)
+Copyright (c) 2026 LZong, Lim, Un-tiong. Licensed under the MIT License (see LICENSE).
+
+Shield's code was extracted from ai-runtime-kit (MIT, same author).
+
+Third-party components with their own licenses live under licenses/.
+None are bundled yet; the OPF-derived (MPL-2.0) and Apache-2.0 subtrees
+arrive in a later release.

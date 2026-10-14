@@ -1,0 +1,27 @@
+{
+  "name": "@untionglim/shield",
+  "version": "0.0.0",
+  "description": "Local privacy and secret shield for Claude Code traffic.",
+  "type": "module",
+  "bin": {
+    "ccshield": "src/cli.mjs"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "test": "node --test --import ./scripts/keychain-trap.mjs",
+    "check": "node scripts/check.mjs"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "license": "MIT",
+  "author": "LZong, Lim, Un-tiong <lzong.tw@gmail.com>",
+  "dependencies": {
+    "@open-policy-agent/opa-wasm": "1.8.0"
+  }
+}
