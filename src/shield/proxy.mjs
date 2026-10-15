@@ -19,6 +19,7 @@ const FAILURE_REASONS = new Map([
     "invalid-source-provenance", "json-key-collision", "invalid-json-topology",
     "model_timeout", "model_error", "model_killed",
     "redaction-projection-limit", "redaction-match-limit", "redaction-body-limit", "redaction-frame-limit",
+    "segment-coverage", "segment-cache-invalid",
   ])],
   ["policy", new Set(["policy_unavailable", "secret_block_invalid"])],
   ["redaction", new Set(["redaction_invalid"])],
@@ -241,15 +242,15 @@ async function handleShieldRequest({ request, response, capability, controlCapab
   if (lifecycle.signal.aborted) return;
   let decision;
   try {
-    const evaluate = async () => await decide({ method: request.method ?? "GET", path, bytes: inspection.bytes, body: inspection.body, signal: lifecycle.signal, launcherContext });
+    const evaluate = async (signal = lifecycle.signal) => await decide({ method: request.method ?? "GET", path, bytes: inspection.bytes, body: inspection.body, signal, launcherContext });
     decision = decisionCache === null || launcherContext !== null
       ? await evaluate()
-      : await cachedDecision({ decisionCache, decisionContext, body: inspection.body, evaluate });
+      : await cachedDecision({ decisionCache, decisionContext, body: inspection.body, evaluate, signal: lifecycle.signal });
   } catch (error) {
     const failure = error?.shieldFailure;
     if (FAILURE_REASONS.get(failure?.stage)?.has(failure?.reason)) fail(failure.stage, failure.reason, inspection.bytes);
     else fail("evaluation", "evaluation_unavailable", inspection.bytes);
-    await finish(response, { status: 503, code: "shield_unavailable" });
+    await finish(response, { status: 503, code: "shield_unavailable", retryAfterSeconds: validRetryAfter(failure ?? {}) });
     return;
   }
   const auditDecision = buildDecisionMetadata(decision, startedAt);
@@ -337,7 +338,7 @@ function recordFailure(failures, { stage, reason, bytes, elapsedMs }) {
   if (failures.length > 16) failures.shift();
 }
 
-export function createShieldFailure(stage, reason, message) {
+export function createShieldFailure(stage, reason, message, { retryAfterSeconds } = {}) {
   const defaults = {
     body_read: "body_read_failed", evaluation: "evaluation_unavailable", secret_scan: "scanner_unavailable",
     privacy_scan: "privacy_unavailable", policy: "policy_unavailable", redaction: "redaction_invalid",
@@ -345,14 +346,25 @@ export function createShieldFailure(stage, reason, message) {
   };
   const safeStage = FAILURE_REASONS.has(stage) ? stage : "evaluation";
   const safeReason = FAILURE_REASONS.get(safeStage).has(reason) ? reason : defaults[safeStage];
-  return Object.assign(new Error(message), { shieldFailure: { stage: safeStage, reason: safeReason } });
+  const retryAfter = validRetryAfter({ stage: safeStage, reason: safeReason, retryAfterSeconds });
+  return Object.assign(new Error(message), {
+    shieldFailure: { stage: safeStage, reason: safeReason, ...(retryAfter === undefined ? {} : { retryAfterSeconds: retryAfter }) },
+  });
 }
 
-async function cachedDecision({ decisionCache, decisionContext, body, evaluate }) {
+// Only a full queue is worth retrying later; the estimate comes from the privacy filter.
+function validRetryAfter({ stage, reason, retryAfterSeconds }) {
+  const retryable = stage === "privacy_scan" && (reason === "admission_limit" || reason === "queue_timeout");
+  return retryable && Number.isInteger(retryAfterSeconds) && retryAfterSeconds >= 1 && retryAfterSeconds <= 60
+    ? retryAfterSeconds
+    : undefined;
+}
+
+async function cachedDecision({ decisionCache, decisionContext, body, evaluate, signal }) {
   const requestDigest = createHash("sha256").update(body).digest("hex");
   const key = { ...decisionContext, requestDigest };
-  const result = await decisionCache.getOrCompute(key, async () => {
-    const decision = await evaluate();
+  const result = await decisionCache.getOrCompute(key, async (sharedSignal) => {
+    const decision = await evaluate(sharedSignal);
     const redactedBody = decision?.action === "redact" ? validateRedactedBody(decision.redactedBody) : Buffer.alloc(0);
     if (redactedBody === null) throw new Error("shield decision redaction is invalid");
     const action = decision?.action;
@@ -360,7 +372,7 @@ async function cachedDecision({ decisionCache, decisionContext, body, evaluate }
       ? decision.reasonCodes
       : [action === "allow" ? "policy_allow" : "policy_blocked"];
     return { ...key, action, reasonCodes, transformCount: decision?.transformCount ?? 0, body: redactedBody };
-  });
+  }, { signal });
   if (!result || typeof result !== "object" || !["evaluated", "cache_hit", "coalesced"].includes(result.source)) {
     throw new Error("shield decision cache result provenance is invalid");
   }
@@ -556,10 +568,13 @@ function waitForDrain(response, signal) {
   });
 }
 
-async function finish(response, { status, code }) {
+async function finish(response, { status, code, retryAfterSeconds }) {
   if (!response.headersSent) {
     const body = Buffer.from(JSON.stringify({ error: { code } }));
-    response.writeHead(status, { "content-type": "application/json", "content-length": String(body.byteLength) });
+    response.writeHead(status, {
+      "content-type": "application/json", "content-length": String(body.byteLength),
+      ...(retryAfterSeconds === undefined ? {} : { "retry-after": String(retryAfterSeconds) }),
+    });
     response.end(body);
   }
 }

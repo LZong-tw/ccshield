@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { gzipSync } from "node:zlib";
 
-import { startShieldProxy } from "../src/shield/proxy.mjs";
+import { createShieldFailure, startShieldProxy } from "../src/shield/proxy.mjs";
 import { createApprovalBroker } from "../src/shield/approval.mjs";
 import { approvalChannelRegistration, createApprovalChannel } from "../src/shield/approval-channel.mjs";
 import { createDecisionCache } from "../src/shield/decision-cache.mjs";
@@ -17,6 +17,16 @@ import { startShieldDaemon } from "../src/shieldd.mjs";
 
 const CAPABILITY = "c".repeat(32);
 const CONTROL_CAPABILITY = "d".repeat(32);
+// Worst case is 16 failures plus 32 recent scans with every field at its bound: ~7 KB.
+const DIAGNOSTICS_MAX_BYTES = 8192;
+
+test("diagnostics size limit covers the worst-case payload", () => {
+  const reason = "conflicting-protocol-context";
+  const failure = { stage: "privacy_scan", reason, bytes: 1_048_576, elapsedMs: 3_600_000 };
+  const scan = { status: "unavailable", reason, hits: 65_536, misses: 65_536, segmentHits: 65_536, segmentMisses: 65_536, attached: 8, elapsedMs: 3_600_000 };
+  const bytes = Buffer.byteLength(JSON.stringify({ failures: Array(16).fill(failure), scans: Array(32).fill(scan) }));
+  assert.equal(bytes < DIAGNOSTICS_MAX_BYTES, true, `worst-case diagnostics are ${bytes} bytes`);
+});
 
 test("diagnostics are control-only, nondestructive and never forward endpoint variants", async (t) => {
   let upstreamCalls = 0;
@@ -91,7 +101,7 @@ test("diagnostics separate real daemon scan, policy and redaction failures while
     const reply = request.type === "health"
       ? { type: "health", id: request.id, protocol: request.protocol, version: "privacy-1" }
       : mode === "prediction" ? { type: "scan", id: request.id, status: "unknown", reason: "invalid-prediction", private: "prediction-secret" }
-        : ["model_timeout", "model_error", "model_killed", "protocol-graph-mutation", "protocol-control-mutation", "signed-block-mutation", "invalid-source-provenance", "json-key-collision", "invalid-json-topology", "redaction-projection-limit", "redaction-match-limit", "redaction-body-limit", "redaction-frame-limit"].includes(mode) ? { type: "scan", id: request.id, status: "unknown", reason: mode, private: "worker-private-secret" }
+        : ["model_timeout", "model_error", "model_killed", "protocol-graph-mutation", "protocol-control-mutation", "signed-block-mutation", "invalid-source-provenance", "json-key-collision", "invalid-json-topology", "redaction-projection-limit", "redaction-match-limit", "redaction-body-limit", "redaction-frame-limit", "segment-coverage", "segment-cache-invalid"].includes(mode) ? { type: "scan", id: request.id, status: "unknown", reason: mode, private: "worker-private-secret" }
         : mode === "unknown" ? { type: "scan", id: request.id, status: "unknown", reason: "credential-secret" }
           : { type: "scan", id: request.id, status: "ok", findings: [] };
     worker.stdout.emit("data", `${JSON.stringify(reply)}\n`);
@@ -127,6 +137,7 @@ test("diagnostics separate real daemon scan, policy and redaction failures while
     ["invalid-json-topology", "privacy_scan", "invalid-json-topology"],
     ["redaction-projection-limit", "privacy_scan", "redaction-projection-limit"], ["redaction-match-limit", "privacy_scan", "redaction-match-limit"],
     ["redaction-body-limit", "privacy_scan", "redaction-body-limit"], ["redaction-frame-limit", "privacy_scan", "redaction-frame-limit"],
+    ["segment-coverage", "privacy_scan", "segment-coverage"], ["segment-cache-invalid", "privacy_scan", "segment-cache-invalid"],
     ["privacy_throw", "privacy_scan", "privacy_unavailable"],
     ["secret", "secret_scan", "scanner_unavailable"], ["policy", "policy", "policy_unavailable"],
     ["redaction", "redaction", "redaction_invalid"], ["audit", "audit", "audit_unavailable"],
@@ -146,7 +157,112 @@ test("diagnostics separate real daemon scan, policy and redaction failures while
   assert.doesNotMatch(JSON.stringify(await readDiagnostics(daemon.shield)), /body-secret|prediction-secret|credential-secret|scanner-secret|policy-secret|audit-secret|worker-private-secret|fixture|requestId/);
   const { scans } = await readDiagnostics(daemon.shield);
   assert.equal(Array.isArray(scans) && scans.length > 0 && scans.length <= 32, true);
-  for (const scan of scans) assert.deepEqual(Object.keys(scan).sort(), ["elapsedMs", "hits", "misses", "reason", "status"]);
+  for (const scan of scans) assert.deepEqual(Object.keys(scan).sort(), ["attached", "elapsedMs", "hits", "misses", "reason", "segmentHits", "segmentMisses", "status"]);
+});
+
+test("a client disconnect aborts the daemon's privacy scan and frees its queued admission slot", async (t) => {
+  const upstream = await startFixture(t, async (_request, response) => { response.end('{}'); });
+  const worker = new EventEmitter();
+  worker.stdout = new EventEmitter(); worker.stderr = new EventEmitter();
+  worker.kill = () => {};
+  worker.stdin = Object.assign(new EventEmitter(), { write(chunk) {
+    const request = JSON.parse(String(chunk).trim());
+    if (request.type === "health") worker.stdout.emit("data", `${JSON.stringify({ type: "health", id: request.id, protocol: request.protocol, version: "privacy-1" })}\n`);
+  } });
+  let filter;
+  let observedSignal;
+  let notifyScanStarted;
+  const scanStarted = new Promise((resolve) => { notifyScanStarted = resolve; });
+  const gitleaks = { executable: "/private/fixture/gitleaks", sha256: "a".repeat(64), ruleBundle: { path: "/private/fixture/rules", sha256: "b".repeat(64), version: "rules-1" } };
+  const daemon = await startShieldDaemon({
+    config: { capability: CAPABILITY, controlCapability: CONTROL_CAPABILITY, lane: "subscription", targetOrigin: upstream.origin, gitleaks },
+    paths: { configPath: "/private/fixture/config" },
+    readPolicyBundle: async () => ({ bundle: {}, publicKey: "fixture" }),
+    loadPolicy: async () => ({ version: "policy-1", detectorVersions: { gitleaks: "8", privacy: "privacy-1" }, async evaluate() { return { action: "allow" }; } }),
+    readAssetsProvision: async () => ({ gitleaks: { path: gitleaks.executable, sha256: gitleaks.sha256, rules: gitleaks.ruleBundle }, privacy: { version: "privacy-1", worker: { command: "/private/fixture/worker", args: [], sha256: "c".repeat(64) } } }),
+    createScanner: async () => ({ version: "8", async scan() { return { findings: [] }; } }),
+    createPrivacy: async (options) => {
+      filter = await createPrivacyFilter({ ...options, spawnWorker: () => worker, validateWorker: async () => {} });
+      return { ...filter, scan(body, scanOptions) {
+        observedSignal = scanOptions?.signal;
+        const result = filter.scan(body, scanOptions);
+        notifyScanStarted();
+        return result;
+      } };
+    },
+    createDecisionRecorder: async () => ({ isReady: async () => true, async recordShieldDecision() {} }),
+    writePolicyState: async () => {}, writeIdentity: async () => {},
+  });
+  t.after(() => daemon.shield.close());
+  const held = [0, 1, 2].map((index) => filter.scan(Buffer.from(JSON.stringify({ held: index }))));
+  const target = new URL(daemon.shield.origin);
+  const client = httpRequest({
+    host: target.hostname, port: target.port, method: "POST", path: "/v1/messages",
+    headers: { "content-length": "2", "x-airkit-shield": CAPABILITY },
+  });
+  const clientClosed = new Promise((resolve) => client.once("close", resolve));
+  client.once("error", () => {});
+  client.end("{}");
+  await scanStarted;
+  assert.equal((await filter.scan(Buffer.from('{"late":true}'))).reason, "admission_limit");
+  client.destroy();
+  await clientClosed;
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(observedSignal?.aborted, true);
+  let lateSettled = false;
+  const late = filter.scan(Buffer.from('{"late":true}')).then((result) => { lateSettled = true; return result; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(lateSettled, false, "a freed slot must admit the next scan instead of rejecting it");
+  filter.close();
+  assert.deepEqual((await Promise.all([...held, late])).map((result) => result.reason), Array(4).fill("worker_closed"));
+});
+
+test("admission and queue failures reach the client as a Retry-After header, other 503s do not", async (t) => {
+  const upstream = await startFixture(t, async () => assert.fail("a failed decision must never forward"));
+  const decisionContext = { lane: "subscription", destinationClass: "subscription", policyVersion: "policy-1", detectorVersions: { gitleaks: "1", privacy: "1" } };
+  for (const [reason, retryAfterSeconds, expected, cached] of [
+    ["admission_limit", 7, "7", false],
+    ["queue_timeout", 60, "60", false],
+    ["admission_limit", 12, "12", true],
+    ["scan_timeout", 7, null, false],
+    ["worker_unavailable", 7, null, false],
+    ["admission_limit", 0, null, false],
+    ["queue_timeout", 61, null, false],
+  ]) {
+    const shield = await startShield(t, {
+      targetOrigin: upstream.origin,
+      ...(cached ? { decisionCache: createDecisionCache(), decisionContext } : {}),
+      decide: async () => { throw createShieldFailure("privacy_scan", reason, "busy", { retryAfterSeconds }); },
+    });
+    const response = await fetch(`${shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield": CAPABILITY }, body: "{}" });
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { error: { code: "shield_unavailable" } });
+    assert.equal(response.headers.get("retry-after"), expected, `${reason} ${retryAfterSeconds}`);
+  }
+});
+
+test("the daemon keeps the privacy Retry-After estimate on its shield failure", async (t) => {
+  const upstream = await startFixture(t, async () => assert.fail("a failed decision must never forward"));
+  const gitleaks = { executable: "/private/fixture/gitleaks", sha256: "a".repeat(64), ruleBundle: { path: "/private/fixture/rules", sha256: "b".repeat(64), version: "rules-1" } };
+  const daemon = await startShieldDaemon({
+    config: { capability: CAPABILITY, controlCapability: CONTROL_CAPABILITY, lane: "subscription", targetOrigin: upstream.origin, gitleaks },
+    paths: { configPath: "/private/fixture/config" },
+    readPolicyBundle: async () => ({ bundle: {}, publicKey: "fixture" }),
+    loadPolicy: async () => ({ version: "policy-1", detectorVersions: { gitleaks: "8", privacy: "privacy-1" }, async evaluate() { return { action: "allow" }; } }),
+    readAssetsProvision: async () => ({ gitleaks: { path: gitleaks.executable, sha256: gitleaks.sha256, rules: gitleaks.ruleBundle }, privacy: { version: "privacy-1", worker: { command: "/private/fixture/worker", args: [], sha256: "c".repeat(64) } } }),
+    createScanner: async () => ({ version: "8", async scan() { return { findings: [] }; } }),
+    createPrivacy: async () => ({
+      version: "privacy-1", async isReady() { return true; }, recentScans: () => [], close() {},
+      async scan() { return { status: "unavailable", reason: "admission_limit", findings: [], retryAfterSeconds: 9 }; },
+    }),
+    createDecisionRecorder: async () => ({ isReady: async () => true, async recordShieldDecision() {} }),
+    writePolicyState: async () => {}, writeIdentity: async () => {},
+  });
+  t.after(() => daemon.shield.close());
+  const response = await fetch(`${daemon.shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield": CAPABILITY }, body: "{}" });
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get("retry-after"), "9");
+  assert.equal((await readDiagnostics(daemon.shield)).failures[0].reason, "admission_limit");
 });
 
 test("diagnostics sanitize arbitrary metadata and separate redaction, audit and upstream failures", async (t) => {
@@ -201,7 +317,7 @@ async function readDiagnostics(shield) {
   assert.equal(response.headers.get("cache-control"), "no-store");
   assert.equal(response.headers.get("content-type"), "application/json");
   const text = await response.text();
-  assert.equal(Buffer.byteLength(text) < 4096, true);
+  assert.equal(Buffer.byteLength(text) < DIAGNOSTICS_MAX_BYTES, true);
   return JSON.parse(text);
 }
 
@@ -297,6 +413,92 @@ test("proxy preserves atomic cache provenance in its re-audit metadata", async (
   }, '{"same":true}');
   assert.equal(result.status, 200);
   assert.deepEqual(events.map((event) => event.decisionSource), ["coalesced"]);
+});
+
+async function startCoalescingShield(t) {
+  const calls = [];
+  const joins = [];
+  const cache = createDecisionCache();
+  t.after(() => { for (const call of calls) call.reject(abortedFailure()); });
+  const upstream = await startFixture(t, async (_request, response) => response.end("{}"));
+  const shield = await startShield(t, {
+    targetOrigin: upstream.origin,
+    decisionCache: {
+      getOrCompute(...args) {
+        joins.push(args);
+        return cache.getOrCompute(...args);
+      },
+    },
+    decisionContext: { lane: "subscription", destinationClass: "subscription", policyVersion: "policy-1", detectorVersions: { gitleaks: "1", privacy: "1" } },
+    decide: ({ signal }) => new Promise((resolve, reject) => calls.push({ signal, resolve, reject })),
+  });
+  const send = () => {
+    const target = new URL(shield.origin);
+    const client = httpRequest({
+      host: target.hostname, port: target.port, method: "POST", path: "/v1/messages",
+      headers: { "x-airkit-shield": CAPABILITY, "content-type": "application/json" },
+    });
+    const status = new Promise((resolve) => {
+      client.once("response", (response) => { response.resume(); resolve(response.statusCode); });
+      client.once("error", () => resolve(null));
+    });
+    client.end('{"same":true}');
+    return { client, status };
+  };
+  return { calls, joins, cache, send };
+}
+
+async function until(predicate) {
+  for (let attempt = 0; attempt < 200 && !predicate(); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(predicate(), true);
+}
+
+const ALLOW = { action: "allow", reasonCodes: ["policy_allow"] };
+const abortedFailure = () => Object.assign(new Error("aborted"), { shieldFailure: { stage: "privacy_scan", reason: "aborted" } });
+
+test("a coalesced decision survives the first caller disconnecting", async (t) => {
+  const { calls, joins, send } = await startCoalescingShield(t);
+  const first = send();
+  await until(() => calls.length === 1);
+  const second = send();
+  await until(() => joins.length === 2);
+  first.client.destroy();
+  await first.status;
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(calls[0].signal.aborted, false);
+  calls[0].resolve(ALLOW);
+  assert.equal(await second.status, 200);
+  assert.equal(calls.length, 1);
+});
+
+test("a coalesced decision aborts only after every caller disconnects", async (t) => {
+  const { calls, joins, cache, send } = await startCoalescingShield(t);
+  const first = send();
+  await until(() => calls.length === 1);
+  const second = send();
+  await until(() => joins.length === 2);
+  first.client.destroy();
+  second.client.destroy();
+  await until(() => calls[0].signal.aborted);
+  calls[0].reject(abortedFailure());
+  await until(() => cache.inspect().inFlight === 0);
+});
+
+test("a caller arriving after a coalesced abort starts a fresh decision", async (t) => {
+  const { calls, joins, send } = await startCoalescingShield(t);
+  const first = send();
+  await until(() => calls.length === 1);
+  const second = send();
+  await until(() => joins.length === 2);
+  first.client.destroy();
+  second.client.destroy();
+  await until(() => calls[0].signal.aborted);
+  const third = send();
+  await until(() => calls.length === 2);
+  assert.equal(calls[1].signal.aborted, false);
+  calls[1].resolve(ALLOW);
+  assert.equal(await third.status, 200);
+  calls[0].reject(abortedFailure());
 });
 
 test("authentication and decision failure never contact upstream", async (t) => {

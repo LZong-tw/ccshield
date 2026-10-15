@@ -73,7 +73,7 @@ export async function startShieldDaemon({
     if (privacy?.version !== policy.detectorVersions.privacy) throw new Error("shield privacy version does not match policy metadata");
     recorder = await createDecisionRecorder({ config, paths, policy, assets });
     if (typeof recorder?.recordShieldDecision !== "function") throw new Error("shield audit recorder is unavailable");
-    const decide = async ({ body, launcherContext: requestLauncherContext = null }) => {
+    const decide = async ({ body, signal, launcherContext: requestLauncherContext = null }) => {
       const launcherContext = {
         ...(requestLauncherContext ?? config.launcherContext ?? defaultShieldLauncherContext(destinationClass)),
         destinationClass,
@@ -87,9 +87,9 @@ export async function startShieldDaemon({
       } catch { throw shieldFailure("secret_scan", "scanner_unavailable", "shield secret scanner unavailable"); }
       let privacyScan;
       try {
-        privacyScan = confirmedSecret ? { status: "ok", findings: [] } : await privacy.scan(body);
+        privacyScan = confirmedSecret ? { status: "ok", findings: [] } : await privacy.scan(body, { signal });
       } catch { throw shieldFailure("privacy_scan", "privacy_unavailable", "shield privacy worker unavailable"); }
-      if (privacyScan?.status !== "ok") throw shieldFailure("privacy_scan", privacyScan?.reason, "shield privacy worker unavailable");
+      if (privacyScan?.status !== "ok") throw shieldFailure("privacy_scan", privacyScan?.reason, "shield privacy worker unavailable", privacyScan ?? {});
       let piiFindings;
       try { piiFindings = canonicalPrivacyFindings(privacyScan.findings); }
       catch { throw shieldFailure("privacy_scan", "findings_invalid", "shield privacy findings are invalid"); }

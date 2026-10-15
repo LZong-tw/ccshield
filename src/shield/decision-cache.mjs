@@ -35,26 +35,48 @@ export function createDecisionCache({ clock = () => Date.now(), ttlMs = 30_000, 
     while (entries.size > maxEntries) entries.delete(entries.keys().next().value);
     return cloneDecision(decision);
   };
+  // The shared computation is aborted only once every attached caller has aborted.
+  const attach = (flight, signal) => {
+    if (signal?.aborted) {
+      if (flight.attached === 0) flight.controller.abort();
+      return;
+    }
+    flight.attached += 1;
+    if (!signal) return;
+    const detach = () => {
+      flight.attached -= 1;
+      if (flight.attached === 0) flight.controller.abort();
+    };
+    signal.addEventListener("abort", detach, { once: true });
+    const release = () => signal.removeEventListener("abort", detach);
+    flight.pending.then(release, release);
+  };
 
   return Object.freeze({
     set: write,
-    async getOrCompute(value, compute) {
+    async getOrCompute(value, compute, { signal } = {}) {
       if (typeof compute !== "function") throw new TypeError("shield decision cache compute is required");
       const hit = read(value);
       if (hit) return result(hit, "cache_hit");
       const key = keyFor(value);
-      let pending = inflight.get(key);
-      if (pending) return result(await pending, "coalesced");
+      const current = inflight.get(key);
+      // A computation whose callers all left is already doomed; start over instead of joining it.
+      if (current && !current.controller.signal.aborted) {
+        attach(current, signal);
+        return result(await current.pending, "coalesced");
+      }
       const computeGeneration = generation;
-      pending = Promise.resolve().then(compute).then((decision) => {
+      const flight = { controller: new AbortController(), attached: 0, pending: null };
+      flight.pending = Promise.resolve().then(() => compute(flight.controller.signal)).then((decision) => {
           if (keyFor(decision) !== key) throw new Error("shield decision cache computed identity mismatch");
           if (computeGeneration !== generation) throw new Error("shield decision cache computation was invalidated");
           return write(decision);
         }).finally(() => {
-          if (inflight.get(key) === pending) inflight.delete(key);
+          if (inflight.get(key) === flight) inflight.delete(key);
         });
-      inflight.set(key, pending);
-      return result(await pending, "evaluated");
+      inflight.set(key, flight);
+      attach(flight, signal);
+      return result(await flight.pending, "evaluated");
     },
     invalidateTransition(value) {
       transition = stableVersion(value);

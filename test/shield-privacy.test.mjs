@@ -65,6 +65,12 @@ test("recent scans keep only bounded window cache counts, status and allowlisted
     { status: "ok", findings: [], cache: { hits: 1, misses: 65_537 } },
     { status: "ok", findings: [], cache: { hits: 1.5, misses: 0, private: sentinel } },
     { status: "unknown", reason: sentinel },
+    { status: "ok", findings: [], segmentHits: 40, segmentMisses: 2 },
+    { status: "ok", findings: [], segmentHits: -1, segmentMisses: 2 },
+    { status: "ok", findings: [], segmentHits: 1, segmentMisses: 65_537 },
+    { status: "ok", findings: [], segmentHits: "3", segmentMisses: 0 },
+    { status: "unknown", reason: "segment-coverage", segmentHits: 4, segmentMisses: 1 },
+    { status: "unknown", reason: "segment-cache-invalid" },
   ];
   let next = 0;
   const worker = fakeWorker((message, emit) => {
@@ -77,15 +83,23 @@ test("recent scans keep only bounded window cache counts, status and allowlisted
   for (let index = 0; index < replies.length; index += 1) {
     const result = await filter.scan(Buffer.from('{}'));
     assert.equal("cache" in result, false);
+    assert.equal("segmentHits" in result || "segmentMisses" in result, false);
   }
   const scans = filter.recentScans();
+  const counts = { segmentHits: null, segmentMisses: null, attached: 0 };
   assert.deepEqual(scans.map(({ elapsedMs, ...scan }) => scan), [
-    { status: "ok", reason: null, hits: 3, misses: 1 },
-    { status: "unknown", reason: "model_timeout", hits: 0, misses: 2 },
-    { status: "ok", reason: null, hits: null, misses: null },
-    { status: "ok", reason: null, hits: null, misses: null },
-    { status: "ok", reason: null, hits: null, misses: null },
-    { status: "unknown", reason: "privacy_unavailable", hits: null, misses: null },
+    { status: "ok", reason: null, hits: 3, misses: 1, ...counts },
+    { status: "unknown", reason: "model_timeout", hits: 0, misses: 2, ...counts },
+    { status: "ok", reason: null, hits: null, misses: null, ...counts },
+    { status: "ok", reason: null, hits: null, misses: null, ...counts },
+    { status: "ok", reason: null, hits: null, misses: null, ...counts },
+    { status: "unknown", reason: "privacy_unavailable", hits: null, misses: null, ...counts },
+    { status: "ok", reason: null, hits: null, misses: null, ...counts, segmentHits: 40, segmentMisses: 2 },
+    { status: "ok", reason: null, hits: null, misses: null, ...counts },
+    { status: "ok", reason: null, hits: null, misses: null, ...counts },
+    { status: "ok", reason: null, hits: null, misses: null, ...counts },
+    { status: "unknown", reason: "segment-coverage", hits: null, misses: null, ...counts, segmentHits: 4, segmentMisses: 1 },
+    { status: "unknown", reason: "segment-cache-invalid", hits: null, misses: null, ...counts },
   ]);
   for (const scan of scans) assert.equal(Number.isInteger(scan.elapsedMs) && scan.elapsedMs >= 0, true);
   assert.doesNotMatch(JSON.stringify(scans), new RegExp(sentinel));
@@ -176,8 +190,8 @@ test("privacy distinguishes body, admission, frame, queue, timeout and protocol 
   assert.equal((await filter.scan(Buffer.alloc(1_048_577))).reason, "body_invalid");
   assert.notEqual((await filter.scan(Buffer.alloc(786_400))).reason, "frame_limit");
   const first = filter.scan(Buffer.from('{}'));
-  const waiting = Array.from({ length: 3 }, () => filter.scan(Buffer.from(JSON.stringify({ content: sentinel }))));
-  assert.equal((await filter.scan(Buffer.from('{}'))).reason, "admission_limit");
+  const waiting = Array.from({ length: 3 }, (_, index) => filter.scan(Buffer.from(JSON.stringify({ content: sentinel, index }))));
+  assert.equal((await filter.scan(Buffer.from('{"content":"fifth"}'))).reason, "admission_limit");
   await flushTasks();
   worker.stdout.emit("data", `${sentinel}\n`);
   assert.equal((await first).reason, "protocol_invalid");
@@ -190,8 +204,8 @@ test("privacy distinguishes body, admission, frame, queue, timeout and protocol 
   const timed = await createPrivacyFilter({ provision, spawnWorker: () => timedWorker, validateWorker, timeoutMs: 100 });
   t.after(() => timed.close());
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const active = timed.scan(Buffer.from('{}'));
-  const queued = timed.scan(Buffer.from('{}'));
+  const active = timed.scan(Buffer.from('{"content":"active"}'));
+  const queued = timed.scan(Buffer.from('{"content":"queued"}'));
   await flushTasks();
   t.mock.timers.tick(100);
   assert.equal((await queued).reason, "queue_timeout");
@@ -199,11 +213,68 @@ test("privacy distinguishes body, admission, frame, queue, timeout and protocol 
   const nextActive = timed.scan(Buffer.from('{}'));
   await flushTasks();
   t.mock.timers.tick(10);
-  const nextQueued = timed.scan(Buffer.from('{}'));
+  const nextQueued = timed.scan(Buffer.from('{"content":"next"}'));
   t.mock.timers.tick(90);
   assert.equal((await nextActive).reason, "scan_timeout");
   assert.equal((await nextQueued).reason, "worker_unavailable", "a waiting request must not inherit another scan's timeout diagnosis");
 });
+
+test("admission and queue failures carry a Retry-After estimate from recent scan times", async (t) => {
+  const { filter, complete, fill } = await retryAfterFilter(t);
+  const extra = () => filter.scan(Buffer.from('{"content":"extra"}'));
+
+  const first = await fill();
+  assert.equal((await extra()).retryAfterSeconds, 30, "no recent scans falls back to the scan timeout");
+  for (let index = 0; index < 4; index += 1) await complete(2_000);
+  await Promise.all(first);
+
+  const second = await fill();
+  assert.equal((await extra()).retryAfterSeconds, 8, "one active plus three queued at a 2 s median");
+  t.mock.timers.tick(30_000);
+  const results = await Promise.all(second);
+  assert.deepEqual(results.map(({ reason, retryAfterSeconds }) => [reason, retryAfterSeconds]), [
+    ["scan_timeout", undefined],
+    ["queue_timeout", 6],
+    ["queue_timeout", 4],
+    ["queue_timeout", 2],
+  ]);
+});
+
+test("Retry-After estimates are clamped to 60 seconds", async (t) => {
+  const { filter, complete, fill } = await retryAfterFilter(t);
+  for (let index = 0; index < 3; index += 1) {
+    const [scan] = await fill(1);
+    await complete(25_000);
+    await scan;
+  }
+  await fill();
+  const result = await filter.scan(Buffer.from('{"content":"extra"}'));
+  assert.equal(result.reason, "admission_limit");
+  assert.equal(result.retryAfterSeconds, 60);
+});
+
+async function retryAfterFilter(t) {
+  const replies = [];
+  const worker = fakeWorker((message, emit) => {
+    if (message.type === "health") emit(health(message));
+    if (message.type === "scan") replies.push(() => emit({ type: "scan", id: message.id, status: "ok", findings: [] }));
+  });
+  const filter = await createPrivacyFilter({ provision, spawnWorker: () => worker, validateWorker, timeoutMs: 30_000 });
+  t.after(() => filter.close());
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  let bodies = 0;
+  const fill = async (count = 4) => {
+    const scans = Array.from({ length: count }, () => filter.scan(Buffer.from(JSON.stringify({ body: bodies++ }))));
+    await flushTasks();
+    return scans;
+  };
+  const complete = async (elapsedMs) => {
+    t.mock.timers.tick(elapsedMs);
+    replies.shift()();
+    await flushTasks();
+  };
+  return { filter, complete, fill };
+}
 
 test("privacy worker assets are revalidated immediately before each worker spawn", async () => {
   let validations = 0;
@@ -330,6 +401,188 @@ test("expired waiting scans never dispatch and each admitted scan gets its timeo
   assert.equal((await second).status, "ok");
   await flushTasks();
   assert.equal(worker.messages.filter((message) => message.type === "scan").length, 2);
+});
+
+test("identical concurrent bodies share one worker scan but each caller owns its result and buffer", async (t) => {
+  const worker = fakeWorker((message, emit) => {
+    if (message.type === "health") emit(health(message));
+  });
+  const filter = await createPrivacyFilter({ provision, spawnWorker: () => worker, validateWorker });
+  t.after(() => filter.close());
+  const body = Buffer.from(`{"content":"${sentinel}"}`);
+  const first = filter.scan(body);
+  const second = filter.scan(Buffer.from(body));
+  await flushTasks();
+  const sent = worker.messages.filter((message) => message.type === "scan");
+  assert.equal(sent.length, 1);
+  emit(worker, { type: "scan", id: sent[0].id, status: "ok", findings: [{ label: "email", count: 1 }], redactedBody: Buffer.from('{"content":"[EMAIL]"}').toString("base64") });
+  const [a, b] = await Promise.all([first, second]);
+  assert.deepEqual(a, b);
+  assert.notEqual(a, b);
+  assert.notEqual(a.redactedBody, b.redactedBody);
+  a.redactedBody.fill(0);
+  assert.deepEqual(b.redactedBody, Buffer.from('{"content":"[EMAIL]"}'));
+  assert.deepEqual(filter.recentScans().map(({ attached }) => attached), [1]);
+});
+
+test("same-length bodies with different content are never merged", async (t) => {
+  const worker = fakeWorker((message, emit) => {
+    if (message.type === "health") emit(health(message));
+    if (message.type === "scan") emit({ type: "scan", id: message.id, status: "ok", findings: [] });
+  });
+  const filter = await createPrivacyFilter({ provision, spawnWorker: () => worker, validateWorker });
+  t.after(() => filter.close());
+  const results = await Promise.all([filter.scan(Buffer.from('{"c":"a"}')), filter.scan(Buffer.from('{"c":"b"}'))]);
+  assert.deepEqual(results.map((result) => result.status), ["ok", "ok"]);
+  assert.deepEqual(worker.messages.filter((message) => message.type === "scan").map((message) => Buffer.from(message.body, "base64").toString()), ['{"c":"a"}', '{"c":"b"}']);
+});
+
+test("attaching to a queued identical body bypasses the admission limit", async (t) => {
+  const worker = fakeWorker((message, emit) => {
+    if (message.type === "health") emit(health(message));
+  });
+  const filter = await createPrivacyFilter({ provision, spawnWorker: () => worker, validateWorker });
+  t.after(() => filter.close());
+  const bodies = Array.from({ length: 4 }, (_, index) => Buffer.from(JSON.stringify({ content: `synthetic-${index}` })));
+  const scans = bodies.map((body) => filter.scan(body));
+  await flushTasks();
+  assert.equal((await filter.scan(Buffer.from('{"content":"other"}'))).reason, "admission_limit");
+  const attached = filter.scan(Buffer.from(bodies[2]));
+  for (let index = 0; index < bodies.length; index += 1) {
+    const sent = worker.messages.filter((message) => message.type === "scan");
+    emit(worker, { type: "scan", id: sent[index].id, status: "ok", findings: [] });
+    await scans[index];
+    await flushTasks();
+  }
+  assert.equal((await attached).status, "ok");
+  assert.equal(worker.messages.filter((message) => message.type === "scan").length, 4);
+});
+
+test("an entry accepts at most eight attached waiters before identical bodies take the admission path", async (t) => {
+  const worker = fakeWorker((message, emit) => {
+    if (message.type === "health") emit(health(message));
+  });
+  const filter = await createPrivacyFilter({ provision, spawnWorker: () => worker, validateWorker });
+  t.after(() => filter.close());
+  const body = Buffer.from('{"content":"shared"}');
+  const scans = Array.from({ length: 10 }, () => filter.scan(Buffer.from(body)));
+  await flushTasks();
+  for (let index = 0; index < 2; index += 1) {
+    const sent = worker.messages.filter((message) => message.type === "scan");
+    assert.equal(sent.length, index + 1);
+    emit(worker, { type: "scan", id: sent[index].id, status: "ok", findings: [] });
+    await flushTasks();
+  }
+  assert.deepEqual((await Promise.all(scans)).map((result) => result.status), Array(10).fill("ok"));
+  assert.deepEqual(filter.recentScans().map(({ attached }) => attached), [8, 0]);
+});
+
+test("a body arriving after its entry timed out in the queue starts a fresh scan", async (t) => {
+  const workers = [];
+  const filter = await createPrivacyFilter({
+    provision,
+    spawnWorker: () => {
+      const worker = fakeWorker((message, emit) => { if (message.type === "health") emit(health(message)); });
+      workers.push(worker);
+      return worker;
+    },
+    validateWorker,
+    timeoutMs: 100,
+  });
+  t.after(() => filter.close());
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const active = filter.scan(Buffer.from('{"content":"active"}'));
+  const queued = filter.scan(Buffer.from('{"content":"queued"}'));
+  await flushTasks();
+  t.mock.timers.tick(100);
+  assert.equal((await queued).reason, "queue_timeout");
+  assert.equal((await active).reason, "scan_timeout");
+  const retry = filter.scan(Buffer.from('{"content":"queued"}'));
+  for (let i = 0; i < 5; i += 1) await flushTasks();
+  const sent = workers.flatMap((worker) => worker.messages.filter((message) => message.type === "scan").map((message) => ({ worker, message })));
+  const last = sent.at(-1);
+  assert.equal(Buffer.from(last.message.body, "base64").toString(), '{"content":"queued"}');
+  emit(last.worker, { type: "scan", id: last.message.id, status: "ok", findings: [] });
+  assert.equal((await retry).status, "ok");
+});
+
+test("a failed shared scan hands every waiter the same unknown result", async (t) => {
+  const worker = fakeWorker((message, emit) => {
+    if (message.type === "health") emit(cooperativeHealth(message));
+  });
+  const filter = await createPrivacyFilter({ provision, spawnWorker: () => worker, validateWorker });
+  t.after(() => filter.close());
+  const scans = Array.from({ length: 3 }, () => filter.scan(Buffer.from('{"content":"shared"}')));
+  await flushTasks();
+  emit(worker, { type: "scan", id: worker.messages.at(-1).id, status: "unknown", reason: "model_error" });
+  const results = await Promise.all(scans);
+  for (const result of results) assert.deepEqual(result, { status: "unknown", findings: [], reason: "model_error" });
+  assert.equal(worker.messages.filter((message) => message.type === "scan").length, 1);
+});
+
+test("aborting the only waiter of a queued scan frees its admission slot without dispatching it", async (t) => {
+  const worker = fakeWorker((message, emit) => {
+    if (message.type === "health") emit(health(message));
+  });
+  const filter = await createPrivacyFilter({ provision, spawnWorker: () => worker, validateWorker });
+  t.after(() => filter.close());
+  const controller = new AbortController();
+  const scans = [0, 1, 2].map((index) => filter.scan(Buffer.from(JSON.stringify({ content: `synthetic-${index}` }))));
+  const abandoned = filter.scan(Buffer.from(`{"content":"${sentinel}"}`), { signal: controller.signal });
+  await flushTasks();
+  assert.equal((await filter.scan(Buffer.from('{"content":"late"}'))).reason, "admission_limit");
+  controller.abort();
+  assert.equal((await abandoned).reason, "aborted");
+  const late = filter.scan(Buffer.from('{"content":"late"}'));
+  for (let index = 0; index < 4; index += 1) {
+    await flushTasks();
+    emit(worker, { type: "scan", id: worker.messages.at(-1).id, status: "ok", findings: [] });
+  }
+  assert.deepEqual((await Promise.all([...scans, late])).map((result) => result.status), Array(4).fill("ok"));
+  assert.doesNotMatch(JSON.stringify(worker.messages), new RegExp(Buffer.from(sentinel).toString("base64").slice(0, 16)));
+  assert.equal((await filter.scan(Buffer.from('{}'), { signal: AbortSignal.abort() })).reason, "aborted");
+});
+
+test("one aborted waiter leaves a shared queued scan running for the other", async (t) => {
+  const worker = fakeWorker((message, emit) => {
+    if (message.type === "health") emit(health(message));
+  });
+  const filter = await createPrivacyFilter({ provision, spawnWorker: () => worker, validateWorker });
+  t.after(() => filter.close());
+  const owner = new AbortController();
+  const active = filter.scan(Buffer.from('{"content":"active"}'));
+  const first = filter.scan(Buffer.from('{"content":"shared"}'), { signal: owner.signal });
+  const second = filter.scan(Buffer.from('{"content":"shared"}'));
+  await flushTasks();
+  owner.abort();
+  assert.equal((await first).reason, "aborted");
+  emit(worker, { type: "scan", id: worker.messages.at(-1).id, status: "ok", findings: [] });
+  await active;
+  await flushTasks();
+  const sent = worker.messages.filter((message) => message.type === "scan");
+  assert.equal(Buffer.from(sent.at(-1).body, "base64").toString(), '{"content":"shared"}');
+  emit(worker, { type: "scan", id: sent.at(-1).id, status: "ok", findings: [] });
+  assert.equal((await second).status, "ok");
+});
+
+test("aborting an active scan releases the caller while the worker still finishes and records it", async (t) => {
+  const worker = fakeWorker((message, emit) => {
+    if (message.type === "health") emit(health(message));
+  });
+  const filter = await createPrivacyFilter({ provision, spawnWorker: () => worker, validateWorker });
+  t.after(() => filter.close());
+  const controller = new AbortController();
+  const scan = filter.scan(Buffer.from('{"content":"active"}'), { signal: controller.signal });
+  await flushTasks();
+  controller.abort();
+  assert.equal((await scan).reason, "aborted");
+  assert.deepEqual(filter.recentScans(), []);
+  emit(worker, { type: "scan", id: worker.messages.at(-1).id, status: "ok", findings: [], cache: { hits: 1, misses: 2 } });
+  await flushTasks();
+  assert.deepEqual(filter.recentScans().map(({ elapsedMs, ...scan }) => scan), [
+    { status: "ok", reason: null, hits: 1, misses: 2, segmentHits: null, segmentMisses: null, attached: 0 },
+  ]);
+  assert.equal(worker.messages.filter((message) => message.type === "scan").length, 1);
 });
 
 test("privacy close releases active and waiting scans without dispatching retained bodies", async () => {

@@ -11,6 +11,7 @@ const MAX_FRAME_BYTES = 4 * 1_048_576; // base64 redacted body (≤1 MiB → ~1.
 const DEFAULT_TIMEOUT_MS = 2_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
 const MAX_ADMITTED_SCANS = 4;
+const MAX_ATTACHED_WAITERS = 8;
 const RECENT_SCANS = 32;
 const MAX_WINDOW_COUNT = 65_536;
 const REQUEST_FAILURE = Symbol("privacy request failure");
@@ -22,6 +23,7 @@ const ADAPTER_UNKNOWN_REASONS = new Set([
   "invalid-source-provenance", "json-key-collision", "invalid-json-topology",
   "model_timeout", "model_error", "model_killed",
   "redaction-projection-limit", "redaction-match-limit", "redaction-body-limit", "redaction-frame-limit",
+  "segment-coverage", "segment-cache-invalid",
 ]);
 const OPAQUE_VALUE = /^[A-Za-z0-9+/=_-]{16,}$/;
 const PROTOCOL_ID = /^[a-zA-Z0-9_-]+$/;
@@ -49,8 +51,30 @@ export async function createPrivacyFilter({ provision, spawnWorker = defaultSpaw
   let readiness = null;
   let active = null;
   const queue = [];
+  const inflight = new Map();
   const recent = [];
   let closed = false;
+  // A caller that goes away stops waiting at once. Its queued scan is dropped only when nobody else
+  // still waits on it; an active scan always runs to completion so the worker is never interrupted.
+  const addWaiter = (entry, resolve, signal) => {
+    const waiter = {
+      release(result) {
+        signal?.removeEventListener("abort", abandon);
+        resolve(result);
+      },
+    };
+    const abandon = () => {
+      if (!entry.waiters.delete(waiter)) return;
+      waiter.release(unavailable("aborted"));
+      const index = queue.indexOf(entry);
+      if (entry.waiters.size === 0 && index !== -1) {
+        queue.splice(index, 1);
+        entry.settle(unavailable("aborted"));
+      }
+    };
+    entry.waiters.add(waiter);
+    signal?.addEventListener("abort", abandon, { once: true });
+  };
   const failScans = (reason = "worker_unavailable") => {
     active?.settle(unavailable(reason));
     active = null;
@@ -179,6 +203,14 @@ export async function createPrivacyFilter({ provision, spawnWorker = defaultSpaw
       .finally(() => { clearTimeout(timer); starting = null; });
     return await starting;
   };
+  // Seconds until the backlog should clear: waiting plus active scans at the recent median scan time.
+  const retryLater = (reason) => {
+    const times = recent.map((scan) => scan.elapsedMs).sort((left, right) => left - right);
+    const estimateMs = times.length === 0
+      ? scanTimeoutMs
+      : (queue.length + Number(active !== null)) * times[Math.floor(times.length / 2)];
+    return Object.freeze({ ...unavailable(reason), retryAfterSeconds: Math.min(60, Math.max(1, Math.ceil(estimateMs / 1000))) });
+  };
   const drain = async () => {
     if (closed || active || queue.length === 0) return;
     const entry = queue.shift();
@@ -186,6 +218,7 @@ export async function createPrivacyFilter({ provision, spawnWorker = defaultSpaw
     clearTimeout(entry.timer);
     let result = unavailable("worker_unavailable");
     let cache = null;
+    let segments = null;
     const dispatchedAt = Date.now();
     try {
       if (!await ensureWorker() || entry.settled) return;
@@ -202,12 +235,17 @@ export async function createPrivacyFilter({ provision, spawnWorker = defaultSpaw
       const reply = await request(session, { type: "scan", body: entry.body.toString("base64") }, scanTimeoutMs);
       result = normalizeScanReply(reply);
       cache = windowCounts(reply);
+      segments = segmentCounts(reply);
       // Only a worker that advertises cooperative timeouts keeps its model and window cache alive across model_timeout.
       if (result.status === "unknown" && (["model_killed", "model_error"].includes(result.reason) || (result.reason === "model_timeout" && !session.cooperativeTimeout))) session.ready = false;
     } catch {} finally {
       entry.settle(result);
       // Record what the caller actually received; close() or a stopped worker may have settled it first.
-      recordScan(recent, { status: entry.outcome.status, reason: entry.outcome.reason ?? null, cache: entry.outcome === result ? cache : null, elapsedMs: Date.now() - dispatchedAt });
+      const own = entry.outcome === result;
+      recordScan(recent, {
+        status: entry.outcome.status, reason: entry.outcome.reason ?? null, cache: own ? cache : null, segments: own ? segments : null,
+        attached: entry.attached, elapsedMs: Date.now() - dispatchedAt,
+      });
       if (active === entry) active = null;
       void drain();
     }
@@ -236,27 +274,39 @@ export async function createPrivacyFilter({ provision, spawnWorker = defaultSpaw
       }
       return await readiness;
     },
-    async scan(body) {
+    async scan(body, { signal } = {}) {
       if (closed) return unavailable("worker_closed");
       if (!validBody(body)) return unavailable("body_invalid");
-      if (queue.length + Number(active !== null) >= MAX_ADMITTED_SCANS) return unavailable("admission_limit");
+      if (signal?.aborted) return unavailable("aborted");
+      const digest = createHash("sha256").update(body).digest("hex");
+      const shared = inflight.get(digest);
+      // The digest only finds a candidate; the bytes decide, so a collision becomes a separate scan.
+      if (shared && !shared.settled && shared.attached < MAX_ATTACHED_WAITERS && shared.body.equals(body)) {
+        shared.attached += 1;
+        return await new Promise((resolve) => addWaiter(shared, resolve, signal));
+      }
+      if (queue.length + Number(active !== null) >= MAX_ADMITTED_SCANS) return retryLater("admission_limit");
       return await new Promise((resolve) => {
         const entry = {
-          body: Buffer.from(body), settled: false,
+          body: Buffer.from(body), settled: false, attached: 0, waiters: new Set(),
           settle(result) {
             if (entry.settled) return;
             entry.settled = true;
             entry.outcome = result;
             clearTimeout(entry.timer);
             entry.body = null;
-            resolve(result);
+            if (inflight.get(digest) === entry) inflight.delete(digest);
+            for (const waiter of entry.waiters) waiter.release(ownCopy(result));
+            entry.waiters.clear();
           },
         };
+        if (!inflight.has(digest)) inflight.set(digest, entry);
+        addWaiter(entry, resolve, signal);
         // Waiting has its own bounded deadline; scan time begins only at dispatch.
         entry.timer = setTimeout(() => {
           const index = queue.indexOf(entry);
           if (index !== -1) queue.splice(index, 1);
-          entry.settle(unavailable("queue_timeout"));
+          entry.settle(retryLater("queue_timeout"));
         }, scanTimeoutMs);
         queue.push(entry);
         void drain();
@@ -318,8 +368,21 @@ function windowCounts(reply) {
   return isPlainObject(cache) && count(cache.hits) && count(cache.misses) ? { hits: cache.hits, misses: cache.misses } : null;
 }
 
-function recordScan(recent, { status, reason, cache, elapsedMs }) {
-  recent.push({ status, reason, hits: cache?.hits ?? null, misses: cache?.misses ?? null, elapsedMs: Math.min(3_600_000, Math.max(0, Math.floor(elapsedMs))) });
+function segmentCounts(reply) {
+  const count = (value) => Number.isSafeInteger(value) && value >= 0 && value <= MAX_WINDOW_COUNT;
+  return isPlainObject(reply) && count(reply.segmentHits) && count(reply.segmentMisses) ? { hits: reply.segmentHits, misses: reply.segmentMisses } : null;
+}
+
+function ownCopy(result) {
+  return Object.freeze({ ...result, ...(Buffer.isBuffer(result.redactedBody) ? { redactedBody: Buffer.from(result.redactedBody) } : {}) });
+}
+
+function recordScan(recent, { status, reason, cache, segments, attached, elapsedMs }) {
+  recent.push({
+    status, reason, hits: cache?.hits ?? null, misses: cache?.misses ?? null,
+    segmentHits: segments?.hits ?? null, segmentMisses: segments?.misses ?? null,
+    attached: Math.min(MAX_ATTACHED_WAITERS, attached), elapsedMs: Math.min(3_600_000, Math.max(0, Math.floor(elapsedMs))),
+  });
   if (recent.length > RECENT_SCANS) recent.shift();
 }
 
