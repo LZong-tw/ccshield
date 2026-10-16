@@ -1,0 +1,39 @@
+{
+  "formatVersion": 1,
+  "code": {
+    "repository": "https://github.com/openai/privacy-filter",
+    "commit": "f7f00ca7fb869683eb732c010299d901457f19c3",
+    "tarball": {
+      "url": "https://codeload.github.com/openai/privacy-filter/tar.gz/f7f00ca7fb869683eb732c010299d901457f19c3",
+      "sha256": "c79c613e3600bfee1357fb37528d439e703484f590552ffe9ef79a8050ccbe39",
+      "advisory": true
+    },
+    "treeSha256": "65a84eceee5f50a971902fd2b1449ff8115385fbd04531dfa3b8a5d071059638"
+  },
+  "checkpoint": {
+    "repository": "https://huggingface.co/openai/privacy-filter",
+    "revision": "7ffa9a043d54d1be65afb281eddf0ffbe629385b",
+    "treeSha256": "ded029b44e12c15a56e4a301de307200d6d193135576f58fc994cfc1c7f2ed98",
+    "files": {
+      "original/config.json": { "sha256": "048a20604a3622de208d30df57cd5424bb583639b9ba20ddd7da593d3f89a248", "size": 707 },
+      "original/dtypes.json": { "sha256": "e936acb3d039b35ec55438af2fffd424a53c7685b895775c186b26c7df79fcc7", "size": 4108 },
+      "original/model.safetensors": { "sha256": "9c262cbe68a0c8a50590a648ef8341a2b7d3be1fa11dfb79893fe0b03ce57b5c", "size": 2798984088 },
+      "original/viterbi_calibration.json": { "sha256": "bbc8611ef08a55ed72d64856cbbbb9a91db8dfa881f0a92e2afbad6e4bbc775a", "size": 372 }
+    }
+  },
+  "tokenizer": {
+    "encoding": "o200k_base",
+    "url": "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken",
+    "cacheName": "fb374d419588a4632f3f557e76b4b70aebbca790",
+    "sha256": "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d",
+    "size": 3613922
+  },
+  "gitleaks": {
+    "version": "8.30.1",
+    "archives": {
+      "darwin-arm64": { "name": "gitleaks_8.30.1_darwin_arm64.tar.gz", "sha256": "b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5", "size": 7897593 },
+      "linux-x64": { "name": "gitleaks_8.30.1_linux_x64.tar.gz", "sha256": "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb", "size": 8230402 },
+      "linux-arm64": { "name": "gitleaks_8.30.1_linux_arm64.tar.gz", "sha256": "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080", "size": 7601421 }
+    }
+  }
+}
