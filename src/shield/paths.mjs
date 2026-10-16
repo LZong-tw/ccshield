@@ -191,12 +191,12 @@ export async function readShieldAssetsProvision({ paths, io = defaultIo } = {}) 
   }
   let state;
   try { state = JSON.parse(contents); } catch { throw new Error("shield asset provision is invalid JSON"); }
-  return assertShieldAssetsProvision(state);
+  return assertShieldAssetsProvision(state, { storeRoot: shieldAssetStore(paths).root });
 }
 
 export async function writeShieldAssetsProvision({ paths, state, io = defaultIo } = {}) {
   if (!paths?.rootDir || !paths.assetsProvisionPath) throw new TypeError("shield asset provision paths are required");
-  const validated = assertShieldAssetsProvision(state);
+  const validated = assertShieldAssetsProvision(state, { storeRoot: shieldAssetStore(paths).root });
   await writePrivateShieldState({ paths, path: paths.assetsProvisionPath, value: validated, io });
   return validated;
 }
@@ -269,63 +269,131 @@ function assertCanonicalAssetsProvisionPath(paths) {
   }
 }
 
-export function assertShieldAssetsProvision(state) {
-  if (!isPlainObject(state) || !exactKeys(state, ["bundle", "gitleaks", "privacy", "version"]) || state.version !== 1
+export const ASSETS_FORMAT_VERSION = 2;
+const PRIVACY_ORIGINS = new Set(["downloaded", "adopted"]);
+
+// Lane-independent detector assets. Downloads land in staging and move into
+// opf/<codeCommit>-<hfRev>/ only after their digests check out.
+export function shieldAssetStore(paths) {
+  if (!canonicalShieldPaths.has(paths)) throw new Error("shield asset store requires canonical ccshield paths");
+  const root = join(dirname(paths.rootDir), "assets");
+  const opfRoot = childPath(join(root, "opf"), root, "opfRoot");
+  return Object.freeze({
+    root,
+    opfRoot,
+    stagingDir: childPath(join(root, "staging"), root, "stagingDir"),
+    opfBundle(codeCommit, hfRevision) {
+      if (!/^[a-f0-9]{40}$/.test(codeCommit ?? "") || !/^[a-f0-9]{40}$/.test(hfRevision ?? "")) throw new Error("shield OPF bundle revisions must be 40-hex commits");
+      const dir = childPath(join(opfRoot, `${codeCommit}-${hfRevision}`), opfRoot, "opfBundle");
+      return Object.freeze(Object.fromEntries([["dir", dir], ...["src", "checkpoint", "venv", "tokenizer"]
+        .map((name) => [name, childPath(join(dir, name), dir, name)])]));
+    },
+  });
+}
+
+// privacy.state is absent | preparing | verified | failed. OPF references are
+// required only when verified. A version-1 file predates the field: a shape the
+// old check accepted is read as verified (OPF there counts as adopted); any
+// other version-1 privacy block is failed with reason legacy-schema.
+export function assertShieldAssetsProvision(state, { storeRoot } = {}) {
+  if (!isPlainObject(state) || !exactKeys(state, ["bundle", "gitleaks", "privacy", "version"])
+    || (state.version !== 1 && state.version !== ASSETS_FORMAT_VERSION)
     || !isPlainObject(state.bundle) || !exactKeys(state.bundle, ["path", "sha256", "version"])
     || !isPlainObject(state.gitleaks) || !exactKeys(state.gitleaks, ["path", "rules", "sha256"])
-    || !isPlainObject(state.gitleaks.rules) || !exactKeys(state.gitleaks.rules, ["path", "sha256", "version"])
-    || !isPlainObject(state.privacy) || !(exactKeys(state.privacy, ["path", "sha256", "version", "worker"])
-      || exactKeys(state.privacy, ["adapter", "checkpoint", "path", "sha256", "source", "tokenizer", "version", "worker"]))
-    || !isPlainObject(state.privacy.worker) || !exactKeys(state.privacy.worker, ["args", "command", "sha256"])) {
+    || !isPlainObject(state.gitleaks.rules) || !exactKeys(state.gitleaks.rules, ["path", "sha256", "version"])) {
     throw new Error("shield asset provision is invalid");
   }
   assertAssetReference(state.bundle, "shield policy bundle");
   assertAssetReference(state.gitleaks, "shield gitleaks");
   assertAssetReference(state.gitleaks.rules, "shield gitleaks rules");
-  assertAssetReference(state.privacy, "shield privacy bundle");
-  if (!safePath(state.privacy.worker.command) || !/^[a-f0-9]{64}$/.test(state.privacy.worker.sha256)
-    || !Array.isArray(state.privacy.worker.args) || !state.privacy.worker.args.every((argument) => typeof argument === "string" && argument.length > 0 && argument.length <= 256)) {
-    throw new Error("shield privacy worker reference is invalid");
-  }
-  if (state.privacy.checkpoint && (!isPlainObject(state.privacy.checkpoint)
-    || !exactKeys(state.privacy.checkpoint, ["path", "sha256", "version"])
-    || !safePath(state.privacy.checkpoint.path)
-    || !/^[a-f0-9]{64}$/.test(state.privacy.checkpoint.sha256)
-    || !safeIdentifier(state.privacy.checkpoint.version)
-    || !isPlainObject(state.privacy.source) || !exactKeys(state.privacy.source, ["path", "sha256", "version"])
-    || !safePath(state.privacy.source.path) || !/^[a-f0-9]{64}$/.test(state.privacy.source.sha256)
-    || !safeIdentifier(state.privacy.source.version)
-    || !isPlainObject(state.privacy.adapter) || !exactKeys(state.privacy.adapter, ["path", "sha256"])
-    || state.privacy.adapter.path !== resolve(dirname(state.privacy.worker.command), "opf-adapter.mjs")
-    || !/^[a-f0-9]{64}$/.test(state.privacy.adapter.sha256)
-    || !isPlainObject(state.privacy.tokenizer) || !exactKeys(state.privacy.tokenizer, ["path", "sha256", "version"])
-    || !safePath(state.privacy.tokenizer.path)
-    || state.privacy.tokenizer.path.split("/").at(-1) !== "fb374d419588a4632f3f557e76b4b70aebbca790"
-    || state.privacy.tokenizer.version !== "o200k_base"
-    || !/^[a-f0-9]{64}$/.test(state.privacy.tokenizer.sha256))) {
-    throw new Error("shield privacy checkpoint reference is invalid");
-  }
   return Object.freeze({
-    version: state.version,
+    version: ASSETS_FORMAT_VERSION,
     bundle: Object.freeze({ version: state.bundle.version, sha256: state.bundle.sha256, path: state.bundle.path }),
     gitleaks: Object.freeze({
       sha256: state.gitleaks.sha256,
       path: state.gitleaks.path,
       rules: Object.freeze({ path: state.gitleaks.rules.path, sha256: state.gitleaks.rules.sha256, version: state.gitleaks.rules.version }),
     }),
-    privacy: Object.freeze({
-      version: state.privacy.version,
-      sha256: state.privacy.sha256,
-      path: state.privacy.path,
-      worker: Object.freeze({ command: state.privacy.worker.command, args: Object.freeze([...state.privacy.worker.args]), sha256: state.privacy.worker.sha256 }),
-      ...(state.privacy.checkpoint ? {
-        checkpoint: Object.freeze({ ...state.privacy.checkpoint }),
-        source: Object.freeze({ ...state.privacy.source }),
-        adapter: Object.freeze({ ...state.privacy.adapter }),
-        tokenizer: Object.freeze({ ...state.privacy.tokenizer }),
-      } : {}),
-    }),
+    privacy: state.version === 1 ? legacyPrivacyAssets(state.privacy) : privacyAssets(state.privacy, storeRoot),
   });
+}
+
+function legacyPrivacyAssets(value) {
+  try {
+    return verifiedPrivacyAssets(value, isPlainObject(value) && value.checkpoint ? "adopted" : undefined);
+  } catch {
+    return Object.freeze({ state: "failed", reason: "legacy-schema" });
+  }
+}
+
+function privacyAssets(value, storeRoot) {
+  if (!isPlainObject(value)) throw new Error("shield asset provision is invalid");
+  if ((value.state === "absent" || value.state === "preparing") && exactKeys(value, ["state"])) return Object.freeze({ state: value.state });
+  if (value.state === "failed" && exactKeys(value, ["reason", "state"]) && safeIdentifier(value.reason)) {
+    return Object.freeze({ state: "failed", reason: value.reason });
+  }
+  if (value.state !== "verified") throw new Error("shield asset provision is invalid");
+  const { state: _state, origin, ...fields } = value;
+  if (fields.checkpoint ? !PRIVACY_ORIGINS.has(origin) : origin !== undefined) throw new Error("shield privacy origin is invalid");
+  const verified = verifiedPrivacyAssets(fields, origin);
+  if (origin === "downloaded") {
+    if (typeof storeRoot !== "string" || !isAbsolute(storeRoot)) throw new Error("shield downloaded privacy assets require the asset store");
+    const opfRoot = join(storeRoot, "opf");
+    for (const path of [verified.checkpoint.path, verified.source.path, verified.tokenizer.path, verified.worker.args[1]]) {
+      if (!isInside(path, opfRoot)) throw new Error("shield downloaded privacy assets must stay inside the asset store");
+    }
+  }
+  return verified;
+}
+
+function verifiedPrivacyAssets(privacy, origin) {
+  if (!isPlainObject(privacy) || !(exactKeys(privacy, ["path", "sha256", "version", "worker"])
+      || exactKeys(privacy, ["adapter", "checkpoint", "path", "sha256", "source", "tokenizer", "version", "worker"]))
+    || !isPlainObject(privacy.worker) || !exactKeys(privacy.worker, ["args", "command", "sha256"])) {
+    throw new Error("shield asset provision is invalid");
+  }
+  assertAssetReference(privacy, "shield privacy bundle");
+  if (!safePath(privacy.worker.command) || !/^[a-f0-9]{64}$/.test(privacy.worker.sha256)
+    || !Array.isArray(privacy.worker.args) || !privacy.worker.args.every((argument) => typeof argument === "string" && argument.length > 0 && argument.length <= 256)) {
+    throw new Error("shield privacy worker reference is invalid");
+  }
+  if (privacy.checkpoint && (!isPlainObject(privacy.checkpoint)
+    || !exactKeys(privacy.checkpoint, ["path", "sha256", "version"])
+    || !safePath(privacy.checkpoint.path)
+    || !/^[a-f0-9]{64}$/.test(privacy.checkpoint.sha256)
+    || !safeIdentifier(privacy.checkpoint.version)
+    || !isPlainObject(privacy.source) || !exactKeys(privacy.source, ["path", "sha256", "version"])
+    || !safePath(privacy.source.path) || !/^[a-f0-9]{64}$/.test(privacy.source.sha256)
+    || !safeIdentifier(privacy.source.version)
+    || !isPlainObject(privacy.adapter) || !exactKeys(privacy.adapter, ["path", "sha256"])
+    || privacy.adapter.path !== resolve(dirname(privacy.worker.command), "opf-adapter.mjs")
+    || !/^[a-f0-9]{64}$/.test(privacy.adapter.sha256)
+    || !isPlainObject(privacy.tokenizer) || !exactKeys(privacy.tokenizer, ["path", "sha256", "version"])
+    || !safePath(privacy.tokenizer.path)
+    || privacy.tokenizer.path.split("/").at(-1) !== "fb374d419588a4632f3f557e76b4b70aebbca790"
+    || privacy.tokenizer.version !== "o200k_base"
+    || !/^[a-f0-9]{64}$/.test(privacy.tokenizer.sha256))) {
+    throw new Error("shield privacy checkpoint reference is invalid");
+  }
+  return Object.freeze({
+    state: "verified",
+    ...(origin ? { origin } : {}),
+    version: privacy.version,
+    sha256: privacy.sha256,
+    path: privacy.path,
+    worker: Object.freeze({ command: privacy.worker.command, args: Object.freeze([...privacy.worker.args]), sha256: privacy.worker.sha256 }),
+    ...(privacy.checkpoint ? {
+      checkpoint: Object.freeze({ ...privacy.checkpoint }),
+      source: Object.freeze({ ...privacy.source }),
+      adapter: Object.freeze({ ...privacy.adapter }),
+      tokenizer: Object.freeze({ ...privacy.tokenizer }),
+    } : {}),
+  });
+}
+
+function isInside(path, root) {
+  const offset = relative(root, path);
+  return safePath(path) && offset !== "" && !offset.startsWith("..") && !isAbsolute(offset);
 }
 
 function assertAssetReference(value, label) {

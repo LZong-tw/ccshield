@@ -43,7 +43,7 @@ test("asset provision previews without writes and only records opaque references
 
   assert.equal(writes.length, 0);
   assert.deepEqual(preview, {
-    version: 1,
+    version: 2,
     bundle: { version: "policy-1", sha256: sha256(bytes[policyPath]), path: policyPath },
     gitleaks: {
       sha256: sha256(bytes[gitleaksPath]),
@@ -51,6 +51,7 @@ test("asset provision previews without writes and only records opaque references
       rules: { path: gitleaksRulesPath, sha256: rulesDigest, version: `rules-${rulesDigest.slice(0, 12)}` },
     },
     privacy: {
+      state: "verified",
       version: "privacy-1",
       sha256: sha256(bytes[privacyPath]),
       path: privacyPath,

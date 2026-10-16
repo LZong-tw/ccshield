@@ -4,11 +4,11 @@ import { basename, dirname, isAbsolute, resolve } from "node:path";
 
 import { runPrivacyWorkerSelfTest } from "./privacy.mjs";
 import { verifyShieldCheckpoint } from "./checkpoint.mjs";
-import { writeShieldAssetsProvision } from "./paths.mjs";
+import { ASSETS_FORMAT_VERSION, writeShieldAssetsProvision } from "./paths.mjs";
 import { isValidOpfWorkerArgs } from "./opf-args.mjs";
 import { PRIVACY_PROTOCOL } from "./protocol.mjs";
 
-const FORMAT_VERSION = 1;
+const MANIFEST_FORMAT_VERSION = 1;
 const O200K_CACHE_KEY = "fb374d419588a4632f3f557e76b4b70aebbca790";
 const defaultIo = { lstat, readFile, realpath };
 
@@ -24,7 +24,7 @@ export async function provisionShieldAssets({ bundlePath, gitleaksPath, gitleaks
   const adapter = manifest.adapter ? await validateAsset({ path: manifest.adapter.path, executable: false, label: "privacy adapter", expectedDigest: manifest.adapter.sha256, io }) : null;
   const tokenizer = manifest.tokenizer ? await validateAsset({ path: manifest.tokenizer.path, executable: false, label: "privacy tokenizer", expectedDigest: manifest.tokenizer.sha256, io }) : null;
   const state = Object.freeze({
-    version: FORMAT_VERSION,
+    version: ASSETS_FORMAT_VERSION,
     bundle: Object.freeze({ version: policyVersion(bundle.bytes), sha256: bundle.sha256, path: bundle.path }),
     gitleaks: Object.freeze({
       sha256: gitleaks.sha256,
@@ -33,7 +33,11 @@ export async function provisionShieldAssets({ bundlePath, gitleaksPath, gitleaks
       // hand-typed one could only ever go stale against the file it names.
       rules: Object.freeze({ path: gitleaksRules.path, sha256: gitleaksRules.sha256, version: `rules-${gitleaksRules.sha256.slice(0, 12)}` }),
     }),
+    // A bundle handed to provision lives outside the asset store, so its OPF
+    // files are adopted; only the pinned downloader records "downloaded".
     privacy: Object.freeze({
+      state: "verified",
+      ...(checkpoint ? { origin: "adopted" } : {}),
       version: manifest.version,
       sha256: privacyBundle.sha256,
       path: privacyBundle.path,
@@ -88,7 +92,7 @@ function parsePrivacyManifest(bytes) {
   try { value = JSON.parse(bytes.toString("utf8")); } catch { throw new Error("shield privacy bundle manifest is invalid"); }
   if (!isPlainObject(value) || !(exactKeys(value, ["formatVersion", "protocol", "version", "worker"])
     || exactKeys(value, ["adapter", "checkpoint", "formatVersion", "protocol", "source", "tokenizer", "version", "worker"]))
-    || value.formatVersion !== FORMAT_VERSION || value.protocol !== PRIVACY_PROTOCOL || !safeIdentifier(value.version)
+    || value.formatVersion !== MANIFEST_FORMAT_VERSION || value.protocol !== PRIVACY_PROTOCOL || !safeIdentifier(value.version)
     || !isPlainObject(value.worker) || !exactKeys(value.worker, ["args", "command", "sha256"])
     || typeof value.worker.command !== "string" || !isAbsolute(value.worker.command) || resolve(value.worker.command) !== value.worker.command
     || !Array.isArray(value.worker.args) || !value.worker.args.every((argument) => typeof argument === "string" && argument.length > 0 && argument.length <= 256)
