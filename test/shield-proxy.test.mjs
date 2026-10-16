@@ -17,14 +17,17 @@ import { startShieldDaemon } from "../src/shieldd.mjs";
 
 const CAPABILITY = "c".repeat(32);
 const CONTROL_CAPABILITY = "d".repeat(32);
-// Worst case is 16 failures plus 32 recent scans with every field at its bound: ~7 KB.
-const DIAGNOSTICS_MAX_BYTES = 8192;
+// Worst case is 16 failures, 32 recent scans with a graph detail and saturated totals with every field at its bound: ~8.7 KB.
+const DIAGNOSTICS_MAX_BYTES = 12_288;
 
 test("diagnostics size limit covers the worst-case payload", () => {
   const reason = "conflicting-protocol-context";
+  const max = 4_294_967_295;
   const failure = { stage: "privacy_scan", reason, bytes: 1_048_576, elapsedMs: 3_600_000 };
-  const scan = { status: "unavailable", reason, hits: 65_536, misses: 65_536, segmentHits: 65_536, segmentMisses: 65_536, attached: 8, elapsedMs: 3_600_000 };
-  const bytes = Buffer.byteLength(JSON.stringify({ failures: Array(16).fill(failure), scans: Array(32).fill(scan) }));
+  const scan = { status: "unavailable", reason, detail: "duplicate", hits: 65_536, misses: 65_536, segmentHits: 65_536, segmentMisses: 65_536, attached: 8, elapsedMs: 3_600_000, queuedMs: 3_600_000 };
+  const failuresByReason = Object.fromEntries(["admission_limit", "queue_timeout", "scan_timeout", "model_timeout", "model_error", "model_killed", "worker_unavailable", "other"].map((key) => [key, max]));
+  const totals = { scans: max, ok: max, unknown: max, unavailable: max, coalesced: max, aborted: max, failuresByReason };
+  const bytes = Buffer.byteLength(JSON.stringify({ failures: Array(16).fill(failure), scans: Array(32).fill(scan), totals }));
   assert.equal(bytes < DIAGNOSTICS_MAX_BYTES, true, `worst-case diagnostics are ${bytes} bytes`);
 });
 
@@ -87,6 +90,14 @@ test("diagnostics include recent scan counts only when a scan stats source is co
   const shield = await startShield(t, { targetOrigin: upstream.origin, decide: async () => ({ action: "allow" }), scanStats: () => scans });
   assert.deepEqual(await readDiagnostics(shield), { failures: [], scans });
   await assert.rejects(startShield(t, { targetOrigin: upstream.origin, decide: async () => ({ action: "allow" }), scanStats: scans }), /scan stats source is invalid/);
+});
+
+test("diagnostics include cumulative scan totals only when a totals source is configured", async (t) => {
+  const upstream = await startFixture(t, async (_request, response) => { response.end('{}'); });
+  const totals = { scans: 3, ok: 1, unknown: 0, unavailable: 2, coalesced: 0, aborted: 0, failuresByReason: { admission_limit: 2 } };
+  const shield = await startShield(t, { targetOrigin: upstream.origin, decide: async () => ({ action: "allow" }), scanStats: () => [], scanTotals: () => totals });
+  assert.deepEqual(await readDiagnostics(shield), { failures: [], scans: [], totals });
+  await assert.rejects(startShield(t, { targetOrigin: upstream.origin, decide: async () => ({ action: "allow" }), scanTotals: totals }), /scan totals source is invalid/);
 });
 
 test("diagnostics separate real daemon scan, policy and redaction failures while readiness remains healthy", async (t) => {
@@ -157,7 +168,7 @@ test("diagnostics separate real daemon scan, policy and redaction failures while
   assert.doesNotMatch(JSON.stringify(await readDiagnostics(daemon.shield)), /body-secret|prediction-secret|credential-secret|scanner-secret|policy-secret|audit-secret|worker-private-secret|fixture|requestId/);
   const { scans } = await readDiagnostics(daemon.shield);
   assert.equal(Array.isArray(scans) && scans.length > 0 && scans.length <= 32, true);
-  for (const scan of scans) assert.deepEqual(Object.keys(scan).sort(), ["attached", "elapsedMs", "hits", "misses", "reason", "segmentHits", "segmentMisses", "status"]);
+  for (const scan of scans) assert.deepEqual(Object.keys(scan).sort(), ["attached", "elapsedMs", "hits", "misses", "queuedMs", "reason", "segmentHits", "segmentMisses", "status"]);
 });
 
 test("a client disconnect aborts the daemon's privacy scan and frees its queued admission slot", async (t) => {
@@ -228,6 +239,9 @@ test("admission and queue failures reach the client as a Retry-After header, oth
     ["worker_unavailable", 7, null, false],
     ["admission_limit", 0, null, false],
     ["queue_timeout", 61, null, false],
+    ["admission_limit", 7.5, null, false],
+    ["queue_timeout", "7", null, false],
+    ["admission_limit", Number.NaN, null, false],
   ]) {
     const shield = await startShield(t, {
       targetOrigin: upstream.origin,
@@ -238,6 +252,9 @@ test("admission and queue failures reach the client as a Retry-After header, oth
     assert.equal(response.status, 503);
     assert.deepEqual(await response.json(), { error: { code: "shield_unavailable" } });
     assert.equal(response.headers.get("retry-after"), expected, `${reason} ${retryAfterSeconds}`);
+    // Claude Code stops retrying at once on x-should-retry: false or a Retry-After above 60 seconds.
+    assert.equal(response.headers.get("x-should-retry"), null);
+    if (expected !== null) assert.match(expected, /^(?:[1-9]|[1-5][0-9]|60)$/);
   }
 });
 

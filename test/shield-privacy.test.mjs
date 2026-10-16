@@ -57,6 +57,35 @@ test("persistent privacy worker health-checks then returns a validated redacted 
   assert.equal(worker.messages.filter((entry) => entry.type === "scan").length, 1);
 });
 
+test("recent scans keep an allowlisted protocol-graph detail and drop any other", async (t) => {
+  const replies = [
+    { status: "unknown", reason: "invalid-protocol-graph", detail: "orphan" },
+    { status: "unknown", reason: "protocol-id-limit", detail: "limit" },
+    { status: "unknown", reason: "invalid-protocol-graph", detail: sentinel },
+    { status: "unknown", reason: "model_timeout", detail: "orphan" },
+    { status: "ok", findings: [], detail: "duplicate" },
+  ];
+  let next = 0;
+  const worker = fakeWorker((message, emit) => {
+    if (message.type === "health") emit({ ...health(message), capabilities: ["cooperative-timeout"] });
+    if (message.type === "scan") emit({ type: "scan", id: message.id, ...replies[next++] });
+  });
+  const filter = await createPrivacyFilter({ provision, spawnWorker: () => worker, validateWorker });
+  t.after(() => filter.close());
+  for (let index = 0; index < replies.length; index += 1) {
+    const result = await filter.scan(Buffer.from(`{"n":${index}}`));
+    assert.equal("detail" in result, false);
+  }
+  assert.deepEqual(filter.recentScans().map((scan) => [scan.reason, scan.detail]), [
+    ["invalid-protocol-graph", "orphan"],
+    ["protocol-id-limit", "limit"],
+    ["invalid-protocol-graph", undefined],
+    ["model_timeout", undefined],
+    [null, undefined],
+  ]);
+  assert.doesNotMatch(JSON.stringify(filter.recentScans()), new RegExp(sentinel));
+});
+
 test("recent scans keep only bounded window cache counts, status and allowlisted reasons", async (t) => {
   const replies = [
     { status: "ok", findings: [], cache: { hits: 3, misses: 1 } },
@@ -87,7 +116,7 @@ test("recent scans keep only bounded window cache counts, status and allowlisted
   }
   const scans = filter.recentScans();
   const counts = { segmentHits: null, segmentMisses: null, attached: 0 };
-  assert.deepEqual(scans.map(({ elapsedMs, ...scan }) => scan), [
+  assert.deepEqual(scans.map(({ elapsedMs, queuedMs, ...scan }) => scan), [
     { status: "ok", reason: null, hits: 3, misses: 1, ...counts },
     { status: "unknown", reason: "model_timeout", hits: 0, misses: 2, ...counts },
     { status: "ok", reason: null, hits: null, misses: null, ...counts },
@@ -101,12 +130,54 @@ test("recent scans keep only bounded window cache counts, status and allowlisted
     { status: "unknown", reason: "segment-coverage", hits: null, misses: null, ...counts, segmentHits: 4, segmentMisses: 1 },
     { status: "unknown", reason: "segment-cache-invalid", hits: null, misses: null, ...counts },
   ]);
-  for (const scan of scans) assert.equal(Number.isInteger(scan.elapsedMs) && scan.elapsedMs >= 0, true);
+  for (const scan of scans) assert.equal(Number.isInteger(scan.elapsedMs) && scan.elapsedMs >= 0 && Number.isInteger(scan.queuedMs) && scan.queuedMs >= 0, true);
   assert.doesNotMatch(JSON.stringify(scans), new RegExp(sentinel));
   scans[0].hits = 99;
   assert.equal(filter.recentScans()[0].hits, 3);
+  const totals = filter.scanTotals();
+  assert.deepEqual({ ...totals, failuresByReason: { ...totals.failuresByReason } }, {
+    scans: 12, ok: 8, unknown: 4, unavailable: 0, coalesced: 0, aborted: 0,
+    failuresByReason: { admission_limit: 0, queue_timeout: 0, scan_timeout: 0, model_timeout: 1, model_error: 0, model_killed: 0, worker_unavailable: 0, other: 3 },
+  });
+  assert.doesNotMatch(JSON.stringify(totals), new RegExp(sentinel));
   for (let index = 0; index < 40; index += 1) await filter.scan(Buffer.from('{}'));
   assert.equal(filter.recentScans().length, 32);
+  assert.equal(filter.scanTotals().scans, 52, "totals keep counting after the recent window rolls over");
+});
+
+test("recent scans split queue wait from scan time", async (t) => {
+  const { filter, complete, fill } = await retryAfterFilter(t);
+  const scans = await fill(2);
+  await complete(2_000);
+  await complete(500);
+  await Promise.all(scans);
+  assert.deepEqual(filter.recentScans().map(({ queuedMs, elapsedMs }) => ({ queuedMs, elapsedMs })), [
+    { queuedMs: 0, elapsedMs: 2_000 },
+    { queuedMs: 2_000, elapsedMs: 500 },
+  ]);
+});
+
+test("scan totals count every caller outcome since start, including rejections that never reach the worker", async (t) => {
+  const { filter, complete, fill } = await retryAfterFilter(t);
+  const held = await fill(4);
+  const shared = filter.scan(Buffer.from(JSON.stringify({ body: 3 })));
+  const controller = new AbortController();
+  const abandoned = filter.scan(Buffer.from(JSON.stringify({ body: 2 })), { signal: controller.signal });
+  controller.abort();
+  assert.equal((await abandoned).reason, "aborted");
+  assert.equal((await filter.scan(Buffer.from('{"content":"extra"}'))).reason, "admission_limit");
+  for (let index = 0; index < 4; index += 1) await complete(2_000);
+  assert.deepEqual((await Promise.all([...held, shared])).map((result) => result.status), Array(5).fill("ok"));
+  const timed = await fill(4);
+  t.mock.timers.tick(30_000);
+  assert.deepEqual((await Promise.all(timed)).map((result) => result.reason), ["scan_timeout", "queue_timeout", "queue_timeout", "queue_timeout"]);
+  assert.deepEqual(filter.scanTotals(), {
+    scans: 11, ok: 5, unknown: 0, unavailable: 6, coalesced: 2, aborted: 1,
+    failuresByReason: { admission_limit: 1, queue_timeout: 3, scan_timeout: 1, model_timeout: 0, model_error: 0, model_killed: 0, worker_unavailable: 0, other: 0 },
+  });
+  const copy = filter.scanTotals();
+  copy.failuresByReason.admission_limit = 99;
+  assert.equal(filter.scanTotals().failuresByReason.admission_limit, 1);
 });
 
 test("privacy readiness probes the live worker and fails closed after exit", async (t) => {
@@ -579,7 +650,7 @@ test("aborting an active scan releases the caller while the worker still finishe
   assert.deepEqual(filter.recentScans(), []);
   emit(worker, { type: "scan", id: worker.messages.at(-1).id, status: "ok", findings: [], cache: { hits: 1, misses: 2 } });
   await flushTasks();
-  assert.deepEqual(filter.recentScans().map(({ elapsedMs, ...scan }) => scan), [
+  assert.deepEqual(filter.recentScans().map(({ elapsedMs, queuedMs, ...scan }) => scan), [
     { status: "ok", reason: null, hits: 1, misses: 2, segmentHits: null, segmentMisses: null, attached: 0 },
   ]);
   assert.equal(worker.messages.filter((message) => message.type === "scan").length, 1);

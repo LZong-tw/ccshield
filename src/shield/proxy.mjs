@@ -48,7 +48,7 @@ const INTERNAL_HEADERS = new Set([
   "x-airkit-shield-approval-socket",
 ]);
 
-export async function startShieldProxy({ capability, controlCapability, targetOrigin, allowDestinationLeases = false, decide, decisionCache = null, decisionContext = null, approvalBroker = null, recordShieldDecision = null, onDecision = null, isReady = null, scanStats = null, now = Date.now, port = 0 } = {}) {
+export async function startShieldProxy({ capability, controlCapability, targetOrigin, allowDestinationLeases = false, decide, decisionCache = null, decisionContext = null, approvalBroker = null, recordShieldDecision = null, onDecision = null, isReady = null, scanStats = null, scanTotals = null, now = Date.now, port = 0 } = {}) {
   assertCapability(capability);
   assertCapability(controlCapability);
   const target = targetOrigin === undefined && allowDestinationLeases ? null : assertFixedTarget(targetOrigin);
@@ -61,6 +61,7 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
   if (typeof now !== "function") throw new TypeError("shield proxy clock is invalid");
   assertPort(port);
   if (scanStats !== null && typeof scanStats !== "function") throw new TypeError("shield scan stats source is invalid");
+  if (scanTotals !== null && typeof scanTotals !== "function") throw new TypeError("shield scan totals source is invalid");
 
   if ((decisionCache === null) !== (decisionContext === null)) throw new TypeError("shield decision cache and identity must be configured together");
   if (decisionCache !== null && (typeof decisionCache.getOrCompute !== "function" || !validDecisionContext(decisionContext))) {
@@ -70,7 +71,7 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
   const destinationLeases = new Map();
   const failures = [];
   const server = createServer((request, response) => {
-    void handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision: record, isReady, approvalRegistration, now, failures, scanStats });
+    void handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision: record, isReady, approvalRegistration, now, failures, scanStats, scanTotals });
   });
   await listenLoopback(server, port);
   const address = server.address();
@@ -84,7 +85,7 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
   };
 }
 
-async function handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision, isReady, approvalRegistration, now, failures, scanStats }) {
+async function handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision, isReady, approvalRegistration, now, failures, scanStats, scanTotals }) {
   const startedAt = Date.now();
   const fail = (stage, reason, bytes = 0) => recordFailure(failures, { stage, reason, bytes, elapsedMs: Date.now() - startedAt });
   if (isDiagnosticsPath(request.url)) {
@@ -96,7 +97,7 @@ async function handleShieldRequest({ request, response, capability, controlCapab
     if (request.method !== "GET" || request.url !== DIAGNOSTICS_PATH) {
       await finish(response, { status: 403, code: "shield_blocked" }); return;
     }
-    const body = Buffer.from(JSON.stringify({ failures, ...(scanStats ? { scans: scanStats() } : {}) }));
+    const body = Buffer.from(JSON.stringify({ failures, ...(scanStats ? { scans: scanStats() } : {}), ...(scanTotals ? { totals: scanTotals() } : {}) }));
     response.writeHead(200, { "content-type": "application/json", "content-length": String(body.byteLength), "cache-control": "no-store" });
     response.end(body); return;
   }

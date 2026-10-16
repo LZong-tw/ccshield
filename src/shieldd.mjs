@@ -133,6 +133,7 @@ export async function startShieldDaemon({
       recordShieldDecision: recorder.recordShieldDecision,
       isReady: async () => Boolean(await recorder.isReady?.() ?? true) && Boolean(await privacy.isReady?.()),
       scanStats: privacy.recentScans ? () => privacy.recentScans() : null,
+      scanTotals: privacy.scanTotals ? () => privacy.scanTotals() : null,
     });
     await writeIdentity({
       paths,

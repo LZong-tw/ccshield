@@ -14,7 +14,12 @@ const MAX_ADMITTED_SCANS = 4;
 const MAX_ATTACHED_WAITERS = 8;
 const RECENT_SCANS = 32;
 const MAX_WINDOW_COUNT = 65_536;
+const MAX_TOTAL = 4_294_967_295;
+// A fixed key set keeps the diagnostics payload bounded; everything else lands in "other".
+const TOTAL_FAILURE_REASONS = ["admission_limit", "queue_timeout", "scan_timeout", "model_timeout", "model_error", "model_killed", "worker_unavailable"];
 const REQUEST_FAILURE = Symbol("privacy request failure");
+const GRAPH_REASONS = new Set(["invalid-protocol-graph", "protocol-id-limit"]);
+const GRAPH_DETAILS = new Set(["orphan", "duplicate", "role", "id", "limit"]);
 const ADAPTER_UNKNOWN_REASONS = new Set([
   "invalid-prediction", "inconsistent-counts", "invalid-span", "unmapped-span", "cross-field-span",
   "inconsistent-quoting", "unmapped-finding", "redaction-too-large", "value-survived",
@@ -53,6 +58,18 @@ export async function createPrivacyFilter({ provision, spawnWorker = defaultSpaw
   const queue = [];
   const inflight = new Map();
   const recent = [];
+  const totals = {
+    scans: 0, ok: 0, unknown: 0, unavailable: 0, coalesced: 0, aborted: 0,
+    failuresByReason: Object.fromEntries([...TOTAL_FAILURE_REASONS, "other"].map((reason) => [reason, 0])),
+  };
+  const count = (counts, key) => { counts[key] = Math.min(MAX_TOTAL, counts[key] + 1); };
+  const tally = (result) => {
+    count(totals, "scans");
+    if (["ok", "unknown", "unavailable"].includes(result.status)) count(totals, result.status);
+    if (result.reason === "aborted") count(totals, "aborted");
+    else if (result.status !== "ok") count(totals.failuresByReason, TOTAL_FAILURE_REASONS.includes(result.reason) ? result.reason : "other");
+    return result;
+  };
   let closed = false;
   // A caller that goes away stops waiting at once. Its queued scan is dropped only when nobody else
   // still waits on it; an active scan always runs to completion so the worker is never interrupted.
@@ -219,6 +236,7 @@ export async function createPrivacyFilter({ provision, spawnWorker = defaultSpaw
     let result = unavailable("worker_unavailable");
     let cache = null;
     let segments = null;
+    let detail = null;
     const dispatchedAt = Date.now();
     try {
       if (!await ensureWorker() || entry.settled) return;
@@ -236,6 +254,7 @@ export async function createPrivacyFilter({ provision, spawnWorker = defaultSpaw
       result = normalizeScanReply(reply);
       cache = windowCounts(reply);
       segments = segmentCounts(reply);
+      detail = graphDetail(reply, result);
       // Only a worker that advertises cooperative timeouts keeps its model and window cache alive across model_timeout.
       if (result.status === "unknown" && (["model_killed", "model_error"].includes(result.reason) || (result.reason === "model_timeout" && !session.cooperativeTimeout))) session.ready = false;
     } catch {} finally {
@@ -244,7 +263,7 @@ export async function createPrivacyFilter({ provision, spawnWorker = defaultSpaw
       const own = entry.outcome === result;
       recordScan(recent, {
         status: entry.outcome.status, reason: entry.outcome.reason ?? null, cache: own ? cache : null, segments: own ? segments : null,
-        attached: entry.attached, elapsedMs: Date.now() - dispatchedAt,
+        detail: own ? detail : null, attached: entry.attached, elapsedMs: Date.now() - dispatchedAt, queuedMs: dispatchedAt - entry.admittedAt,
       });
       if (active === entry) active = null;
       void drain();
@@ -274,48 +293,53 @@ export async function createPrivacyFilter({ provision, spawnWorker = defaultSpaw
       }
       return await readiness;
     },
-    async scan(body, { signal } = {}) {
-      if (closed) return unavailable("worker_closed");
-      if (!validBody(body)) return unavailable("body_invalid");
-      if (signal?.aborted) return unavailable("aborted");
-      const digest = createHash("sha256").update(body).digest("hex");
-      const shared = inflight.get(digest);
-      // The digest only finds a candidate; the bytes decide, so a collision becomes a separate scan.
-      if (shared && !shared.settled && shared.attached < MAX_ATTACHED_WAITERS && shared.body.equals(body)) {
-        shared.attached += 1;
-        return await new Promise((resolve) => addWaiter(shared, resolve, signal));
-      }
-      if (queue.length + Number(active !== null) >= MAX_ADMITTED_SCANS) return retryLater("admission_limit");
-      return await new Promise((resolve) => {
-        const entry = {
-          body: Buffer.from(body), settled: false, attached: 0, waiters: new Set(),
-          settle(result) {
-            if (entry.settled) return;
-            entry.settled = true;
-            entry.outcome = result;
-            clearTimeout(entry.timer);
-            entry.body = null;
-            if (inflight.get(digest) === entry) inflight.delete(digest);
-            for (const waiter of entry.waiters) waiter.release(ownCopy(result));
-            entry.waiters.clear();
-          },
-        };
-        if (!inflight.has(digest)) inflight.set(digest, entry);
-        addWaiter(entry, resolve, signal);
-        // Waiting has its own bounded deadline; scan time begins only at dispatch.
-        entry.timer = setTimeout(() => {
-          const index = queue.indexOf(entry);
-          if (index !== -1) queue.splice(index, 1);
-          entry.settle(retryLater("queue_timeout"));
-        }, scanTimeoutMs);
-        queue.push(entry);
-        void drain();
-      });
-    },
+    scan: async (body, options) => tally(await scan(body, options)),
     // Numbers and allowlisted reasons only, so diagnostics can show cache behaviour without any content.
     recentScans: () => recent.map((scan) => ({ ...scan })),
+    // Cumulative since start over a fixed key set, unlike the rolling recentScans window.
+    scanTotals: () => ({ ...totals, failuresByReason: { ...totals.failuresByReason } }),
     close: () => close(),
   });
+
+  async function scan(body, { signal } = {}) {
+    if (closed) return unavailable("worker_closed");
+    if (!validBody(body)) return unavailable("body_invalid");
+    if (signal?.aborted) return unavailable("aborted");
+    const digest = createHash("sha256").update(body).digest("hex");
+    const shared = inflight.get(digest);
+    // The digest only finds a candidate; the bytes decide, so a collision becomes a separate scan.
+    if (shared && !shared.settled && shared.attached < MAX_ATTACHED_WAITERS && shared.body.equals(body)) {
+      shared.attached += 1;
+      count(totals, "coalesced");
+      return await new Promise((resolve) => addWaiter(shared, resolve, signal));
+    }
+    if (queue.length + Number(active !== null) >= MAX_ADMITTED_SCANS) return retryLater("admission_limit");
+    return await new Promise((resolve) => {
+      const entry = {
+        body: Buffer.from(body), settled: false, attached: 0, waiters: new Set(), admittedAt: Date.now(),
+        settle(result) {
+          if (entry.settled) return;
+          entry.settled = true;
+          entry.outcome = result;
+          clearTimeout(entry.timer);
+          entry.body = null;
+          if (inflight.get(digest) === entry) inflight.delete(digest);
+          for (const waiter of entry.waiters) waiter.release(ownCopy(result));
+          entry.waiters.clear();
+        },
+      };
+      if (!inflight.has(digest)) inflight.set(digest, entry);
+      addWaiter(entry, resolve, signal);
+      // Waiting has its own bounded deadline; scan time begins only at dispatch.
+      entry.timer = setTimeout(() => {
+        const index = queue.indexOf(entry);
+        if (index !== -1) queue.splice(index, 1);
+        entry.settle(retryLater("queue_timeout"));
+      }, scanTimeoutMs);
+      queue.push(entry);
+      void drain();
+    });
+  }
 }
 
 export async function runPrivacyWorkerSelfTest(provision, { spawnWorker = defaultSpawnWorker, validateWorker = validatePrivacyWorkerAsset, validateCheckpoint = attestShieldCheckpoint, validateFile = validatePrivacyPinnedFile, timeoutMs, startupTimeoutMs } = {}) {
@@ -373,15 +397,23 @@ function segmentCounts(reply) {
   return isPlainObject(reply) && count(reply.segmentHits) && count(reply.segmentMisses) ? { hits: reply.segmentHits, misses: reply.segmentMisses } : null;
 }
 
+// The adapter names which protocol-graph rule failed; only these values reach diagnostics.
+function graphDetail(reply, result) {
+  const graphFailure = result.status === "unknown" && GRAPH_REASONS.has(result.reason);
+  return graphFailure && GRAPH_DETAILS.has(reply?.detail) ? reply.detail : null;
+}
+
 function ownCopy(result) {
   return Object.freeze({ ...result, ...(Buffer.isBuffer(result.redactedBody) ? { redactedBody: Buffer.from(result.redactedBody) } : {}) });
 }
 
-function recordScan(recent, { status, reason, cache, segments, attached, elapsedMs }) {
+function recordScan(recent, { status, reason, cache, segments, detail, attached, elapsedMs, queuedMs }) {
+  const boundedMs = (value) => Math.min(3_600_000, Math.max(0, Math.floor(value)));
+  // elapsedMs is worker time from dispatch; queuedMs is the wait from admission to dispatch.
   recent.push({
-    status, reason, hits: cache?.hits ?? null, misses: cache?.misses ?? null,
+    status, reason, ...(detail ? { detail } : {}), hits: cache?.hits ?? null, misses: cache?.misses ?? null,
     segmentHits: segments?.hits ?? null, segmentMisses: segments?.misses ?? null,
-    attached: Math.min(MAX_ATTACHED_WAITERS, attached), elapsedMs: Math.min(3_600_000, Math.max(0, Math.floor(elapsedMs))),
+    attached: Math.min(MAX_ATTACHED_WAITERS, attached), elapsedMs: boundedMs(elapsedMs), queuedMs: boundedMs(queuedMs),
   });
   if (recent.length > RECENT_SCANS) recent.shift();
 }
