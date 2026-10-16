@@ -847,6 +847,40 @@ test("proxy does not forward after a downstream disconnect during decision", asy
   assert.equal(upstreamCalls, 0);
 });
 
+test("a decision that fails because the client disconnected records no failure", async (t) => {
+  let notifyDecisionStarted;
+  const decisionStarted = new Promise((resolve) => { notifyDecisionStarted = resolve; });
+  let notifyDecisionSettled;
+  const decisionSettled = new Promise((resolve) => { notifyDecisionSettled = resolve; });
+  const upstream = await startFixture(t, async (_request, response) => { response.end(); });
+  const shield = await startShield(t, {
+    targetOrigin: upstream.origin,
+    decide: ({ signal }) => {
+      notifyDecisionStarted();
+      return new Promise((_resolve, reject) => signal.addEventListener("abort", () => {
+        reject(abortedFailure());
+        notifyDecisionSettled();
+      }, { once: true }));
+    },
+  });
+  const target = new URL(shield.origin);
+  const client = httpRequest({
+    host: target.hostname, port: target.port, method: "POST", path: "/v1/messages",
+    headers: { "content-length": "2", "x-airkit-shield": CAPABILITY },
+  });
+  const clientClosed = new Promise((resolve) => client.once("close", resolve));
+  client.once("error", () => {});
+  client.end("{}");
+
+  await decisionStarted;
+  client.destroy();
+  await clientClosed;
+  await decisionSettled;
+  await new Promise((resolve) => setTimeout(resolve, 25));
+
+  assert.deepEqual((await readDiagnostics(shield)).failures, []);
+});
+
 test("proxy does not forward when the downstream disconnects as inspection completes", async (t) => {
   let upstreamCalls = 0;
   const upstream = await startFixture(t, async (_request, response) => {

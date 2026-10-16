@@ -247,6 +247,7 @@ async function handleShieldRequest({ request, response, capability, controlCapab
       ? await evaluate()
       : await cachedDecision({ decisionCache, decisionContext, body: inspection.body, evaluate, signal: lifecycle.signal });
   } catch (error) {
+    if (lifecycle.signal.aborted) return;
     const failure = error?.shieldFailure;
     if (FAILURE_REASONS.get(failure?.stage)?.has(failure?.reason)) fail(failure.stage, failure.reason, inspection.bytes);
     else fail("evaluation", "evaluation_unavailable", inspection.bytes);
