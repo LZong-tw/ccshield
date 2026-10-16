@@ -4,6 +4,13 @@ Copyright (c) 2026 LZong, Lim, Un-tiong. Licensed under the MIT License (see LIC
 Shield's code was extracted from ai-runtime-kit (same author, who
 relicenses it here under MIT).
 
-Third-party components with their own licenses live under licenses/.
-None are bundled yet; the OPF-derived (MPL-2.0) and Apache-2.0 subtrees
-arrive in a later release.
+This product includes files derived from openai/privacy-filter
+(https://github.com/openai/privacy-filter), licensed under the Apache
+License 2.0 (see licenses/Apache-2.0.txt). They were modified by ccshield
+and carry a header naming the upstream file and commit:
+
+  detectors/opf/python/opf-cpu-grouped.py
+  detectors/opf/python/opf-viterbi-deadline.py
+
+The privacy-filter model weights and tokenizer are downloaded at setup,
+not bundled; they are also Apache-2.0. See licenses/README.md.

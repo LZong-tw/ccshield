@@ -1451,8 +1451,8 @@ class OPF:
         cache = self.runtime.model.forward.__self__
         assert type(cache).__name__ == "ExactWindowLogitsCache"
         assert "threads4" in cache._namespace and "ctx4096" in cache._namespace
-        assert "2414e6566435a2f92b4e2d41002d19755b8c75bbeb10cf385e5deb613293a8b5" in cache._namespace
-        assert "51adfd347aa761b70c573a109fe4878ba3cf8cb2a6bede6b93a86cdf844ca81c" in cache._namespace
+        assert "adb9dd7d6f47e482ccb0925e621a1375461b997833dfa5be6dfc67b9d58b6f0e" in cache._namespace
+        assert "75ef80d5320cf25d6949154ec374dccc61e53038a42538ee907e9d8c70d9f9cc" in cache._namespace
         self.calls += 1
         scan_number[0] = self.calls
         if self.calls == 1:

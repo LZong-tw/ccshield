@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Derived from openai/privacy-filter opf/_core/decoding.py (ViterbiCRFDecoder.decode) at commit f7f00ca7fb869683eb732c010299d901457f19c3
+# (Apache License 2.0, see licenses/Apache-2.0.txt).
+# Modified by ccshield: see the docstrings below for what changed.
 import torch
 
 CHECK_EVERY = 256

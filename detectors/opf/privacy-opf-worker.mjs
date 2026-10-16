@@ -16,10 +16,10 @@ const MAX_FRAME_BYTES = 4 * 1_048_576; // base64 redacted body (≤1 MiB → ~1.
 const MAX_BODY_BYTES = 1_048_576;
 const MAX_SCANS = 4;
 const HELPERS = {
-  "opf-cpu-grouped.py": "2414e6566435a2f92b4e2d41002d19755b8c75bbeb10cf385e5deb613293a8b5",
-  "opf-window-cache.py": "51adfd347aa761b70c573a109fe4878ba3cf8cb2a6bede6b93a86cdf844ca81c",
+  "opf-cpu-grouped.py": "adb9dd7d6f47e482ccb0925e621a1375461b997833dfa5be6dfc67b9d58b6f0e",
+  "opf-window-cache.py": "75ef80d5320cf25d6949154ec374dccc61e53038a42538ee907e9d8c70d9f9cc",
   "opf-mmap-weights.py": "62d69ebf8e46ea2bec8b2e73437905018a064fbf7ebaa10429e5fe34162f3b21",
-  "opf-viterbi-deadline.py": "4ff6aec48b1b722f733e08f2018cd494548d1bbbc0e81fdcd19da749ee5ffa49",
+  "opf-viterbi-deadline.py": "6fbfb16aae67c6eecacc292f8d41dda13cbe7d6792d8c2be97b8d629cc590117",
 };
 const PYTHON = String.raw`
 import importlib.util

@@ -1,4 +1,8 @@
-"""Experimental process-local OPF CPU MoE replacement, never installed live."""
+# SPDX-License-Identifier: Apache-2.0
+# Derived from openai/privacy-filter opf/_model/model.py (MLPBlock.forward) at commit f7f00ca7fb869683eb732c010299d901457f19c3
+# (Apache License 2.0, see licenses/Apache-2.0.txt).
+# Modified by ccshield: see the docstrings below for what changed.
+"""Process-local grouped CPU replacement for OPF's MoE MLPBlock.forward."""
 import torch
 import torch.nn.functional as F
 from opf._common.env import get_env_bool

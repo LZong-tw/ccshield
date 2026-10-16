@@ -1,4 +1,4 @@
-"""Offline exact-window logits cache prototype; never caches privacy decisions."""
+"""Offline exact-window logits cache; never caches privacy decisions."""
 from collections import OrderedDict
 from math import isfinite
 from time import monotonic
