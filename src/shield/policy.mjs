@@ -23,6 +23,7 @@ export async function loadShieldPolicy({ bundle, publicKey, opa = { loadPolicy: 
   return Object.freeze({
     version: validated.manifest.version,
     detectorVersions: Object.freeze({ ...validated.manifest.detectorVersions }),
+    detectorFallbacks: Object.freeze({ ...validated.manifest.detectorFallbacks }),
     evaluate,
   });
 }

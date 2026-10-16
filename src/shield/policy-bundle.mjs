@@ -105,13 +105,15 @@ function parseManifest(value) {
 }
 
 function assertManifest(manifest) {
-  assertExactKeys(manifest, ["formatVersion", "version", "opaAbi", "opaWasmSdkVersion", "wasmSha256", "detectorVersions", "selfTest"], "shield policy manifest");
+  const fields = ["formatVersion", "version", "opaAbi", "opaWasmSdkVersion", "wasmSha256", "detectorVersions", "selfTest"];
+  assertExactKeys(manifest, Object.hasOwn(manifest, "detectorFallbacks") ? [...fields, "detectorFallbacks"] : fields, "shield policy manifest");
   if (manifest.formatVersion !== SHIELD_POLICY_FORMAT_VERSION) throw new Error("shield policy manifest format is unsupported");
   assertSafeIdentifier(manifest.version, "shield policy version");
   if (typeof manifest.opaAbi !== "string" || !SUPPORTED_OPA_ABIS.has(manifest.opaAbi)) throw new Error("shield policy OPA ABI is unsupported");
   if (manifest.opaWasmSdkVersion !== SHIELD_OPA_WASM_SDK_VERSION) throw new Error("shield policy OPA/Wasm runtime version is unsupported");
   if (typeof manifest.wasmSha256 !== "string" || !/^[a-f0-9]{64}$/.test(manifest.wasmSha256)) throw new Error("shield policy Wasm digest is invalid");
   assertDetectorVersions(manifest.detectorVersions);
+  if (Object.hasOwn(manifest, "detectorFallbacks")) assertDetectorFallbacks(manifest.detectorFallbacks, manifest.detectorVersions);
   assertSelfTest(manifest.selfTest);
 }
 
@@ -132,6 +134,16 @@ function assertDetectorVersions(value) {
     assertSafeIdentifier(name, "shield policy detector name");
     assertSafeIdentifier(version, "shield policy detector version");
   }
+}
+
+// A signed fallback is the only way the daemon may scan with a detector other
+// than the one detectorVersions names. Only Privacy has one: regex covers
+// requests until the model is downloaded and verified.
+function assertDetectorFallbacks(value, versions) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("shield policy detector fallbacks are invalid");
+  assertExactKeys(value, ["privacy"], "shield policy detector fallbacks");
+  assertSafeIdentifier(value.privacy, "shield policy detector fallback version");
+  if (value.privacy === versions.privacy) throw new Error("shield policy detector fallback must differ from the detector version");
 }
 
 function assertWasm(value) {
@@ -180,6 +192,7 @@ function freezeManifest(manifest) {
     opaWasmSdkVersion: manifest.opaWasmSdkVersion,
     wasmSha256: manifest.wasmSha256,
     detectorVersions: Object.freeze({ ...manifest.detectorVersions }),
+    ...(manifest.detectorFallbacks ? { detectorFallbacks: Object.freeze({ ...manifest.detectorFallbacks }) } : {}),
     selfTest: Object.freeze({ input: Object.freeze({ ...manifest.selfTest.input }), expected: Object.freeze({ ...manifest.selfTest.expected }) }),
   });
 }

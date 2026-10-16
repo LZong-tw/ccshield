@@ -5,7 +5,7 @@
 //   node tools/shield/sign-policy-bundle.mjs sign \
 //     --wasm <policy.wasm> --private-key <dir>/policy-signing.key \
 //     --version <id> --gitleaks-version <x.y.z> --privacy-version <id> \
-//     --out <dir>/policy-bundle.json
+//     [--privacy-fallback-version <id>] --out <dir>/policy-bundle.json
 //
 // The private key never belongs in a repository, in Shield state, or in this
 // tool's output. keygen writes it 0600 and prints only its fingerprint; store
@@ -62,6 +62,9 @@ function signBundle() {
       gitleaks: required("gitleaks-version"),
       privacy: required("privacy-version"),
     },
+    // The detector the daemon may scan with until the Privacy model is
+    // verified, e.g. regex-v1. Without it, a missing model fails closed.
+    ...(args.has("privacy-fallback-version") ? { detectorFallbacks: { privacy: required("privacy-fallback-version") } } : {}),
     // Proves the subscription policy and runtime agree on OPF-only secret
     // redaction, without a Gitleaks finding or restricted classification.
     selfTest: {

@@ -53,6 +53,19 @@ test("policy activation requires both Gitleaks and Privacy detector versions", a
   );
 });
 
+test("policy activation exposes a signed Privacy fallback and rejects malformed ones", async () => {
+  assert.deepEqual((await loadTestPolicy()).detectorFallbacks, {});
+  const policy = await loadTestPolicy({ bundle: signedBundle({ detectorFallbacks: { privacy: "regex-v1" } }) });
+  assert.deepEqual(policy.detectorFallbacks, { privacy: "regex-v1" });
+  for (const detectorFallbacks of [null, [], { gitleaks: "8.23.0" }, { privacy: "regex-v1", gitleaks: "8.23.0" }, { privacy: "" }]) {
+    await assert.rejects(loadTestPolicy({ bundle: signedBundle({ detectorFallbacks }) }), /fallback/i);
+  }
+  await assert.rejects(
+    loadTestPolicy({ bundle: signedBundle({ detectorFallbacks: { privacy: "privacy-1" } }) }),
+    /fallback must differ/,
+  );
+});
+
 test("policy activation rejects an unsupported OPA ABI and missing self-test", async () => {
   await assert.rejects(
     loadTestPolicy({ bundle: signedBundle({ opaAbi: "999" }) }),
