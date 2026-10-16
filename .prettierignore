@@ -1,0 +1,3 @@
+detectors/opf/opf-adapter.mjs
+detectors/opf/privacy-opf-worker.mjs
+detectors/opf/python/**

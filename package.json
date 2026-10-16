@@ -12,6 +12,9 @@
   },
   "files": [
     "src/",
+    "detectors/",
+    "policy/",
+    "licenses/",
     "README.md",
     "LICENSE",
     "NOTICE"

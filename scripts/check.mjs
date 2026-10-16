@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
 
-const roots = ["src", "test", "scripts"];
+const roots = ["src", "test", "scripts", "detectors", "policy", "tools"];
 const skip = new Set(["node_modules", "fixtures"]);
 
 function* walk(dir) {

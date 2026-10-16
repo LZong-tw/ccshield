@@ -1,0 +1,110 @@
+# AirKit Shield — Gitleaks rules for the subscription lane.
+#
+# This file decides what counts as a secret. Shield blocks the request on ANY
+# finding here, with no approval path, so a rule with false positives does not
+# degrade quality — it stops work. Widen one rule at a time.
+#
+# Two hard constraints from src/shield/gitleaks.mjs, both enforced at daemon
+# startup rather than at provisioning time:
+#
+#   1. createGitleaksScanner scans this exact sentinel body
+#
+#        -----BEGIN PRIVATE KEY-----
+#        AIRKIT_SHIELD_SEMANTIC_SENTINEL
+#        -----END PRIVATE KEY-----
+#
+#      and requires EXACTLY ONE finding, RuleID `private-key`, count exactly 1.
+#      parseFindings groups by RuleID, so two rules matching the sentinel — or
+#      one rule matching it twice — fails the daemon closed. Any generic
+#      high-entropy or long-token rule you add will match the sentinel. Test
+#      against this file, not against a minimal one:
+#
+#        printf -- '-----BEGIN PRIVATE KEY-----\nAIRKIT_SHIELD_SEMANTIC_SENTINEL\n-----END PRIVATE KEY-----\n' \
+#          | gitleaks stdin --config tools/shield/gitleaks-rules.toml \
+#              --report-format json --report-path - --redact
+#
+#      Exactly one object, RuleID "private-key".
+#
+#   2. The file is digest-pinned. Editing it changes its SHA-256 and the daemon
+#      refuses to start until you re-run
+#      `airkit shield privacy provision ... --gitleaks-rules <path> --write`.
+#
+# Deploy a copy next to the worker (not this repo path — the pinned path must be
+# canonical, owned by you, and not group/world writable):
+#
+#   install -m 0600 tools/shield/gitleaks-rules.toml ~/.config/airkit-shield/gitleaks-rules.toml
+#
+# Scanning is stdin-only against a request body, never a git history, so
+# path-based allowlists and `[[rules.allowlists]]` on file paths do nothing here.
+
+title = "airkit-shield-subscription"
+
+[[rules]]
+id = "private-key"
+description = "PEM private key block"
+# Required by the semantic self-test above. Do not remove or rename.
+regex = '''(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY[ A-Z0-9_-]{0,100}-----[\s\S]*?-----END[ A-Z0-9_-]{0,100}PRIVATE KEY[ A-Z0-9_-]{0,100}-----'''
+keywords = ["-----begin"]
+
+[[rules]]
+id = "anthropic-api-key"
+description = "Anthropic API key"
+regex = '''sk-ant-[A-Za-z0-9_-]{20,}'''
+keywords = ["sk-ant-"]
+
+[[rules]]
+id = "openai-api-key"
+description = "OpenAI API key"
+# Both alternatives are anchored tightly enough that an `sk-ant-` key cannot
+# match, so an Anthropic key reports once rather than under two rule ids.
+regex = '''\bsk-(?:proj-[A-Za-z0-9_-]{32,}|[A-Za-z0-9]{48})\b'''
+keywords = ["sk-"]
+
+[[rules]]
+id = "aws-access-key-id"
+description = "AWS access key id"
+regex = '''\b(?:A3T[A-Z0-9]|AKIA|ABIA|ACCA|ASIA)[A-Z0-9]{16}\b'''
+keywords = ["akia", "asia", "abia", "acca", "a3t"]
+
+[[rules]]
+id = "github-token"
+description = "GitHub personal access, OAuth, app, or refresh token"
+regex = '''\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b'''
+keywords = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]
+
+[[rules]]
+id = "gitlab-token"
+description = "GitLab personal or project access token"
+regex = '''\bglpat-[A-Za-z0-9_-]{20,}\b'''
+keywords = ["glpat-"]
+
+[[rules]]
+id = "slack-token"
+description = "Slack API token"
+regex = '''\bxox[abposr]-[A-Za-z0-9-]{10,}\b'''
+keywords = ["xoxb-", "xoxa-", "xoxp-", "xoxo-", "xoxs-", "xoxr-"]
+
+[[rules]]
+id = "google-api-key"
+description = "Google API key"
+regex = '''\bAIza[A-Za-z0-9_-]{35}\b'''
+keywords = ["aiza"]
+
+[[rules]]
+id = "jwt"
+description = "JSON Web Token"
+regex = '''\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b'''
+keywords = ["eyj"]
+
+[[rules]]
+id = "npm-token"
+description = "npm access token"
+regex = '''\bnpm_[A-Za-z0-9]{36}\b'''
+keywords = ["npm_"]
+
+# Deliberately absent: a generic high-entropy rule. Gitleaks' entropy rules
+# match the sentinel and break the semantic self-test, and on request bodies —
+# which carry base64 images, minified code, and content hashes — they block
+# constantly. If you want one, give it a `keywords` guard narrow enough that the
+# sentinel cannot match, and re-run the self-test command above before
+# provisioning.
