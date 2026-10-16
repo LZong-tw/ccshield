@@ -5,6 +5,7 @@ import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { runPrivacyWorkerSelfTest } from "./privacy.mjs";
 import { verifyShieldCheckpoint } from "./checkpoint.mjs";
 import { writeShieldAssetsProvision } from "./paths.mjs";
+import { PRIVACY_PROTOCOL } from "./protocol.mjs";
 
 const FORMAT_VERSION = 1;
 const O200K_CACHE_KEY = "fb374d419588a4632f3f557e76b4b70aebbca790";
@@ -86,7 +87,7 @@ function parsePrivacyManifest(bytes) {
   try { value = JSON.parse(bytes.toString("utf8")); } catch { throw new Error("shield privacy bundle manifest is invalid"); }
   if (!isPlainObject(value) || !(exactKeys(value, ["formatVersion", "protocol", "version", "worker"])
     || exactKeys(value, ["adapter", "checkpoint", "formatVersion", "protocol", "source", "tokenizer", "version", "worker"]))
-    || value.formatVersion !== FORMAT_VERSION || value.protocol !== "airkit-privacy-ndjson-v1" || !safeIdentifier(value.version)
+    || value.formatVersion !== FORMAT_VERSION || value.protocol !== PRIVACY_PROTOCOL || !safeIdentifier(value.version)
     || !isPlainObject(value.worker) || !exactKeys(value.worker, ["args", "command", "sha256"])
     || typeof value.worker.command !== "string" || !isAbsolute(value.worker.command) || resolve(value.worker.command) !== value.worker.command
     || !Array.isArray(value.worker.args) || !value.worker.args.every((argument) => typeof argument === "string" && argument.length > 0 && argument.length <= 256)

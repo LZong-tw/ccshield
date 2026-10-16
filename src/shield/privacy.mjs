@@ -3,9 +3,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 
+import { envNamesFor, readEnv } from "../compat-env.mjs";
 import { attestShieldCheckpoint } from "./checkpoint.mjs";
-
-const PROTOCOL = "airkit-privacy-ndjson-v1";
+import { PRIVACY_PROTOCOL as PROTOCOL } from "./protocol.mjs";
 const MAX_BODY_BYTES = 1_048_576;
 const MAX_FRAME_BYTES = 4 * 1_048_576; // base64 redacted body (≤1 MiB → ~1.4 MiB) plus findings must fit
 const DEFAULT_TIMEOUT_MS = 2_000;
@@ -346,7 +346,7 @@ export async function runPrivacyWorkerSelfTest(provision, { spawnWorker = defaul
   const filter = await createPrivacyFilter({ provision, spawnWorker, validateWorker, validateCheckpoint, validateFile, timeoutMs, startupTimeoutMs });
   try {
     const opf = Boolean(provision?.privacy?.checkpoint);
-    const email = opf ? "alice@example.com" : "AIRKIT_PRIVACY_PROTOCOL_PROBE_EMAIL";
+    const email = opf ? "alice@example.com" : "CCSHIELD_PRIVACY_PROTOCOL_PROBE_EMAIL";
     const original = Buffer.from(JSON.stringify({ content: email }));
     const result = await filter.scan(original);
     if (!isVerifiedRedaction({ original, result }) || !result.findings.some((finding) => finding.label === (opf ? "private_email" : "email")) || result.redactedBody.includes(email)) {
@@ -633,4 +633,13 @@ function requestFailure(reason) { return { [REQUEST_FAILURE]: true, reason }; }
 function safeIdentifier(value) { return typeof value === "string" && /^[A-Za-z0-9._-]{1,128}$/.test(value); }
 function isAbsoluteCanonical(value) { return typeof value === "string" && value.startsWith("/") && !value.includes("//") && !value.includes("/../") && !value.endsWith("/.."); }
 function isPlainObject(value) { return value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype; }
-function defaultSpawnWorker({ command, args, shell, stdio }) { return spawn(command, args, { shell, stdio }); }
+// The OPF worker's embedded Python reads only CCSHIELD_OPF_WARM_SECONDS, so the old name is mapped here.
+export function privacyWorkerEnv(env = process.env) {
+  const child = { ...env };
+  const warm = readEnv(env, "CCSHIELD_OPF_WARM_SECONDS");
+  delete child[envNamesFor("CCSHIELD_OPF_WARM_SECONDS")[1]];
+  if (warm !== undefined) child.CCSHIELD_OPF_WARM_SECONDS = warm;
+  return child;
+}
+
+function defaultSpawnWorker({ command, args, shell, stdio }) { return spawn(command, args, { shell, stdio, env: privacyWorkerEnv() }); }

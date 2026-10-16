@@ -20,7 +20,7 @@ test("scanner provisions canonical trusted assets and scans with bounded shell-f
   const scanner = await createGitleaksScanner({
     executable,
     sha256: sha256(executableBytes),
-    ruleBundle: { path: rulesPath, sha256: sha256(rulesBytes), version: "airkit-rules-1", commandProfile },
+    ruleBundle: { path: rulesPath, sha256: sha256(rulesBytes), version: "ccshield-rules-1", commandProfile },
     io: fixtureIo(),
     run: async (request) => {
       calls.push(request);
@@ -49,7 +49,7 @@ test("scanner rejects noncanonical, symlinked, foreign-owned, and digest-drifted
   const options = {
     executable,
     sha256: sha256(executableBytes),
-    ruleBundle: { path: rulesPath, sha256: sha256(rulesBytes), version: "airkit-rules-1", commandProfile },
+    ruleBundle: { path: rulesPath, sha256: sha256(rulesBytes), version: "ccshield-rules-1", commandProfile },
     run: async () => ({ code: 0, stdout: "8.24.0\n", stderr: "" }),
   };
 
@@ -69,11 +69,11 @@ test("scanner fails closed without returning raw child output", async () => {
   const scanner = await createGitleaksScanner({
     executable,
     sha256: sha256(executableBytes),
-    ruleBundle: { path: rulesPath, sha256: sha256(rulesBytes), version: "airkit-rules-1", commandProfile },
+    ruleBundle: { path: rulesPath, sha256: sha256(rulesBytes), version: "ccshield-rules-1", commandProfile },
     io: fixtureIo(),
     run: async (request) => request.args[0] === "version"
       ? { code: 0, stdout: "8.24.0\n", stderr: "" }
-      : request.input.includes("AIRKIT_SHIELD_SEMANTIC_SENTINEL")
+      : request.input.includes("CCSHIELD_SEMANTIC_SENTINEL")
         ? report("private-key")
       : { code: 2, stdout: privateKey, stderr: terraformState },
   });
@@ -89,7 +89,7 @@ test("semantic probe requires the provisioned private-key category and count", a
   await assert.rejects(createGitleaksScanner({
     executable,
     sha256: sha256(executableBytes),
-    ruleBundle: { path: rulesPath, sha256: sha256(rulesBytes), version: "airkit-rules-1", commandProfile },
+    ruleBundle: { path: rulesPath, sha256: sha256(rulesBytes), version: "ccshield-rules-1", commandProfile },
     io: fixtureIo(),
     run: async (request) => request.args[0] === "version"
       ? { code: 0, stdout: "8.24.0\n", stderr: "" }

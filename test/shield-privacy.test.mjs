@@ -7,7 +7,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { attestShieldCheckpoint } from "../src/shield/checkpoint.mjs";
-import { createPrivacyFilter, isVerifiedRedaction, runPrivacyWorkerSelfTest } from "../src/shield/privacy.mjs";
+import { createPrivacyFilter, isVerifiedRedaction, privacyWorkerEnv, runPrivacyWorkerSelfTest } from "../src/shield/privacy.mjs";
 
 const sentinel = "privacy-raw-sentinel-must-not-escape";
 const provision = {
@@ -1342,7 +1342,7 @@ test("OPF provision self-test uses a valid synthetic mailbox and requires privat
 test("privacy self-test rejects unchanged or category-incomplete replacement bodies", async () => {
   const unchangedWorker = fakeWorker((message, emit) => {
     if (message.type === "health") emit(health(message));
-    if (message.type === "scan") emit({ type: "scan", id: message.id, status: "ok", findings: [{ label: "email", count: 1 }], redactions: [{ label: "email", count: 1, spans: [{ start: 12, end: 47 }] }], redactedBody: Buffer.from('{"content":"AIRKIT_PRIVACY_PROTOCOL_PROBE_EMAIL"}').toString("base64") });
+    if (message.type === "scan") emit({ type: "scan", id: message.id, status: "ok", findings: [{ label: "email", count: 1 }], redactions: [{ label: "email", count: 1, spans: [{ start: 12, end: 49 }] }], redactedBody: Buffer.from('{"content":"CCSHIELD_PRIVACY_PROTOCOL_PROBE_EMAIL"}').toString("base64") });
   });
   await assert.rejects(runPrivacyWorkerSelfTest(provision, { spawnWorker: () => unchangedWorker, validateWorker }), /self-test failed/i);
 
@@ -1457,3 +1457,9 @@ function fakeWorker(handler) {
 function emit(worker, reply) {
   worker.stdout.emit("data", `${JSON.stringify(reply)}\n`);
 }
+
+test("the worker environment maps the old OPF warm-budget name and lets the new one win", () => {
+  assert.deepEqual(privacyWorkerEnv({ PATH: "/bin", AIRKIT_SHIELD_OPF_WARM_SECONDS: "0" }), { PATH: "/bin", CCSHIELD_OPF_WARM_SECONDS: "0" });
+  assert.deepEqual(privacyWorkerEnv({ AIRKIT_SHIELD_OPF_WARM_SECONDS: "0", CCSHIELD_OPF_WARM_SECONDS: "30" }), { CCSHIELD_OPF_WARM_SECONDS: "30" });
+  assert.deepEqual(privacyWorkerEnv({ PATH: "/bin" }), { PATH: "/bin" });
+});

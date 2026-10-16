@@ -81,5 +81,5 @@ class MappedCheckpoint:
         if mapped == 0:
             raise RuntimeError("no weights mapped")
         # The mappings must outlive every view; keep them on the model.
-        model._airkit_weight_mappings = self.mappings
+        model._ccshield_weight_mappings = self.mappings
         return {"mapped_bytes": mapped, "kept_bytes": kept}

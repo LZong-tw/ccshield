@@ -1,4 +1,4 @@
-# AirKit Shield — Gitleaks rules for the subscription lane.
+# ccshield — default Gitleaks rules.
 #
 # This file decides what counts as a secret. Shield blocks the request on ANY
 # finding here, with no approval path, so a rule with false positives does not
@@ -10,7 +10,7 @@
 #   1. createGitleaksScanner scans this exact sentinel body
 #
 #        -----BEGIN PRIVATE KEY-----
-#        AIRKIT_SHIELD_SEMANTIC_SENTINEL
+#        CCSHIELD_SEMANTIC_SENTINEL
 #        -----END PRIVATE KEY-----
 #
 #      and requires EXACTLY ONE finding, RuleID `private-key`, count exactly 1.
@@ -19,25 +19,25 @@
 #      high-entropy or long-token rule you add will match the sentinel. Test
 #      against this file, not against a minimal one:
 #
-#        printf -- '-----BEGIN PRIVATE KEY-----\nAIRKIT_SHIELD_SEMANTIC_SENTINEL\n-----END PRIVATE KEY-----\n' \
-#          | gitleaks stdin --config tools/shield/gitleaks-rules.toml \
+#        printf -- '-----BEGIN PRIVATE KEY-----\nCCSHIELD_SEMANTIC_SENTINEL\n-----END PRIVATE KEY-----\n' \
+#          | gitleaks stdin --config detectors/gitleaks/gitleaks-rules.toml \
 #              --report-format json --report-path - --redact
 #
 #      Exactly one object, RuleID "private-key".
 #
 #   2. The file is digest-pinned. Editing it changes its SHA-256 and the daemon
 #      refuses to start until you re-run
-#      `airkit shield privacy provision ... --gitleaks-rules <path> --write`.
+#      `ccshield privacy provision ... --gitleaks-rules <path> --write`.
 #
 # Deploy a copy next to the worker (not this repo path — the pinned path must be
 # canonical, owned by you, and not group/world writable):
 #
-#   install -m 0600 tools/shield/gitleaks-rules.toml ~/.config/airkit-shield/gitleaks-rules.toml
+#   install -m 0600 detectors/gitleaks/gitleaks-rules.toml ~/.config/ccshield/gitleaks-rules.toml
 #
 # Scanning is stdin-only against a request body, never a git history, so
 # path-based allowlists and `[[rules.allowlists]]` on file paths do nothing here.
 
-title = "airkit-shield-subscription"
+title = "ccshield-default"
 
 [[rules]]
 id = "private-key"

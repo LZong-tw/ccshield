@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// AirKit Shield Privacy worker — skeleton.
+// ccshield privacy worker — skeleton.
 //
 // Speaks airkit-privacy-ndjson-v1 correctly and completely. What it DETECTS is
 // deliberately minimal, because detection scope is a decision for whoever is
@@ -16,7 +16,7 @@
 //      rule at a time.
 //   2. The worker is digest-pinned. Editing this file changes its SHA-256 and
 //      the next spawn refuses to start until you re-run
-//      `airkit shield privacy provision ... --write`.
+//      `ccshield privacy provision ... --write`.
 //
 // Deploying it: the daemon spawns this file with `shell: false`
 // (privacy.mjs:22), so the shebang is what execs, and the daemon runs under
@@ -56,11 +56,12 @@ const VERSION = "0.3.0-skeleton-client-exempt";
 //   address  credit-card  email  ip-address  person  phone  ssn  token
 // ---------------------------------------------------------------------------
 const RULES = [
-  // Required. `airkit shield privacy provision` scans a fixed probe body and
+  // Required. `ccshield privacy provision` scans a fixed probe body and
   // fails unless this exact token comes back labelled "email" and redacted.
   // The probe is not a syntactically valid address, so the rule below does not
   // cover it. Do not remove this entry.
-  { label: "email", pattern: /AIRKIT_PRIVACY_PROTOCOL_PROBE_EMAIL/g },
+  // The AIRKIT_ spelling is the probe older daemons send. TODO(P5): drop it.
+  { label: "email", pattern: /(?:CCSHIELD|AIRKIT)_PRIVACY_PROTOCOL_PROBE_EMAIL/g },
 
   { label: "email", pattern: /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g },
 
@@ -74,7 +75,7 @@ const RULES = [
   // { label: "token",       pattern: /\b[A-Za-z0-9_-]{32,}\b/g },
   //
   // `address` and `person` are not regex-shaped. They need a model, which is
-  // exactly the asset AirKit refuses to ship. Leave them unimplemented rather
+  // exactly the asset ccshield refuses to ship. Leave them unimplemented rather
   // than approximating them.
 ];
 
@@ -137,7 +138,7 @@ function scan(original) {
   const redactions = labels.map((label) => ({ label, count: grouped.get(label).length, spans: grouped.get(label) }));
 
   const redacted = rebuild(original, kept);
-  // A redaction AirKit cannot verify is worse than none: report the findings
+  // A redaction ccshield cannot verify is worse than none: report the findings
   // and let the policy act on them. The subscription policy blocks either way.
   if (!verifiable(original, redacted, kept)) return { status: "ok", findings };
   return { status: "ok", findings, redactions, redactedBody: redacted.toString("base64") };
@@ -236,7 +237,7 @@ function rebuild(original, spans) {
 
 function verifiable(original, redacted, spans) {
   if (redacted.byteLength === 0 || redacted.byteLength > MAX_BODY_BYTES || redacted.equals(original)) return false;
-  // The replacement must not break the envelope; AirKit re-parses it.
+  // The replacement must not break the envelope; ccshield re-parses it.
   try { JSON.parse(redacted.toString("utf8")); } catch { return false; }
   return spans.every((span) => !redacted.includes(original.subarray(span.start, span.end)));
 }

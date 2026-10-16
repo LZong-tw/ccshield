@@ -453,7 +453,7 @@ test("OPF exact-range multiple labels retain secret facts and use a deterministi
     [["private_email", 2], ["private_person", 2], ["secret", 2]]);
   const piiFindings = result.findings.map(({ label, count }) => ({ category: label, count }));
   const decision = spawnSync("opa", ["eval", "--format=json", "--data",
-    resolve(import.meta.dirname, "../policy/baseline.rego"), "--stdin-input", "data.airkit.shield.decision"], {
+    resolve(import.meta.dirname, "../policy/baseline.rego"), "--stdin-input", "data.ccshield.shield.decision"], {
     encoding: "utf8", input: JSON.stringify({ destinationClass: "subscription", lane: "subscription", interactive: false,
       repositoryClass: "unknown", pathClasses: ["unknown"], secretFindings: [], piiFindings }),
   });
@@ -1044,7 +1044,7 @@ test("OPF propagation budget counts all labels together at 8192 and 8193", () =>
   }
 });
 
-const opfRoot = process.env.AIRKIT_TEST_OPF_ROOT
+const opfRoot = process.env.CCSHIELD_TEST_OPF_ROOT
   ?? (process.env.CCSHIELD_LIVE_INSTALL_TEST === "1" ? join(homedir(), ".local/share/airkit-shield/opf-2026-09-29") : undefined);
 test("deadline Viterbi returns the pinned upstream paths with real torch", { skip: !(opfRoot && existsSync(join(opfRoot, ".venv/bin/python"))) && "provisioned OPF venv not present" }, () => {
   const result = spawnSync(join(opfRoot, ".venv/bin/python"), ["-I", "-B", sourceOf("opf-viterbi-deadline.py"),
@@ -1250,7 +1250,7 @@ test("pinned local OPF worker keeps raw predictions inside the adapter", async (
   const python = spawnSync("python3", ["-c", "import sys; print(sys.executable)"], { encoding: "utf8" });
   assert.equal(python.status, 0, "Python 3 is required for the OPF worker test");
   const pythonPath = python.stdout.trim();
-  const temp = await realpath(await mkdtemp(join(tmpdir(), "airkit-opf-test-")));
+  const temp = await realpath(await mkdtemp(join(tmpdir(), "ccshield-opf-test-")));
   try {
     const checkpoint = join(temp, "checkpoint");
     await mkdir(checkpoint);
@@ -1268,33 +1268,34 @@ test("pinned local OPF worker keeps raw predictions inside the adapter", async (
     const source = join(temp, "opf");
     await mkdir(source);
     const sourceBytes = Buffer.from(`
+import json
 import os
 import signal
 import struct
 import sys
 import time
 import types
-cooperative_mode = os.getenv("AIRKIT_TEST_COOPERATIVE_MODE")
+cooperative_mode = os.getenv("CCSHIELD_TEST_COOPERATIVE_MODE")
 scan_ms = int(sys.argv[6])
 budget = (scan_ms - min(5000, scan_ms / 5)) / 1000
 clock = [0.0]
 if cooperative_mode:
     time.monotonic = lambda: clock[0]
-pid_marker = os.getenv("AIRKIT_TEST_PID_MARKER")
-if os.getenv("AIRKIT_TEST_IGNORE_TERM"):
+pid_marker = os.getenv("CCSHIELD_TEST_PID_MARKER")
+if os.getenv("CCSHIELD_TEST_IGNORE_TERM"):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 if pid_marker:
     with open(pid_marker, "w") as file:
         file.write(str(os.getpid()) + ":startup")
-if os.getenv("AIRKIT_TEST_STALL"):
+if os.getenv("CCSHIELD_TEST_STALL"):
     time.sleep(10)
-restart_fail = os.getenv("AIRKIT_TEST_RESTART_FAIL_ONCE_MARKER")
-exit_once = os.getenv("AIRKIT_TEST_SCAN_EXIT_ONCE_MARKER")
+restart_fail = os.getenv("CCSHIELD_TEST_RESTART_FAIL_ONCE_MARKER")
+exit_once = os.getenv("CCSHIELD_TEST_SCAN_EXIT_ONCE_MARKER")
 if restart_fail and exit_once and os.path.exists(exit_once) and not os.path.exists(restart_fail):
     with open(restart_fail, "w") as file:
         file.write("failed")
     raise RuntimeError("synthetic restart failure")
-exit_after_reply = os.getenv("AIRKIT_TEST_EXIT_AFTER_REPLY_MARKER")
+exit_after_reply = os.getenv("CCSHIELD_TEST_EXIT_AFTER_REPLY_MARKER")
 if exit_after_reply:
     import builtins
     if os.path.exists(exit_after_reply):
@@ -1409,9 +1410,15 @@ for name, module in {"torch": torch, "torch.nn": torch.nn,
         "opf._model.model": architecture, "opf._model.weights": weights,
         "opf._core": types.ModuleType("opf._core"), "opf._core.decoding": decoding}.items():
     sys.modules[name] = module
+# The worker passes its thread count in the cache namespace; a test may pin the value it must be.
+def expected_threads():
+    threads = json.loads(sys.argv[5])["threads"]
+    pinned = os.getenv("CCSHIELD_TEST_EXPECT_THREADS")
+    assert pinned is None or threads == int(pinned)
+    return threads
 class Result:
     def __init__(self, text):
-        selected = os.getenv("AIRKIT_TEST_PREDICTION_VALUE")
+        selected = os.getenv("CCSHIELD_TEST_PREDICTION_VALUE")
         value = selected if selected and selected in text else "alice@example.com" if "alice@example.com" in text else "person@example.org"
         start = text.index(value)
         self.payload = {
@@ -1422,7 +1429,7 @@ class Result:
             "redacted_text": text.replace(value, "<PRIVATE_EMAIL>"),
         }
     def to_dict(self):
-        marker = os.getenv("AIRKIT_TEST_EMPTY_PREDICTION_ONCE_MARKER")
+        marker = os.getenv("CCSHIELD_TEST_EMPTY_PREDICTION_ONCE_MARKER")
         if marker and not os.path.exists(marker) and self.payload["text"] != "alice@example.com":
             with open(marker, "w") as file:
                 file.write("empty")
@@ -1432,7 +1439,7 @@ class OPF:
     def __init__(self, *, model, device, output_mode, output_text_only, context_window_length=None):
         assert model and device == "cpu" and output_mode == "typed" and output_text_only is False
         assert context_window_length == 4096
-        assert torch.get_num_threads() == 4
+        assert torch.get_num_threads() == expected_threads()
         assert not any(name.startswith("OPF_") for name in os.environ)
         assert os.environ["TIKTOKEN_CACHE_DIR"].endswith("/tiktoken-cache")
         self.model = model
@@ -1450,7 +1457,7 @@ class OPF:
         assert MLPBlock.forward.__name__ == "grouped_forward"
         cache = self.runtime.model.forward.__self__
         assert type(cache).__name__ == "ExactWindowLogitsCache"
-        assert "threads4" in cache._namespace and "ctx4096" in cache._namespace
+        assert f"cpu:threads{expected_threads()}:" in cache._namespace and "ctx4096" in cache._namespace
         assert "adb9dd7d6f47e482ccb0925e621a1375461b997833dfa5be6dfc67b9d58b6f0e" in cache._namespace
         assert "75ef80d5320cf25d6949154ec374dccc61e53038a42538ee907e9d8c70d9f9cc" in cache._namespace
         self.calls += 1
@@ -1461,16 +1468,16 @@ class OPF:
             # Attention runs in fp32 while the mapped MLP weights stay bf16.
             assert all(layer.dtype == "float32" for block in self.runtime.model.block for layer in (block.attn.qkv, block.attn.out))
             # Global Viterbi now runs the deadline-aware copy; an empty sequence returns before any torch op.
-            if not os.getenv("AIRKIT_TEST_SKIP_WARMUP_DECODE"):
+            if not os.getenv("CCSHIELD_TEST_SKIP_WARMUP_DECODE"):
                 assert self.decoder.decode(EmptyScores()) == []
             hooks = [len(module.__dict__.get("pre_hooks", [])) for module in self.runtime.model.modules()
                      if isinstance(module, (TransformerBlock, MLPBlock))]
             assert hooks == [1, 1, 1, 1], "every transformer and MLP block needs exactly one deadline hook"
             if cooperative_mode == "blocks": cache.forward(Tensor(0))
-            elif not os.getenv("AIRKIT_TEST_SKIP_WARMUP_BLOCKS"):
+            elif not os.getenv("CCSHIELD_TEST_SKIP_WARMUP_BLOCKS"):
                 for block in self.runtime.model.block: block(Tensor(-1))
         if cooperative_mode and self.calls > 1:
-            marker = os.getenv("AIRKIT_TEST_COOPERATIVE_MARKER")
+            marker = os.getenv("CCSHIELD_TEST_COOPERATIVE_MARKER")
             try:
                 if cooperative_mode == "preprocess" and self.calls == 2: clock[0] += 1.25 * budget
                 for value in [1, 2]: cache.forward(Tensor(value))
@@ -1482,24 +1489,24 @@ class OPF:
         if self.calls > 1 and pid_marker:
             with open(pid_marker, "w") as file:
                 file.write(str(os.getpid()) + ":scan")
-        error_marker = os.getenv("AIRKIT_TEST_SCAN_ERROR_ONCE_MARKER")
+        error_marker = os.getenv("CCSHIELD_TEST_SCAN_ERROR_ONCE_MARKER")
         if self.calls > 1 and error_marker and not os.path.exists(error_marker):
             with open(error_marker, "w") as file:
                 file.write("error")
             raise RuntimeError("synthetic private model failure person@example.org")
-        if self.calls > 1 and os.getenv("AIRKIT_TEST_SCAN_STALL"):
+        if self.calls > 1 and os.getenv("CCSHIELD_TEST_SCAN_STALL"):
             time.sleep(10)
-        slow_marker = os.getenv("AIRKIT_TEST_SCAN_SLOW_MARKER")
+        slow_marker = os.getenv("CCSHIELD_TEST_SCAN_SLOW_MARKER")
         if self.calls > 1 and slow_marker:
             with open(slow_marker, "w") as file:
                 file.write("scanning")
             time.sleep(0.4)
-        exit_marker = os.getenv("AIRKIT_TEST_SCAN_EXIT_ONCE_MARKER")
+        exit_marker = os.getenv("CCSHIELD_TEST_SCAN_EXIT_ONCE_MARKER")
         if self.calls > 1 and exit_marker and not os.path.exists(exit_marker):
             with open(exit_marker, "w") as file:
                 file.write("exited")
             os._exit(2)
-        held_pipe_marker = os.getenv("AIRKIT_TEST_SCAN_EXIT_HELD_PIPE_MARKER")
+        held_pipe_marker = os.getenv("CCSHIELD_TEST_SCAN_EXIT_HELD_PIPE_MARKER")
         if self.calls > 1 and held_pipe_marker and not os.path.exists(held_pipe_marker):
             descendant = os.fork()
             if descendant == 0:
@@ -1508,14 +1515,14 @@ class OPF:
             with open(held_pipe_marker, "w") as file:
                 file.write(str(descendant))
             os._exit(2)
-        marker = os.getenv("AIRKIT_TEST_SCAN_STALL_ONCE_MARKER")
+        marker = os.getenv("CCSHIELD_TEST_SCAN_STALL_ONCE_MARKER")
         if self.calls > 1 and marker and not os.path.exists(marker):
             with open(marker, "w") as file:
                 file.write("stalled")
-            if os.getenv("AIRKIT_TEST_MUTATE_AFTER_STALL"):
+            if os.getenv("CCSHIELD_TEST_MUTATE_AFTER_STALL"):
                 with open(os.path.join(self.model, "model.safetensors"), "ab") as file:
                     file.write(b"changed")
-            helper = os.getenv("AIRKIT_TEST_MUTATE_HELPER_AFTER_STALL")
+            helper = os.getenv("CCSHIELD_TEST_MUTATE_HELPER_AFTER_STALL")
             if helper:
                 with open(helper, "ab") as file:
                     file.write(b"\\n# drift\\n")
@@ -1540,7 +1547,9 @@ class OPF:
 import childProcess from "node:child_process";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-const note = (event) => fs.appendFileSync(process.env.AIRKIT_TEST_SPY_LOG, event + " " + Date.now() + "\\n");
+import os from "node:os";
+if (process.env.CCSHIELD_TEST_PARALLELISM) os.availableParallelism = () => Number(process.env.CCSHIELD_TEST_PARALLELISM);
+const note = (event) => fs.appendFileSync(process.env.CCSHIELD_TEST_SPY_LOG, event + " " + Date.now() + "\\n");
 const createReadStream = fs.createReadStream;
 fs.createReadStream = function (path, ...rest) {
   if (String(path).endsWith("/model.safetensors")) note("digest");
@@ -1552,7 +1561,7 @@ childProcess.spawn = function (...args) {
   const child = spawn.apply(this, args);
   const index = pythons++;
   note("spawn-" + index);
-  const delay = index === 0 ? Number(process.env.AIRKIT_TEST_DELAY_REAP_MS || 0) : 0;
+  const delay = index === 0 ? Number(process.env.CCSHIELD_TEST_DELAY_REAP_MS || 0) : 0;
   if (!delay) { child.once("exit", () => note("exit-" + index)); return child; }
   const codes = { exitCode: null, signalCode: null };
   let released = false;
@@ -1602,6 +1611,14 @@ syncBuiltinESMExports();
       capabilities: ["cooperative-timeout"] }, "OSS keeps a session ready across model_timeout only for this advertised capability");
     assert.equal(replies[1].status, "ok");
     assert.deepEqual(replies[1].findings, [{ label: "private_email", count: 1 }]);
+    // Fewer CPUs lower the thread count; more never raise it past 4. Both must survive warm-up and a scan.
+    for (const [parallelism, expected] of [[2, 2], [8, 4]]) {
+      const threadRun = spawnSync(process.execPath, spyArgs(args), { input, encoding: "utf8", timeout: runTimeout,
+        env: { ...process.env, CCSHIELD_TEST_SPY_LOG: join(temp, `threads-${parallelism}.log`),
+          CCSHIELD_TEST_PARALLELISM: String(parallelism), CCSHIELD_TEST_EXPECT_THREADS: String(expected) } });
+      const threadReplies = parseReplies(threadRun);
+      assert.equal(threadReplies[1]?.status, "ok", `scan with ${parallelism} CPUs: ${threadRun.stderr}`);
+    }
     assert.equal(JSON.parse(Buffer.from(replies[1].redactedBody, "base64")).content, "[redacted:private_email]");
     assert.equal(run.stdout.includes("person@example.org"), false);
     await t.test("worker returns a 549102-byte redaction inside the 4 MiB frame", () => {
@@ -1612,7 +1629,7 @@ syncBuiltinESMExports();
       const request = JSON.stringify({ protocol: "airkit-privacy-ndjson-v1", id: "bounded-proof",
         type: "scan", body: largeBody.toString("base64") }) + "\n";
       const result = spawnSync(process.execPath, args, { input: request, encoding: "utf8", timeout: runTimeout, maxBuffer: 8 * 1048576,
-        env: { ...process.env, AIRKIT_TEST_PREDICTION_VALUE: "Alice" } });
+        env: { ...process.env, CCSHIELD_TEST_PREDICTION_VALUE: "Alice" } });
       const [reply] = parseReplies(result);
       assert.equal(reply.status, "ok");
       assert.ok(Buffer.byteLength(result.stdout) <= 4 * 1048576);
@@ -1664,25 +1681,25 @@ syncBuiltinESMExports();
     })}\n`, encoding: "utf8", timeout: runTimeout });
     assert.deepEqual(parseReplies(malformed), [{ type: "scan", id: "malformed", status: "unknown" }]);
     const stalled = spawnSync(process.execPath, startupExpiryArgs,
-    { input, encoding: "utf8", env: { ...process.env, AIRKIT_TEST_STALL: "1" }, timeout: 5_000 });
+    { input, encoding: "utf8", env: { ...process.env, CCSHIELD_TEST_STALL: "1" }, timeout: 5_000 });
     assert.equal(stalled.error, undefined, "a stalled model must not keep the worker alive");
     assert.notEqual(stalled.status, 0, "a startup timeout must not look like a clean exit");
     assert.equal(stalled.stdout, "", "a stalled model must not answer health");
     const unhooked = spawnSync(process.execPath, args,
-      { input, encoding: "utf8", env: { ...process.env, AIRKIT_TEST_SKIP_WARMUP_BLOCKS: "1" }, timeout: runTimeout });
+      { input, encoding: "utf8", env: { ...process.env, CCSHIELD_TEST_SKIP_WARMUP_BLOCKS: "1" }, timeout: runTimeout });
     assert.equal(unhooked.error, undefined, "a model that bypasses the deadline hooks must not keep the worker alive");
     assert.doesNotMatch(unhooked.stdout, /opf-1-client-exempt|"ok"/, "a model whose blocks never reach the deadline hooks must not report ready");
     const undecoded = spawnSync(process.execPath, args,
-      { input, encoding: "utf8", env: { ...process.env, AIRKIT_TEST_SKIP_WARMUP_DECODE: "1" }, timeout: runTimeout });
+      { input, encoding: "utf8", env: { ...process.env, CCSHIELD_TEST_SKIP_WARMUP_DECODE: "1" }, timeout: runTimeout });
     assert.equal(undecoded.error, undefined);
     assert.doesNotMatch(undecoded.stdout, /opf-1-client-exempt|"ok"/, "a prediction path that bypasses the deadline Viterbi must not report ready");
     // The warm-up probe finds only part of the address, as wrongly mapped weights would.
     const misread = spawnSync(process.execPath, args,
-      { input, encoding: "utf8", env: { ...process.env, AIRKIT_TEST_PREDICTION_VALUE: "alice" }, timeout: runTimeout });
+      { input, encoding: "utf8", env: { ...process.env, CCSHIELD_TEST_PREDICTION_VALUE: "alice" }, timeout: runTimeout });
     assert.equal(misread.error, undefined);
     assert.doesNotMatch(misread.stdout, /opf-1-client-exempt|"ok"/, "a model that misses the known warm-up answer must not report ready");
     const scanStalled = spawnSync(process.execPath, scanExpiryArgs,
-    { input, encoding: "utf8", env: { ...process.env, AIRKIT_TEST_SCAN_STALL: "1" }, timeout: runTimeout });
+    { input, encoding: "utf8", env: { ...process.env, CCSHIELD_TEST_SCAN_STALL: "1" }, timeout: runTimeout });
     const timeoutReplies = parseReplies(scanStalled);
     assert.equal(timeoutReplies[0].type, "health");
     assert.deepEqual(timeoutReplies[1], { type: "scan", id: "s", status: "unknown", reason: "model_killed" },
@@ -1697,7 +1714,7 @@ syncBuiltinESMExports();
         const marker = join(temp, `cooperative-${mode}-${scan}`);
         const result = spawnSync(process.execPath, workerArgs({ startup: 30_000, scan }), { input: retryInput, encoding: "utf8", timeout: runTimeout,
           // Warming off keeps the redact call sequence exact; the warming test below covers it separately.
-          env: { ...process.env, AIRKIT_TEST_COOPERATIVE_MODE: mode, AIRKIT_TEST_COOPERATIVE_MARKER: marker, AIRKIT_SHIELD_OPF_WARM_SECONDS: "0" } });
+          env: { ...process.env, CCSHIELD_TEST_COOPERATIVE_MODE: mode, CCSHIELD_TEST_COOPERATIVE_MARKER: marker, CCSHIELD_OPF_WARM_SECONDS: "0" } });
         const scans = parseReplies(result).filter(({ type }) => type === "scan");
         // Per-scan window cache counts show the retry reusing what the timed-out scan already computed.
         const counts = { windows: [[0, 2], [2, 0]], blocks: [[0, 2], [1, 1]], preprocess: [[0, 0], [0, 2]], postprocess: [[0, 2], [2, 0]] }[mode];
@@ -1717,7 +1734,7 @@ syncBuiltinESMExports();
       });
     }
     const recovered = spawnSync(process.execPath, scanExpiryArgs,
-      { input: retryInput, encoding: "utf8", env: { ...process.env, AIRKIT_TEST_SCAN_STALL_ONCE_MARKER: join(temp, "stalled-once") }, timeout: runTimeout });
+      { input: retryInput, encoding: "utf8", env: { ...process.env, CCSHIELD_TEST_SCAN_STALL_ONCE_MARKER: join(temp, "stalled-once") }, timeout: runTimeout });
     const recoveredReplies = parseReplies(recovered)
       .sort((a, b) => ["first", "after-timeout", "second"].indexOf(a.id) - ["first", "after-timeout", "second"].indexOf(b.id));
     assert.deepEqual(recoveredReplies.map(({ id, status }) => [id, status]), [
@@ -1725,7 +1742,7 @@ syncBuiltinESMExports();
     ]);
     assert.deepEqual(recoveredReplies[2].findings, [{ label: "private_email", count: 1 }]);
     const exited = spawnSync(process.execPath, scanExpiryArgs,
-      { input: retryInput, encoding: "utf8", env: { ...process.env, AIRKIT_TEST_SCAN_EXIT_ONCE_MARKER: join(temp, "exited-once") }, timeout: runTimeout });
+      { input: retryInput, encoding: "utf8", env: { ...process.env, CCSHIELD_TEST_SCAN_EXIT_ONCE_MARKER: join(temp, "exited-once") }, timeout: runTimeout });
     const exitReplies = parseReplies(exited)
       .sort((a, b) => ["first", "after-timeout", "second"].indexOf(a.id) - ["first", "after-timeout", "second"].indexOf(b.id));
     assert.deepEqual(exitReplies.map(({ id, status }) => [id, status]), [
@@ -1733,7 +1750,7 @@ syncBuiltinESMExports();
     ]);
     const slowMarker = join(temp, "slow-scan");
     const concurrent = spawn(process.execPath, workerArgs({ startup: 30_000, scan: 1_000 }), {
-      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, AIRKIT_TEST_SCAN_SLOW_MARKER: slowMarker },
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, CCSHIELD_TEST_SCAN_SLOW_MARKER: slowMarker },
     });
     const liveReplies = [];
     const liveOutput = createInterface({ input: concurrent.stdout });
@@ -1755,7 +1772,7 @@ syncBuiltinESMExports();
     await t.test("a restart with unchanged asset metadata reuses the boot digest", async () => {
       const log = join(temp, "restart-digest-log");
       const result = spawnSync(process.execPath, spyArgs(scanExpiryArgs), { input: retryInput, encoding: "utf8", timeout: runTimeout,
-        env: { ...process.env, AIRKIT_TEST_SPY_LOG: log, AIRKIT_TEST_SCAN_STALL_ONCE_MARKER: join(temp, "restart-digest-stall") } });
+        env: { ...process.env, CCSHIELD_TEST_SPY_LOG: log, CCSHIELD_TEST_SCAN_STALL_ONCE_MARKER: join(temp, "restart-digest-stall") } });
       const scans = parseReplies(result).filter(({ type }) => type === "scan");
       assert.deepEqual(scans.map(({ id, status, reason }) => [id, status, reason]), [["first", "unknown", "model_killed"], ["second", "ok", undefined]]);
       const events = (await spyEvents(log)).map(({ event }) => event);
@@ -1778,7 +1795,7 @@ syncBuiltinESMExports();
     await t.test("an idle worker finishes a timed-out scan's windows so the retry is all cache hits", async () => {
       const marker = join(temp, "cooperative-warming");
       const { child, output, reply } = liveChild(workerArgs({ startup: 30_000, scan: 2_000 }),
-        { AIRKIT_TEST_COOPERATIVE_MODE: "blocks", AIRKIT_TEST_COOPERATIVE_MARKER: marker });
+        { CCSHIELD_TEST_COOPERATIVE_MODE: "blocks", CCSHIELD_TEST_COOPERATIVE_MARKER: marker });
       try {
         send(child, "first");
         // Scan one stops inside window 2 and caches only window 1 (see the blocks case above).
@@ -1802,8 +1819,8 @@ syncBuiltinESMExports();
     });
     await t.test("a slow Python reap after a hard kill keeps the worker and never overlaps a second Python", async () => {
       const log = join(temp, "slow-reap-log");
-      const { child, output, reply } = liveChild(spyArgs(scanExpiryArgs), { AIRKIT_TEST_SPY_LOG: log,
-        AIRKIT_TEST_DELAY_REAP_MS: "4000", AIRKIT_TEST_SCAN_STALL_ONCE_MARKER: join(temp, "slow-reap-stall") });
+      const { child, output, reply } = liveChild(spyArgs(scanExpiryArgs), { CCSHIELD_TEST_SPY_LOG: log,
+        CCSHIELD_TEST_DELAY_REAP_MS: "4000", CCSHIELD_TEST_SCAN_STALL_ONCE_MARKER: join(temp, "slow-reap-stall") });
       try {
         send(child, "first");
         assert.deepEqual(await reply("first"), { type: "scan", id: "first", status: "unknown", reason: "model_killed" });
@@ -1834,8 +1851,8 @@ syncBuiltinESMExports();
     });
     await t.test("a failed Python respawn backs off without stopping the worker", async () => {
       const log = join(temp, "respawn-fail-log");
-      const { child, output, reply } = liveChild(spyArgs(scanExpiryArgs), { AIRKIT_TEST_SPY_LOG: log,
-        AIRKIT_TEST_SCAN_EXIT_ONCE_MARKER: join(temp, "respawn-exit"), AIRKIT_TEST_RESTART_FAIL_ONCE_MARKER: join(temp, "respawn-fail") });
+      const { child, output, reply } = liveChild(spyArgs(scanExpiryArgs), { CCSHIELD_TEST_SPY_LOG: log,
+        CCSHIELD_TEST_SCAN_EXIT_ONCE_MARKER: join(temp, "respawn-exit"), CCSHIELD_TEST_RESTART_FAIL_ONCE_MARKER: join(temp, "respawn-fail") });
       try {
         send(child, "first");
         assert.equal((await reply("first")).reason, "model_error");
@@ -1860,8 +1877,8 @@ syncBuiltinESMExports();
     });
     await t.test("an ok reply never waits behind a Python restart", async () => {
       const pidMarker = join(temp, "exit-after-reply-pid");
-      const { child, output, reply } = liveChild(args, { AIRKIT_TEST_EXIT_AFTER_REPLY_MARKER: join(temp, "exit-after-reply"),
-        AIRKIT_TEST_PID_MARKER: pidMarker });
+      const { child, output, reply } = liveChild(args, { CCSHIELD_TEST_EXIT_AFTER_REPLY_MARKER: join(temp, "exit-after-reply"),
+        CCSHIELD_TEST_PID_MARKER: pidMarker });
       try {
         send(child, "ready", "health");
         await reply("ready");
@@ -1882,7 +1899,7 @@ syncBuiltinESMExports();
     await t.test("an unexpected Python exit closes its inherited pipe before recovery completes", async () => {
       const marker = join(temp, "exited-held-pipe");
       const child = spawn(process.execPath, args, { stdio: ["pipe", "pipe", "pipe"],
-        env: { ...process.env, AIRKIT_TEST_SCAN_EXIT_HELD_PIPE_MARKER: marker } });
+        env: { ...process.env, CCSHIELD_TEST_SCAN_EXIT_HELD_PIPE_MARKER: marker } });
       const replies = [];
       const output = createInterface({ input: child.stdout });
       output.on("line", (line) => replies.push(JSON.parse(line)));
@@ -1909,7 +1926,7 @@ syncBuiltinESMExports();
         output.close();
       }
     });
-    for (const variable of ["AIRKIT_TEST_SCAN_ERROR_ONCE_MARKER", "AIRKIT_TEST_EMPTY_PREDICTION_ONCE_MARKER"]) {
+    for (const variable of ["CCSHIELD_TEST_SCAN_ERROR_ONCE_MARKER", "CCSHIELD_TEST_EMPTY_PREDICTION_ONCE_MARKER"]) {
       await t.test(`${variable} reports model_error without losing recovery`, () => {
         const result = spawnSync(process.execPath, scanExpiryArgs, { input: retryInput, encoding: "utf8", timeout: runTimeout,
           env: { ...process.env, [variable]: join(temp, variable) } });
@@ -1924,8 +1941,8 @@ syncBuiltinESMExports();
         const path = join(workerDir, helper);
         const helperBytes = await readFile(path);
         const child = spawn(process.execPath, scanExpiryArgs, { stdio: ["pipe", "pipe", "pipe"],
-          env: { ...process.env, AIRKIT_TEST_SCAN_STALL_ONCE_MARKER: join(temp, `held-${helper}`),
-            AIRKIT_TEST_MUTATE_HELPER_AFTER_STALL: path } });
+          env: { ...process.env, CCSHIELD_TEST_SCAN_STALL_ONCE_MARKER: join(temp, `held-${helper}`),
+            CCSHIELD_TEST_MUTATE_HELPER_AFTER_STALL: path } });
         const replies = [];
         const output = createInterface({ input: child.stdout });
         output.on("line", (line) => replies.push(JSON.parse(line)));
@@ -1947,8 +1964,8 @@ syncBuiltinESMExports();
         await t.test(`${signal} during ${phase} waits for its TERM-resistant Python child to exit`, async () => {
           const marker = join(temp, `${phase}-${signal}-pid`);
           const child = spawn(process.execPath, args, { stdio: ["pipe", "pipe", "pipe"],
-            env: { ...process.env, AIRKIT_TEST_PID_MARKER: marker, AIRKIT_TEST_IGNORE_TERM: "1",
-              [phase === "startup" ? "AIRKIT_TEST_STALL" : "AIRKIT_TEST_SCAN_STALL"]: "1" } });
+            env: { ...process.env, CCSHIELD_TEST_PID_MARKER: marker, CCSHIELD_TEST_IGNORE_TERM: "1",
+              [phase === "startup" ? "CCSHIELD_TEST_STALL" : "CCSHIELD_TEST_SCAN_STALL"]: "1" } });
           const replies = [];
           const output = createInterface({ input: child.stdout });
           output.on("line", (line) => replies.push(JSON.parse(line)));
@@ -2005,7 +2022,7 @@ syncBuiltinESMExports();
       const helperBytes = await readFile(path);
       const marker = join(temp, `drift-${helper}`);
       const child = spawn(process.execPath, args, {
-        stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, AIRKIT_TEST_SCAN_SLOW_MARKER: marker },
+        stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, CCSHIELD_TEST_SCAN_SLOW_MARKER: marker },
       });
       const output = [];
       const lines = createInterface({ input: child.stdout });
@@ -2030,8 +2047,8 @@ syncBuiltinESMExports();
         await writeFile(path, helperBytes);
         const recovering = spawnSync(process.execPath, scanExpiryArgs, {
           input: retryInput, encoding: "utf8", timeout: runTimeout,
-          env: { ...process.env, AIRKIT_TEST_SCAN_STALL_ONCE_MARKER: join(temp, `recovery-${helper}`),
-            AIRKIT_TEST_MUTATE_HELPER_AFTER_STALL: path },
+          env: { ...process.env, CCSHIELD_TEST_SCAN_STALL_ONCE_MARKER: join(temp, `recovery-${helper}`),
+            CCSHIELD_TEST_MUTATE_HELPER_AFTER_STALL: path },
         });
         const scans = parseReplies(recovering, "failure").filter(({ type }) => type === "scan");
         assert.deepEqual(scans.map(({ id, status }) => [id, status]), [["first", "unknown"]]);
@@ -2044,7 +2061,7 @@ syncBuiltinESMExports();
     const held = spawn(process.execPath, scanExpiryArgs, {
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env,
-        AIRKIT_TEST_SCAN_STALL_ONCE_MARKER: join(temp, "held-mutated-once"), AIRKIT_TEST_MUTATE_AFTER_STALL: "1" },
+        CCSHIELD_TEST_SCAN_STALL_ONCE_MARKER: join(temp, "held-mutated-once"), CCSHIELD_TEST_MUTATE_AFTER_STALL: "1" },
     });
     try {
       const output = createInterface({ input: held.stdout });
@@ -2064,7 +2081,7 @@ syncBuiltinESMExports();
     await writeFile(join(checkpoint, "model.safetensors"), modelBytes);
     const drifted = spawnSync(process.execPath, scanExpiryArgs,
       { input: retryInput, encoding: "utf8", env: { ...process.env,
-        AIRKIT_TEST_SCAN_STALL_ONCE_MARKER: join(temp, "mutated-once"), AIRKIT_TEST_MUTATE_AFTER_STALL: "1" }, timeout: runTimeout });
+        CCSHIELD_TEST_SCAN_STALL_ONCE_MARKER: join(temp, "mutated-once"), CCSHIELD_TEST_MUTATE_AFTER_STALL: "1" }, timeout: runTimeout });
     const driftedReplies = parseReplies(drifted, "failure").filter(({ type }) => type === "scan");
     assert.deepEqual(driftedReplies.map(({ id, status }) => [id, status]), [["first", "unknown"]], "asset drift must stop worker before later requests");
   } finally {

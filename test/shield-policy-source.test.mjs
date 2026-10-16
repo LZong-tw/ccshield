@@ -19,7 +19,7 @@ function decide(overrides = {}) {
     piiFindings: [],
     ...overrides,
   };
-  const run = spawnSync("opa", ["eval", "--format=json", "--data", policy, "--stdin-input", "data.airkit.shield.decision"], {
+  const run = spawnSync("opa", ["eval", "--format=json", "--data", policy, "--stdin-input", "data.ccshield.shield.decision"], {
     encoding: "utf8",
     input: JSON.stringify(input),
   });

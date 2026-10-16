@@ -306,7 +306,7 @@ test("a non-JSON body with an email reports findings without a redaction", () =>
 });
 
 test("the provisioning probe token is detected and redacted", () => {
-  const reply = scanJson({ content: "AIRKIT_PRIVACY_PROTOCOL_PROBE_EMAIL" });
+  const reply = scanJson({ content: "CCSHIELD_PRIVACY_PROTOCOL_PROBE_EMAIL" });
   assert.equal(reply.status, "ok");
   assert.deepEqual(reply.findings, [{ label: "email", count: 1 }]);
   const redacted = Buffer.from(reply.redactedBody, "base64");

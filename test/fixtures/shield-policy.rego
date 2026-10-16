@@ -1,4 +1,4 @@
-package airkit.shield
+package ccshield.shield
 
 default decision := {
   "action": "allow",

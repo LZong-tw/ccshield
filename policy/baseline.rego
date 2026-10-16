@@ -1,4 +1,4 @@
-# AirKit Shield policy for the personal-subscription lane.
+# ccshield default policy for the personal-subscription lane.
 #
 # Only two findings inputs vary at runtime: secretFindings (Gitleaks) and
 # piiFindings (the Privacy worker). repositoryClass, pathClasses and
@@ -10,7 +10,7 @@
 # Rule bodies are mutually exclusive on purpose: two simultaneously true
 # bodies producing different values is a Rego conflict, which surfaces as
 # "shield policy evaluation failed" and a 503 on every request.
-package airkit.shield
+package ccshield.shield
 
 default decision := {
 	"action": "allow",

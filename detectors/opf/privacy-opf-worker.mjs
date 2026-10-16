@@ -2,8 +2,9 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, readFileSync } from "node:fs";
 import { lstat, readFile, readdir, realpath } from "node:fs/promises";
+import { availableParallelism } from "node:os";
 import { createInterface } from "node:readline";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -18,9 +19,19 @@ const MAX_SCANS = 4;
 const HELPERS = {
   "opf-cpu-grouped.py": "adb9dd7d6f47e482ccb0925e621a1375461b997833dfa5be6dfc67b9d58b6f0e",
   "opf-window-cache.py": "75ef80d5320cf25d6949154ec374dccc61e53038a42538ee907e9d8c70d9f9cc",
-  "opf-mmap-weights.py": "62d69ebf8e46ea2bec8b2e73437905018a064fbf7ebaa10429e5fe34162f3b21",
+  "opf-mmap-weights.py": "8be0f49097d7317937ebe7572b09619925b0c10044f0376d6438f31400485bbc",
   "opf-viterbi-deadline.py": "6fbfb16aae67c6eecacc292f8d41dda13cbe7d6792d8c2be97b8d629cc590117",
 };
+// Threads per worker: at most 4, fewer when the CPU count or a cgroup v2 quota is smaller.
+// Python takes this count from the cache namespace, so both sides always agree.
+function workerThreads() {
+  let quota = Infinity;
+  try {
+    const [max, period] = readFileSync("/sys/fs/cgroup/cpu.max", "utf8").trim().split(/\s+/);
+    if (max !== "max" && Number(period) > 0) quota = Math.max(1, Math.floor(Number(max) / Number(period)));
+  } catch {}
+  return Math.min(4, availableParallelism(), quota);
+}
 const PYTHON = String.raw`
 import importlib.util
 import hashlib
@@ -45,7 +56,10 @@ try:
     from opf._model.model import AttentionBlock, MLPBlock, TransformerBlock
     from opf._model.weights import PARAM_NAME_MAP, Checkpoint
     from opf._core.decoding import ViterbiCRFDecoder
-    torch.set_num_threads(4)
+    THREADS = json.loads(sys.argv[5])["threads"]
+    if type(THREADS) is not int or not 1 <= THREADS <= 4:
+        raise RuntimeError("invalid thread count")
+    torch.set_num_threads(THREADS)
     def load_helper(name, path):
         with open(path, "rb") as file:
             source = file.read()
@@ -56,10 +70,10 @@ try:
         module = importlib.util.module_from_spec(spec)
         exec(compile(source, path, "exec"), module.__dict__)
         return module
-    grouped = load_helper("airkit_opf_grouped", sys.argv[3])
-    cache_module = load_helper("airkit_opf_cache", sys.argv[4])
-    weights_module = load_helper("airkit_opf_mmap", sys.argv[7])
-    viterbi_module = load_helper("airkit_opf_viterbi", sys.argv[8])
+    grouped = load_helper("ccshield_opf_grouped", sys.argv[3])
+    cache_module = load_helper("ccshield_opf_cache", sys.argv[4])
+    weights_module = load_helper("ccshield_opf_mmap", sys.argv[7])
+    viterbi_module = load_helper("ccshield_opf_viterbi", sys.argv[8])
     MLPBlock.forward = grouped.grouped_forward
     # OPF copies each tensor out of the checkpoint; serving mmap views avoids a second private read.
     weights = weights_module.MappedCheckpoint(sys.argv[1])
@@ -67,7 +81,7 @@ try:
     model = OPF(model=sys.argv[1], device="cpu", output_mode="typed", output_text_only=False,
                 context_window_length=4096)
     runtime = model.get_runtime()
-    if runtime.n_ctx != 4096 or torch.get_num_threads() != 4 or torch.is_autocast_enabled("cpu"):
+    if runtime.n_ctx != 4096 or torch.get_num_threads() != THREADS or torch.is_autocast_enabled("cpu"):
         raise RuntimeError("inference settings mismatch")
     runtime.model.eval()
     # Bit-identical weights move to file-backed pages the kernel can drop instead of compress or swap.
@@ -126,9 +140,9 @@ from time import monotonic
 # A timed-out scan keeps warming its remaining windows while the worker is idle, so the caller's retry
 # hits the cache. Only the latest timed-out text is kept, it yields to any new request between blocks,
 # and it is dropped after WARM_SECONDS of compute. Warming caches logits only, never decisions.
-# AIRKIT_SHIELD_OPF_WARM_SECONDS sets that budget (0 disables warming, at most 3600).
+# CCSHIELD_OPF_WARM_SECONDS sets that budget (0 disables warming, at most 3600).
 try:
-    WARM_SECONDS = float(os.environ.get("AIRKIT_SHIELD_OPF_WARM_SECONDS", "600"))
+    WARM_SECONDS = float(os.environ.get("CCSHIELD_OPF_WARM_SECONDS", "600"))
 except ValueError:
     raise RuntimeError("invalid warm budget")
 if not isfinite(WARM_SECONDS) or not 0 <= WARM_SECONDS <= 3600:
@@ -168,7 +182,7 @@ while True:
     request = None
     before = cache.snapshot()
     try:
-        if torch.get_num_threads() != 4 or torch.is_autocast_enabled("cpu"):
+        if torch.get_num_threads() != THREADS or torch.is_autocast_enabled("cpu"):
             raise RuntimeError("inference settings changed")
         request = json.loads(line)
         cache.begin_scan(cooperative_seconds)
@@ -348,10 +362,11 @@ async function main() {
   };
   const { checkpointMetadata, sourceMetadata } = await attestAssets();
   const { prepareOpfScan, adaptOpfPrediction } = await import(pathToFileURL(adapterPath));
+  const threads = workerThreads();
   const namespace = JSON.stringify({ checkpoint: config["--checkpoint-sha256"],
     checkpointVersion: config["--checkpoint-version"], source: config["--opf-source-sha256"],
     adapter: config["--adapter-sha256"], tokenizer: config["--tokenizer-sha256"], helpers: HELPERS,
-    policy: VERSION, settings: "cpu:threads4:ctx4096:eval:no-autocast:attention-fp32" });
+    policy: VERSION, threads, settings: `cpu:threads${threads}:ctx4096:eval:no-autocast:attention-fp32` });
   let starting;
   const startPython = async () => {
     if (fatal) throw new Error("worker unavailable");

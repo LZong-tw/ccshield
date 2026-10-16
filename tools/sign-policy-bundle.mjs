@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Build and sign an AirKit Shield policy bundle.
+// Build and sign a ccshield policy bundle.
 //
 //   node tools/shield/sign-policy-bundle.mjs keygen --out <dir>
 //   node tools/shield/sign-policy-bundle.mjs sign \
@@ -12,7 +12,7 @@
 // it outside the repository and delete the file.
 //
 // Compile the Wasm first:
-//   opa build -t wasm -e airkit/shield/decision tools/shield/airkit-subscription.rego
+//   opa build -t wasm -e ccshield/shield/decision policy/baseline.rego
 //   tar -xzf bundle.tar.gz   # yields /policy.wasm
 
 import { createHash, generateKeyPairSync, createPrivateKey, sign } from "node:crypto";

@@ -26,7 +26,7 @@ export async function createGitleaksScanner({ executable, sha256, ruleBundle, ru
   const selfTestResult = await invoke(run, {
     command: provision.executable,
     args: scanArguments(provision.ruleBundle),
-    input: Buffer.from("-----BEGIN PRIVATE KEY-----\nAIRKIT_SHIELD_SEMANTIC_SENTINEL\n-----END PRIVATE KEY-----\n"),
+    input: Buffer.from("-----BEGIN PRIVATE KEY-----\nCCSHIELD_SEMANTIC_SENTINEL\n-----END PRIVATE KEY-----\n"),
   });
   const selfTestFindings = parseFindings(selfTestResult);
   if (selfTestFindings.length !== 1 || selfTestFindings[0].category !== "private-key" || selfTestFindings[0].count !== 1) {
