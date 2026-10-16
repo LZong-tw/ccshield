@@ -42,12 +42,56 @@ test("health handshake reports the protocol and the worker file's version", asyn
   assert.equal(reply.type, "health");
   assert.equal(reply.protocol, "airkit-privacy-ndjson-v1");
   assert.equal(reply.version, await workerVersion());
-  // Honesty markers: the scope gate exempts client-injected content (`system`,
-  // `tools`, and the claudeMd envelope), and detection is still skeleton (probe
-  // token + one email regex). A version bump must not drop either marker
-  // without a deliberate decision.
-  assert.match(reply.version, /client-exempt/);
-  assert.match(reply.version, /skeleton/);
+  assert.equal(reply.version, "regex-v1");
+});
+
+function redactedText(content) {
+  const reply = scanJson({ system: "", messages: [{ role: "user", content }] });
+  assert.equal(reply.status, "ok");
+  if (reply.findings.length === 0) {
+    assert.equal("redactedBody" in reply, false);
+    return { findings: [], text: content };
+  }
+  const body = JSON.parse(Buffer.from(reply.redactedBody, "base64").toString("utf8"));
+  return { findings: reply.findings, text: body.messages[0].content };
+}
+
+test("a value right after a newline is redacted without breaking the JSON escape", () => {
+  const { findings, text } = redactedText("line one\nfoo@example.com");
+  assert.deepEqual(findings, [{ label: "email", count: 1 }]);
+  assert.equal(text, "line one\n[redacted:email]");
+});
+
+test("regex-v1 redacts each supported label", () => {
+  const cases = [
+    ["ip 8.8.8.8", "ip [redacted:ip-address]", "ip-address"],
+    ["card 4111 1111 1111 1111", "card [redacted:credit-card]", "credit-card"],
+    ["card 5500-0000-0000-0004", "card [redacted:credit-card]", "credit-card"],
+    ["ssn 123-45-6789", "ssn [redacted:ssn]", "ssn"],
+    ["tel +886 912 345 678", "tel [redacted:phone]", "phone"],
+    ["tel (02) 2345-6789", "tel [redacted:phone]", "phone"],
+    ["key sk-proj-abcdefghijklmnopqrstuvwxyz012345", "key [redacted:token]", "token"],
+    [`key ghp_${"a".repeat(36)}`, "key [redacted:token]", "token"],
+  ];
+  for (const [input, expected, label] of cases) {
+    const { findings, text } = redactedText(input);
+    assert.deepEqual(findings, [{ label, count: 1 }], input);
+    assert.equal(text, expected, input);
+  }
+});
+
+test("regex-v1 leaves coding-session lookalikes alone", () => {
+  for (const input of [
+    "loopback 127.0.0.1, private 10.0.0.1 192.168.1.20 172.16.4.4, any 0.0.0.0, docs 192.0.2.1",
+    "version v1.2.3.4 and 1.2.3.4.5 and 999.1.1.1",
+    "luhn-invalid 4111111111111112, unknown prefix 1234567812345670",
+    "sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "commit e00a32d0123456789abcdef0123456789abcdef and base64 QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=",
+    "timestamp 20261016123045, date 2026-10-16, port 8080, id 4294967296",
+    "ssn-shaped invalid 000-12-3456 666-12-3456 123-00-4567",
+  ]) {
+    assert.deepEqual(redactedText(input).findings, [], input);
+  }
 });
 
 test("a preamble email in the system field is exempt (string form)", () => {

@@ -1,22 +1,22 @@
 #!/usr/bin/env node
-// ccshield privacy worker — skeleton.
+// ccshield privacy worker — regex fallback.
 //
-// Speaks airkit-privacy-ndjson-v1 correctly and completely. What it DETECTS is
-// deliberately minimal, because detection scope is a decision for whoever is
-// accountable for it, not for the transport. Edit RULES below; everything
-// outside RULES is protocol plumbing you should not need to touch.
+// Speaks airkit-privacy-ndjson-v1. This is the detector the daemon runs until
+// the OPF model is downloaded and verified, and the one it falls back to when
+// OPF is unavailable. It only covers what a regex can say with low false
+// positives; `address` and `person` need the model.
 //
 // Read docs/superpowers/specs/2026-09-03-shield-privacy-worker-contract.md
 // before changing anything here.
 //
 // Two things to know before you widen RULES:
 //
-//   1. The subscription policy blocks on ANY finding. A rule with false
-//      positives does not degrade quality, it stops the request. Widen one
-//      rule at a time.
+//   1. The subscription policy redacts on any finding, so a false positive
+//      silently rewrites what the user sent. Every rule here is scoped so that
+//      hashes, git SHAs, loopback addresses, timestamps and version strings
+//      in a coding session do not match. Gitleaks owns secrets.
 //   2. The worker is digest-pinned. Editing this file changes its SHA-256 and
-//      the next spawn refuses to start until you re-run
-//      `ccshield privacy provision ... --write`.
+//      the next spawn refuses to start until it is re-pinned.
 //
 // Deploying it: the daemon spawns this file with `shell: false`
 // (privacy.mjs:22), so the shebang is what execs, and the daemon runs under
@@ -41,12 +41,11 @@ const PROTOCOL = "airkit-privacy-ndjson-v1";
 // Must equal the manifest `version` and the policy manifest's
 // detectorVersions.privacy. The daemon refuses to start if the three disagree.
 //
-// `client-exempt`: scan() skips the parts of an Anthropic messages-shaped body
-// the client fills in before the user types anything — the `system` preamble,
-// the `tools` descriptions, and the single claudeMd <system-reminder> envelope
-// in the first message (see scanScope). `skeleton` stays: the detection rules
-// are still just the probe token + one email regex.
-const VERSION = "0.3.0-skeleton-client-exempt";
+// scan() skips the parts of an Anthropic messages-shaped body the client fills
+// in before the user types anything — the `system` preamble, the `tools`
+// descriptions, and the single claudeMd <system-reminder> envelope in the
+// first message (see scanScope).
+const VERSION = "regex-v1";
 
 // ---------------------------------------------------------------------------
 // The part you decide.
@@ -65,18 +64,28 @@ const RULES = [
 
   { label: "email", pattern: /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g },
 
-  // Starting points, left off on purpose. Enable one at a time and watch what
-  // it blocks before enabling the next.
-  //
-  // { label: "ip-address",  pattern: /\b(?:\d{1,3}\.){3}\d{1,3}\b/g },
-  // { label: "credit-card", pattern: /\b(?:\d[ -]?){13,19}\b/g },
-  // { label: "phone",       pattern: /\+?\d[\d ()-]{7,}\d/g },
-  // { label: "ssn",         pattern: /\b\d{3}-\d{2}-\d{4}\b/g },
-  // { label: "token",       pattern: /\b[A-Za-z0-9_-]{32,}\b/g },
-  //
-  // `address` and `person` are not regex-shaped. They need a model, which is
-  // exactly the asset ccshield refuses to ship. Leave them unimplemented rather
-  // than approximating them.
+  // Public IPv4 only. Loopback, private, link-local, CGNAT, unspecified,
+  // documentation and multicast ranges are infrastructure, not personal data.
+  { label: "ip-address", pattern: /(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])/g, accept: isPublicIpv4 },
+
+  // 13-19 digits, optionally grouped by single spaces or hyphens, that pass
+  // the Luhn check and start with a card-network prefix.
+  { label: "credit-card", pattern: /(?<![\d-])\d(?:[ -]?\d){12,18}(?![\d-])/g, accept: isCardNumber },
+
+  // US SSN with its canonical separators; the invalid area/group/serial
+  // values are excluded.
+  { label: "ssn", pattern: /(?<![\d-])(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}(?![\d-])/g },
+
+  // A phone number must say it is one: a leading + country code, or a
+  // parenthesised area code. Bare digit runs are timestamps and IDs.
+  { label: "phone", pattern: /(?<![\w+])\+\d{1,3}[ -]?(?:\(\d{1,4}\)[ -]?)?\d{2,4}(?:[ -]?\d{2,4}){1,3}(?![\w-])|(?<![\w)])\(\d{2,4}\) ?\d{3,4}[ -]\d{4}(?![\w-])/g },
+
+  // Bearer-style tokens with a recognisable issuer prefix that Gitleaks'
+  // default rules do not already confirm. A generic long-string rule would
+  // redact every hash in the transcript.
+  { label: "token", pattern: /\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{36,}|xox[abpr]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/g },
+
+  // `address` and `person` are not regex-shaped. They need the model.
 ];
 
 // ---------------------------------------------------------------------------
@@ -93,16 +102,46 @@ for (const rule of RULES) {
   if (!rule.pattern.global) throw new Error(`privacy rule for ${rule.label} needs the g flag`);
 }
 
+function isPublicIpv4(value) {
+  const octets = value.split(".").map(Number);
+  if (octets.some((octet, index) => octet > 255 || (octet > 0 && value.split(".")[index].startsWith("0")))) return false;
+  const [a, b, c] = octets;
+  if (a === 0 || a === 10 || a === 127 || a >= 224) return false;
+  if (a === 100 && b >= 64 && b <= 127) return false;
+  if (a === 169 && b === 254) return false;
+  if (a === 172 && b >= 16 && b <= 31) return false;
+  if (a === 192 && b === 168) return false;
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return false;
+  if (a === 198 && (b === 18 || b === 19)) return false;
+  if ((a === 198 && b === 51 && c === 100) || (a === 203 && b === 0 && c === 113)) return false;
+  return true;
+}
+
+function isCardNumber(value) {
+  if (/[ -].*[ -]/.test(value) && new Set(value.match(/[ -]/g)).size > 1) return false;
+  const digits = value.replace(/[ -]/g, "");
+  if (!/^(?:4|5[1-5]|2[2-7]|3[47]|6(?:011|5)|35|3[0689])/.test(digits)) return false;
+  let sum = 0;
+  for (let index = 0; index < digits.length; index += 1) {
+    let digit = Number(digits[digits.length - 1 - index]);
+    if (index % 2 === 1) {
+      digit *= 2;
+      if (digit > 9) digit -= 9;
+    }
+    sum += digit;
+  }
+  return sum % 10 === 0;
+}
+
 function scan(original) {
-  const text = scanScope(original);
+  const texts = scanScope(original);
   const seen = new Set();
   const byLabel = new Map();
 
   for (const rule of RULES) {
-    rule.pattern.lastIndex = 0;
-    for (const match of text.matchAll(rule.pattern)) {
+    for (const match of texts.flatMap((text) => [...text.matchAll(rule.pattern)])) {
       const value = match[0];
-      if (!value) continue;
+      if (!value || (rule.accept && !rule.accept(value))) continue;
       const key = `${rule.label} ${value}`;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -165,31 +204,33 @@ function scan(original) {
 // exactly one balanced pair, so a reminder quoted inside real user content does
 // not gain the exemption.
 //
-// Soundness of the scan-text → original-span mapping: every enabled rule matches
-// a pure-ASCII sequence, and JSON.stringify emits those characters verbatim —
-// never escaped — so a match found in the scan text necessarily exists as the
-// same byte sequence in the original body, which is what occurrences() below
-// relies on. Re-check this property before enabling any rule that can match
-// non-ASCII characters.
+// Rules run over the decoded string values in scope, not over JSON text. On
+// JSON text a value after a newline arrives as `\nfoo@example.com`, the rule
+// swallows the escape's `n`, and the redaction then cuts the escape in half —
+// the body stops parsing and the request fails closed. Every rule matches a
+// pure-ASCII sequence with no `"` or `\\`, which JSON.stringify never escapes,
+// so a match in a decoded value exists verbatim in the original body, which is
+// what occurrences() relies on. Re-check that before adding a rule that can
+// match non-ASCII, quotes or backslashes.
 function scanScope(original) {
-  try {
-    const parsed = JSON.parse(original.toString("utf8"));
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)
-      || !Array.isArray(parsed.messages) || !("system" in parsed)) {
-      return original.toString("utf8");
-    }
-    const { system: _exempt, tools: _exemptTools, messages, ...rest } = parsed;
-    return JSON.stringify({ ...rest, messages: messages.map(exemptEnvelope) });
-  } catch {
-    return original.toString("utf8");
+  const raw = original.toString("utf8");
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { return [raw]; }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)
+    || !Array.isArray(parsed.messages) || !("system" in parsed)) {
+    return stringValues(parsed);
   }
+  const { system: _exempt, tools: _exemptTools, messages, ...rest } = parsed;
+  return stringValues({ ...rest, messages: messages.map(exemptEnvelope) });
 }
 
-// Returns a copy of `message` with the claudeMd envelope dropped — its first
-// content entry when that entry is a text block that is one whole
-// <system-reminder>…</system-reminder>. Anything else (no leading text block,
-// an unbalanced or partial reminder, multiple reminders, a reminder that is
-// not the first block) is kept verbatim and stays in scope.
+function stringValues(value, out = []) {
+  if (typeof value === "string") out.push(value);
+  else if (Array.isArray(value)) for (const item of value) stringValues(item, out);
+  else if (value !== null && typeof value === "object") for (const item of Object.values(value)) stringValues(item, out);
+  return out;
+}
+
 function exemptEnvelope(message) {
   if (message === null || typeof message !== "object" || Array.isArray(message)
     || !Array.isArray(message.content)) {
