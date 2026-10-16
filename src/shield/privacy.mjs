@@ -5,6 +5,7 @@ import { dirname, isAbsolute, resolve } from "node:path";
 
 import { envNamesFor, readEnv } from "../compat-env.mjs";
 import { attestShieldCheckpoint } from "./checkpoint.mjs";
+import { isValidOpfWorkerArgs } from "./opf-args.mjs";
 import { PRIVACY_PROTOCOL as PROTOCOL } from "./protocol.mjs";
 const MAX_BODY_BYTES = 1_048_576;
 const MAX_FRAME_BYTES = 4 * 1_048_576; // base64 redacted body (≤1 MiB → ~1.4 MiB) plus findings must fit
@@ -558,7 +559,7 @@ function assertPrivacyProvision(provision) {
   }
   if (privacy.checkpoint !== undefined && (!validTree(privacy.checkpoint) || !validTree(privacy.source)
     || !validPinnedFile(privacy.adapter) || privacy.adapter.path !== resolve(dirname(privacy.worker.command), "opf-adapter.mjs")
-    || !validPinnedFile(privacy.tokenizer, true) || !validOpfRuntimeArgs(privacy))) {
+    || !validPinnedFile(privacy.tokenizer, true) || !isValidOpfWorkerArgs(privacy.worker.args, privacy))) {
     throw new TypeError("shield privacy provision is invalid");
   }
   return Object.freeze({
@@ -584,21 +585,6 @@ function validPinnedFile(value, tokenizer = false) {
     && isAbsoluteCanonical(value.path) && resolve(value.path) === value.path
     && /^[a-f0-9]{64}$/.test(value.sha256 ?? "")
     && (!tokenizer || (value.version === "o200k_base" && value.path.endsWith("/fb374d419588a4632f3f557e76b4b70aebbca790")));
-}
-
-function validOpfRuntimeArgs(privacy) {
-  const args = privacy.worker.args;
-  return args.length === 22 && args[0] === "--python" && isAbsoluteCanonical(args[1]) && resolve(args[1]) === args[1]
-    && args[2] === "--checkpoint" && args[3] === privacy.checkpoint.path
-    && args[4] === "--checkpoint-sha256" && args[5] === privacy.checkpoint.sha256
-    && args[6] === "--checkpoint-version" && args[7] === privacy.checkpoint.version
-    && args[8] === "--opf-source" && args[9] === privacy.source.path
-    && args[10] === "--opf-source-sha256" && args[11] === privacy.source.sha256
-    && args[12] === "--adapter-sha256" && args[13] === privacy.adapter.sha256
-    && args[14] === "--tokenizer" && args[15] === privacy.tokenizer.path
-    && args[16] === "--tokenizer-sha256" && args[17] === privacy.tokenizer.sha256
-    && args[18] === "--startup-timeout-ms" && args[19] === "30000"
-    && args[20] === "--scan-timeout-ms" && ["2000", "10000", "25000", "60000"].includes(args[21]);
 }
 
 async function validatePrivacyPinnedFile(asset, { label } = {}) {

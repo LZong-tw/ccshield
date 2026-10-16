@@ -5,6 +5,7 @@ import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { runPrivacyWorkerSelfTest } from "./privacy.mjs";
 import { verifyShieldCheckpoint } from "./checkpoint.mjs";
 import { writeShieldAssetsProvision } from "./paths.mjs";
+import { isValidOpfWorkerArgs } from "./opf-args.mjs";
 import { PRIVACY_PROTOCOL } from "./protocol.mjs";
 
 const FORMAT_VERSION = 1;
@@ -102,7 +103,7 @@ function parsePrivacyManifest(bytes) {
     || !isAbsolute(value.tokenizer.path) || resolve(value.tokenizer.path) !== value.tokenizer.path
     || basename(value.tokenizer.path) !== O200K_CACHE_KEY || value.tokenizer.version !== "o200k_base"
     || !/^[a-f0-9]{64}$/.test(value.tokenizer.sha256 ?? "")
-    || !validOpfArguments(value.worker.args, value))) {
+    || !isValidOpfWorkerArgs(value.worker.args, value))) {
     throw new Error("shield privacy bundle manifest is invalid");
   }
   return Object.freeze({
@@ -110,21 +111,6 @@ function parsePrivacyManifest(bytes) {
     worker: Object.freeze({ command: value.worker.command, args: Object.freeze([...value.worker.args]), sha256: value.worker.sha256 }),
     ...(value.checkpoint ? { checkpoint: value.checkpoint, source: value.source, adapter: value.adapter, tokenizer: value.tokenizer } : {}),
   });
-}
-
-function validOpfArguments(args, manifest) {
-  return args.length === 22 && isAbsolute(args[1]) && resolve(args[1]) === args[1]
-    && args[0] === "--python"
-    && args[2] === "--checkpoint" && args[3] === manifest.checkpoint?.path
-    && args[4] === "--checkpoint-sha256" && args[5] === manifest.checkpoint?.sha256
-    && args[6] === "--checkpoint-version" && args[7] === manifest.checkpoint?.version
-    && args[8] === "--opf-source" && args[9] === manifest.source?.path
-    && args[10] === "--opf-source-sha256" && args[11] === manifest.source?.sha256
-    && args[12] === "--adapter-sha256" && args[13] === manifest.adapter?.sha256
-    && args[14] === "--tokenizer" && args[15] === manifest.tokenizer?.path
-    && args[16] === "--tokenizer-sha256" && args[17] === manifest.tokenizer?.sha256
-    && args[18] === "--startup-timeout-ms" && args[19] === "30000"
-    && args[20] === "--scan-timeout-ms" && ["2000", "10000", "25000", "60000"].includes(args[21]);
 }
 
 function safeIdentifier(value) { return typeof value === "string" && /^[A-Za-z0-9._-]{1,128}$/.test(value); }
