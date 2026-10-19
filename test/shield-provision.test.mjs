@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { provisionShieldAssets } from "../src/shield/provision.mjs";
+import { prepareRegexWorker } from "../src/shield/regex-detector.mjs";
 import { assertShieldAssetsProvision, readShieldAssetsProvision, shieldPaths } from "../src/shield/paths.mjs";
 
 const policyPath = "/opt/ccshield/policy.json";
@@ -28,6 +29,9 @@ const bytes = {
   [workerPath]: Buffer.from("privacy worker fixture"),
 };
 const rulesDigest = sha256(bytes[gitleaksRulesPath]);
+// Fixture runs have no home directory, so they name the store and skip the regex install.
+const storeRoot = "/opt/ccshield/store";
+const installRegex = async () => {};
 
 test("asset provision previews without writes and only records opaque references after explicit write", async () => {
   const writes = [];
@@ -36,10 +40,12 @@ test("asset provision previews without writes and only records opaque references
     gitleaksPath,
     gitleaksRulesPath,
     privacyBundlePath: privacyPath,
+    storeRoot,
     io: fixtureIo(),
     runPrivacySelfTest: async () => ({ version: "privacy-1" }),
     writeState: async (value) => writes.push(value),
   });
+  const regex = await prepareRegexWorker({ storeRoot });
 
   assert.equal(writes.length, 0);
   assert.deepEqual(preview, {
@@ -57,6 +63,7 @@ test("asset provision previews without writes and only records opaque references
       path: privacyPath,
       worker: { command: workerPath, args: ["--stdio"], sha256: sha256(bytes[workerPath]) },
     },
+    regex: { version: regex.version, worker: regex.worker },
   });
 
   const written = await provisionShieldAssets({
@@ -65,6 +72,8 @@ test("asset provision previews without writes and only records opaque references
     gitleaksRulesPath,
     privacyBundlePath: privacyPath,
     write: true,
+    storeRoot,
+    installRegex,
     io: fixtureIo(),
     runPrivacySelfTest: async () => ({ version: "privacy-1" }),
     writeState: async (value) => writes.push(value),
@@ -74,12 +83,35 @@ test("asset provision previews without writes and only records opaque references
   assert.doesNotMatch(JSON.stringify(writes), /fixture|PRIVATE|secret/i);
 });
 
+test("asset provision without an OPF bundle records privacy as absent and skips the self-test", async () => {
+  const writes = [];
+  let selfTests = 0;
+  const written = await provisionShieldAssets({
+    bundlePath: policyPath,
+    gitleaksPath,
+    gitleaksRulesPath,
+    write: true,
+    storeRoot,
+    installRegex,
+    io: fixtureIo(),
+    runPrivacySelfTest: async () => { selfTests += 1; return { version: "privacy-1" }; },
+    writeState: async (value) => writes.push(value),
+  });
+  const regex = await prepareRegexWorker({ storeRoot });
+
+  assert.equal(selfTests, 0);
+  assert.deepEqual(written.privacy, { state: "absent" });
+  assert.deepEqual(written.regex, { version: regex.version, worker: regex.worker });
+  assert.deepEqual(writes, [written]);
+});
+
 test("asset provision rejects unsafe, drifted, or protocol-invalid preinstalled artifacts without a download path", async () => {
   const options = {
     bundlePath: policyPath,
     gitleaksPath,
     gitleaksRulesPath,
     privacyBundlePath: privacyPath,
+    storeRoot,
     runPrivacySelfTest: async () => ({ version: "privacy-1" }),
   };
   await assert.rejects(provisionShieldAssets({ ...options, bundlePath: "relative", io: fixtureIo() }), /canonical and absolute/i);
@@ -108,6 +140,10 @@ test("explicit write stores a private canonical asset provision record", async (
     assert.equal((await stat(paths.assetsProvisionPath)).mode & 0o777, 0o600);
     assert.deepEqual(await readShieldAssetsProvision({ paths }), written);
     assert.deepEqual(JSON.parse(await readFile(paths.assetsProvisionPath, "utf8")), written);
+    const installed = written.regex.worker.command;
+    assert.equal((await stat(installed)).mode & 0o777, 0o755);
+    assert.equal(sha256(await readFile(installed)), written.regex.worker.sha256);
+    assert.match((await readFile(installed, "utf8")).split("\n")[0], new RegExp(`^#!${process.execPath}$`));
   } finally {
     await rm(homeDir, { recursive: true, force: true });
   }
@@ -144,6 +180,7 @@ test("OPF provision pins its model, source, helper, tokenizer and worker argumen
     gitleaksPath,
     gitleaksRulesPath,
     privacyBundlePath: privacyPath,
+    storeRoot,
     io: fixtureIo({ privacyManifest, extraBytes: { [adapterPath]: adapterBytes, [tokenizerPath]: tokenizerBytes } }),
     runPrivacySelfTest: async () => ({ version: "privacy-1" }),
   };

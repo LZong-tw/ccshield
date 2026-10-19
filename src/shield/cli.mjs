@@ -87,7 +87,7 @@ async function createDefaultShieldDependencies(dependencies) {
     async install({ write, lane }) {
       const lanePaths = shieldPaths({ env, lane });
       const assets = await readAssets({ paths: lanePaths, io: dependencies.io });
-      if (!assets) throw new Error("shield assets are missing; provision Privacy and Gitleaks before install");
+      if (!assets) throw new Error("shield assets are missing; run ccshield privacy provision with Gitleaks before install");
       const { loadShieldPolicy } = dependencies.loadShieldPolicy ? { loadShieldPolicy: dependencies.loadShieldPolicy } : await import("./policy.mjs");
       const provision = await readPolicyProvision({ paths: lanePaths, io: dependencies.io });
       await loadShieldPolicy(provision);
@@ -145,6 +145,7 @@ async function createDefaultShieldDependencies(dependencies) {
         privacyBundlePath: bundlePath,
         write,
         paths: lanePaths,
+        nodePath,
       });
       return { state: write ? "degraded" : "preview", write, provisioned: write };
     },
@@ -277,7 +278,7 @@ function parseLaneCommand(argv, command) {
   throw new Error(`usage: ${command} [--lane subscription|managed]`);
 }
 
-const PRIVACY_PROVISION_USAGE = "usage: ccshield privacy provision --bundle /absolute/privacy-manifest --gitleaks /absolute/gitleaks --gitleaks-rules /absolute/gitleaks-rules.toml [--policy-bundle /absolute/policy-bundle] [--write]";
+const PRIVACY_PROVISION_USAGE = "usage: ccshield privacy provision --gitleaks /absolute/gitleaks --gitleaks-rules /absolute/gitleaks-rules.toml [--bundle /absolute/privacy-manifest] [--policy-bundle /absolute/policy-bundle] [--write]";
 
 function parsePrivacyProvision(argv) {
   if (argv[0] !== "provision") throw new Error(PRIVACY_PROVISION_USAGE);
@@ -293,8 +294,8 @@ function parsePrivacyProvision(argv) {
     values[token] = argv[index + 1];
     index += 1;
   }
-  if (!values["--bundle"] || !values["--gitleaks"] || !values["--gitleaks-rules"] || (values["--lane"] !== null && !["subscription", "managed"].includes(values["--lane"]))) throw new Error(PRIVACY_PROVISION_USAGE);
-  return { bundlePath: values["--bundle"], gitleaksPath: values["--gitleaks"], gitleaksRulesPath: values["--gitleaks-rules"], ...(values["--policy-bundle"] === null ? {} : { policyBundlePath: values["--policy-bundle"] }), lane: values["--lane"] ?? "subscription", write };
+  if (!values["--gitleaks"] || !values["--gitleaks-rules"] || (values["--lane"] !== null && !["subscription", "managed"].includes(values["--lane"]))) throw new Error(PRIVACY_PROVISION_USAGE);
+  return { ...(values["--bundle"] === null ? {} : { bundlePath: values["--bundle"] }), gitleaksPath: values["--gitleaks"], gitleaksRulesPath: values["--gitleaks-rules"], ...(values["--policy-bundle"] === null ? {} : { policyBundlePath: values["--policy-bundle"] }), lane: values["--lane"] ?? "subscription", write };
 }
 
 function parsePolicyInstall(argv) {
@@ -316,7 +317,7 @@ function parsePolicyInstall(argv) {
 }
 
 function renderShieldHelp() {
-  return `Commands:\n  ccshield install [--lane subscription|managed] [--write]\n  ccshield uninstall [--lane subscription|managed] [--write]\n  ccshield start [--lane subscription|managed]\n  ccshield stop [--lane subscription|managed]\n  ccshield status [--lane subscription|managed]\n  ccshield doctor [--lane subscription|managed]\n  ccshield policy <status [--lane subscription|managed]|install --bundle /absolute/policy-bundle --public-key /absolute/policy-public-key [--lane subscription|managed] [--write]>\n  ccshield privacy provision --bundle /absolute/privacy-manifest --gitleaks /absolute/gitleaks --gitleaks-rules /absolute/gitleaks-rules.toml [--policy-bundle /absolute/policy-bundle] [--lane subscription|managed] [--write]\n  ccshield launch --lane subscription|managed [--target http://127.0.0.1:port] -- command [args...]\n`;
+  return `Commands:\n  ccshield install [--lane subscription|managed] [--write]\n  ccshield uninstall [--lane subscription|managed] [--write]\n  ccshield start [--lane subscription|managed]\n  ccshield stop [--lane subscription|managed]\n  ccshield status [--lane subscription|managed]\n  ccshield doctor [--lane subscription|managed]\n  ccshield policy <status [--lane subscription|managed]|install --bundle /absolute/policy-bundle --public-key /absolute/policy-public-key [--lane subscription|managed] [--write]>\n  ccshield privacy provision --gitleaks /absolute/gitleaks --gitleaks-rules /absolute/gitleaks-rules.toml [--bundle /absolute/privacy-manifest] [--policy-bundle /absolute/policy-bundle] [--lane subscription|managed] [--write]\n  ccshield launch --lane subscription|managed [--target http://127.0.0.1:port] -- command [args...]\n`;
 }
 
 function renderShieldResult(command, result = {}) {

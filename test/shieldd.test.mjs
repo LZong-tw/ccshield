@@ -651,14 +651,14 @@ test("daemon blocks every privacy worker failure before a real upstream fetch", 
 
 function assetsProvision() {
   return {
-    version: 1,
+    version: 2,
     bundle: { version: "policy-1", sha256: "a".repeat(64), path: "/opt/ccshield/policy.json" },
     gitleaks: {
       sha256: "b".repeat(64),
       path: "/opt/ccshield/gitleaks",
       rules: { path: "/opt/ccshield/rules.toml", sha256: "c".repeat(64), version: "rules-1" },
     },
-    privacy: { version: "privacy-1", sha256: "c".repeat(64), path: "/opt/ccshield/privacy.json", worker: { command: "/opt/ccshield/privacy-worker", args: ["--stdio"], sha256: "d".repeat(64) } },
+    privacy: { state: "verified", version: "privacy-1", sha256: "c".repeat(64), path: "/opt/ccshield/privacy.json", worker: { command: "/opt/ccshield/privacy-worker", args: ["--stdio"], sha256: "d".repeat(64) } },
   };
 }
 

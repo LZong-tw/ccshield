@@ -346,18 +346,21 @@ export async function createPrivacyFilter({ provision, spawnWorker = defaultSpaw
 export async function runPrivacyWorkerSelfTest(provision, { spawnWorker = defaultSpawnWorker, validateWorker = validatePrivacyWorkerAsset, validateCheckpoint = attestShieldCheckpoint, validateFile = validatePrivacyPinnedFile, timeoutMs, startupTimeoutMs } = {}) {
   const filter = await createPrivacyFilter({ provision, spawnWorker, validateWorker, validateCheckpoint, validateFile, timeoutMs, startupTimeoutMs });
   try {
-    const opf = Boolean(provision?.privacy?.checkpoint);
-    const email = opf ? "alice@example.com" : "CCSHIELD_PRIVACY_PROTOCOL_PROBE_EMAIL";
-    const original = Buffer.from(JSON.stringify({ content: email }));
-    const result = await filter.scan(original);
-    if (!isVerifiedRedaction({ original, result }) || !result.findings.some((finding) => finding.label === (opf ? "private_email" : "email")) || result.redactedBody.includes(email)) {
-      throw new Error("shield privacy worker self-test failed");
-    }
+    await probePrivacyFilter(filter, { opf: Boolean(provision?.privacy?.checkpoint) });
     return Object.freeze({ version: filter.version });
-  } catch {
-    throw new Error("shield privacy worker self-test failed");
   } finally {
     filter.close();
+  }
+}
+
+// Proves a running filter redacts a known email before anything relies on it.
+export async function probePrivacyFilter(filter, { opf }) {
+  const email = opf ? "alice@example.com" : "CCSHIELD_PRIVACY_PROTOCOL_PROBE_EMAIL";
+  const original = Buffer.from(JSON.stringify({ content: email }));
+  let result;
+  try { result = await filter.scan(original); } catch { result = null; }
+  if (!result || !isVerifiedRedaction({ original, result }) || !result.findings.some((finding) => finding.label === (opf ? "private_email" : "email")) || result.redactedBody.includes(email)) {
+    throw new Error("shield privacy worker self-test failed");
   }
 }
 

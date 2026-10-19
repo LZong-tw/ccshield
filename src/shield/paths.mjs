@@ -296,7 +296,8 @@ export function shieldAssetStore(paths) {
 // old check accepted is read as verified (OPF there counts as adopted); any
 // other version-1 privacy block is failed with reason legacy-schema.
 export function assertShieldAssetsProvision(state, { storeRoot } = {}) {
-  if (!isPlainObject(state) || !exactKeys(state, ["bundle", "gitleaks", "privacy", "version"])
+  const keys = state?.version === 1 ? ["bundle", "gitleaks", "privacy", "version"] : ["bundle", "gitleaks", "privacy", "regex", "version"];
+  if (!isPlainObject(state) || !exactKeys(state, keys)
     || (state.version !== 1 && state.version !== ASSETS_FORMAT_VERSION)
     || !isPlainObject(state.bundle) || !exactKeys(state.bundle, ["path", "sha256", "version"])
     || !isPlainObject(state.gitleaks) || !exactKeys(state.gitleaks, ["path", "rules", "sha256"])
@@ -315,6 +316,25 @@ export function assertShieldAssetsProvision(state, { storeRoot } = {}) {
       rules: Object.freeze({ path: state.gitleaks.rules.path, sha256: state.gitleaks.rules.sha256, version: state.gitleaks.rules.version }),
     }),
     privacy: state.version === 1 ? legacyPrivacyAssets(state.privacy) : privacyAssets(state.privacy, storeRoot),
+    regex: state.version === 1 ? null : regexAssets(state.regex, storeRoot),
+  });
+}
+
+// The regex detector is copied into the store at install time, so the daemon
+// runs a pinned file rather than whatever the package currently ships.
+function regexAssets(value, storeRoot) {
+  if (!isPlainObject(value) || !exactKeys(value, ["version", "worker"]) || !safeIdentifier(value.version)
+    || !isPlainObject(value.worker) || !exactKeys(value.worker, ["args", "command", "sha256"])
+    || !safePath(value.worker.command) || !Array.isArray(value.worker.args) || value.worker.args.length !== 0
+    || !/^[a-f0-9]{64}$/.test(value.worker.sha256 ?? "")) {
+    throw new Error("shield regex detector reference is invalid");
+  }
+  if (typeof storeRoot === "string" && value.worker.command !== join(storeRoot, "regex", value.version, "privacy-worker.mjs")) {
+    throw new Error("shield regex detector must stay inside the asset store");
+  }
+  return Object.freeze({
+    version: value.version,
+    worker: Object.freeze({ command: value.worker.command, args: Object.freeze([]), sha256: value.worker.sha256 }),
   });
 }
 

@@ -10,6 +10,7 @@ import { classifyShieldRequest } from "./shield/classify.mjs";
 import { createGitleaksScanner } from "./shield/gitleaks.mjs";
 import { readShieldPolicyProvision } from "./shield/policy-bundle.mjs";
 import { loadShieldPolicy } from "./shield/policy.mjs";
+import { openPrivacyDetector } from "./shield/privacy-detector.mjs";
 import { createPrivacyFilter, isVerifiedRedaction } from "./shield/privacy.mjs";
 import { createShieldFailure as shieldFailure, startShieldProxy } from "./shield/proxy.mjs";
 import { createDecisionCache } from "./shield/decision-cache.mjs";
@@ -69,11 +70,19 @@ export async function startShieldDaemon({
     }
   };
   try {
-    privacy = await createPrivacy({ provision: assets });
-    if (privacy?.version !== policy.detectorVersions.privacy) throw new Error("shield privacy version does not match policy metadata");
+    privacy = await openPrivacyDetector({
+      paths,
+      assets,
+      policy,
+      readAssets: readAssetsProvision,
+      createPrivacy,
+      onUpgradeFailure: () => process.stderr.write("ccshieldd: OPF probe failed; staying on the regex detector\n"),
+    });
     recorder = await createDecisionRecorder({ config, paths, policy, assets });
     if (typeof recorder?.recordShieldDecision !== "function") throw new Error("shield audit recorder is unavailable");
-    const decide = async ({ body, signal, launcherContext: requestLauncherContext = null }) => {
+    const decide = async ({ body, signal, launcherContext: requestLauncherContext = null, detectorVersions: keyedVersions }) => {
+      privacy.refresh();
+      const detectorVersions = keyedVersions ?? privacy.detectorVersions();
       const launcherContext = {
         ...(requestLauncherContext ?? config.launcherContext ?? defaultShieldLauncherContext(destinationClass)),
         destinationClass,
@@ -87,7 +96,7 @@ export async function startShieldDaemon({
       } catch { throw shieldFailure("secret_scan", "scanner_unavailable", "shield secret scanner unavailable"); }
       let privacyScan;
       try {
-        privacyScan = confirmedSecret ? { status: "ok", findings: [] } : await privacy.scan(body, { signal });
+        privacyScan = confirmedSecret ? { status: "ok", findings: [] } : await privacy.scan(body, { signal, version: detectorVersions.privacy });
       } catch { throw shieldFailure("privacy_scan", "privacy_unavailable", "shield privacy worker unavailable"); }
       if (privacyScan?.status !== "ok") throw shieldFailure("privacy_scan", privacyScan?.reason, "shield privacy worker unavailable", privacyScan ?? {});
       let piiFindings;
@@ -114,7 +123,7 @@ export async function startShieldDaemon({
         lane: config.lane,
         destinationClass,
         bundleVersion: policy.version,
-        detectorVersions: { ...policy.detectorVersions },
+        detectorVersions: { ...detectorVersions },
         ...(decision.action === "redact" ? { redactedBody: privacyScan.redactedBody, transformCount: privacyScan.redactions.reduce((total, item) => total + item.count, 0) } : {}),
       };
     };
@@ -129,11 +138,14 @@ export async function startShieldDaemon({
       // Policy activation restarts this daemon after identity quiescence. This
       // cache is process-local, so no terminal decision survives that boundary.
       decisionCache: createCache(),
-      decisionContext: { lane: config.lane, destinationClass, policyVersion: policy.version, detectorVersions: policy.detectorVersions },
+      decisionContext: () => {
+        privacy.refresh();
+        return { lane: config.lane, destinationClass, policyVersion: policy.version, detectorVersions: privacy.detectorVersions() };
+      },
       recordShieldDecision: recorder.recordShieldDecision,
       isReady: async () => Boolean(await recorder.isReady?.() ?? true) && Boolean(await privacy.isReady?.()),
-      scanStats: privacy.recentScans ? () => privacy.recentScans() : null,
-      scanTotals: privacy.scanTotals ? () => privacy.scanTotals() : null,
+      scanStats: () => privacy.recentScans(),
+      scanTotals: () => privacy.scanTotals(),
     });
     await writeIdentity({
       paths,

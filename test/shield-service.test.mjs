@@ -78,6 +78,15 @@ test("shield privacy provision is preview-first and keeps asset references out o
   assert.doesNotMatch(output.value(), /private/);
 });
 
+test("privacy provision without an OPF bundle provisions Gitleaks and the regex detector only", async () => {
+  const calls = [];
+  await runShieldCli(["privacy", "provision", "--gitleaks", "/private/gitleaks", "--gitleaks-rules", "/private/rules.toml"], {
+    stdout: capture().stdout,
+    shield: { async privacyProvision(request) { calls.push(request); return { state: "preview" }; } },
+  });
+  assert.deepEqual(calls, [{ gitleaksPath: "/private/gitleaks", gitleaksRulesPath: "/private/rules.toml", lane: "subscription", write: false }]);
+});
+
 test("clean-lane privacy preview accepts its explicit policy bundle without persisted policy state", async () => {
   const calls = [];
   await runShieldCli([

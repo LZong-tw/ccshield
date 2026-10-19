@@ -64,7 +64,9 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
   if (scanTotals !== null && typeof scanTotals !== "function") throw new TypeError("shield scan totals source is invalid");
 
   if ((decisionCache === null) !== (decisionContext === null)) throw new TypeError("shield decision cache and identity must be configured together");
-  if (decisionCache !== null && (typeof decisionCache.getOrCompute !== "function" || !validDecisionContext(decisionContext))) {
+  // A function context is resolved per request, so a detector swap changes the
+  // cache key and the recorded versions at the same request boundary.
+  if (decisionCache !== null && (typeof decisionCache.getOrCompute !== "function" || !validDecisionContext(resolveDecisionContext(decisionContext)))) {
     throw new TypeError("shield decision cache configuration is invalid");
   }
   const approvalRegistration = { channel: null };
@@ -243,7 +245,7 @@ async function handleShieldRequest({ request, response, capability, controlCapab
   if (lifecycle.signal.aborted) return;
   let decision;
   try {
-    const evaluate = async (signal = lifecycle.signal) => await decide({ method: request.method ?? "GET", path, bytes: inspection.bytes, body: inspection.body, signal, launcherContext });
+    const evaluate = async (signal = lifecycle.signal, detectorVersions) => await decide({ method: request.method ?? "GET", path, bytes: inspection.bytes, body: inspection.body, signal, launcherContext, ...(detectorVersions ? { detectorVersions } : {}) });
     decision = decisionCache === null || launcherContext !== null
       ? await evaluate()
       : await cachedDecision({ decisionCache, decisionContext, body: inspection.body, evaluate, signal: lifecycle.signal });
@@ -362,11 +364,13 @@ function validRetryAfter({ stage, reason, retryAfterSeconds }) {
     : undefined;
 }
 
-async function cachedDecision({ decisionCache, decisionContext, body, evaluate, signal }) {
+async function cachedDecision({ decisionCache, decisionContext: contextSource, body, evaluate, signal }) {
+  const decisionContext = resolveDecisionContext(contextSource);
+  if (!validDecisionContext(decisionContext)) throw new Error("shield decision context is invalid");
   const requestDigest = createHash("sha256").update(body).digest("hex");
   const key = { ...decisionContext, requestDigest };
   const result = await decisionCache.getOrCompute(key, async (sharedSignal) => {
-    const decision = await evaluate(sharedSignal);
+    const decision = await evaluate(sharedSignal, decisionContext.detectorVersions);
     const redactedBody = decision?.action === "redact" ? validateRedactedBody(decision.redactedBody) : Buffer.alloc(0);
     if (redactedBody === null) throw new Error("shield decision redaction is invalid");
     const action = decision?.action;
@@ -632,6 +636,10 @@ function resolveDecisionRecorder(recordShieldDecision, onDecision) {
 function validReasonCodes(value) {
   return Array.isArray(value) && value.length > 0 && value.length <= 32
     && value.every((code) => typeof code === "string" && /^[A-Za-z0-9._-]{1,128}$/.test(code));
+}
+
+function resolveDecisionContext(value) {
+  return typeof value === "function" ? value() : value;
 }
 
 function validDecisionContext(value) {

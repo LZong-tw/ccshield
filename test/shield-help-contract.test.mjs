@@ -18,7 +18,7 @@ const SHIELD_COMMANDS = [
   "ccshield status",
   "ccshield doctor",
   "ccshield policy <status [--lane subscription|managed]|install --bundle /absolute/policy-bundle --public-key /absolute/policy-public-key [--lane subscription|managed] [--write]>",
-  "ccshield privacy provision --bundle /absolute/privacy-manifest --gitleaks /absolute/gitleaks --gitleaks-rules /absolute/gitleaks-rules.toml [--policy-bundle /absolute/policy-bundle] [--lane subscription|managed] [--write]",
+  "ccshield privacy provision --gitleaks /absolute/gitleaks --gitleaks-rules /absolute/gitleaks-rules.toml [--bundle /absolute/privacy-manifest] [--policy-bundle /absolute/policy-bundle] [--lane subscription|managed] [--write]",
   "ccshield launch --lane subscription|managed [--target http://127.0.0.1:port] -- command [args...]",
 ];
 

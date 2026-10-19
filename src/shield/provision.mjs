@@ -4,7 +4,8 @@ import { basename, dirname, isAbsolute, resolve } from "node:path";
 
 import { runPrivacyWorkerSelfTest } from "./privacy.mjs";
 import { verifyShieldCheckpoint } from "./checkpoint.mjs";
-import { ASSETS_FORMAT_VERSION, writeShieldAssetsProvision } from "./paths.mjs";
+import { ASSETS_FORMAT_VERSION, shieldAssetStore, writeShieldAssetsProvision } from "./paths.mjs";
+import { installRegexWorker, prepareRegexWorker } from "./regex-detector.mjs";
 import { isValidOpfWorkerArgs } from "./opf-args.mjs";
 import { PRIVACY_PROTOCOL } from "./protocol.mjs";
 
@@ -12,17 +13,18 @@ const MANIFEST_FORMAT_VERSION = 1;
 const O200K_CACHE_KEY = "fb374d419588a4632f3f557e76b4b70aebbca790";
 const defaultIo = { lstat, readFile, realpath };
 
-export async function provisionShieldAssets({ bundlePath, gitleaksPath, gitleaksRulesPath, privacyBundlePath, write = false, paths, io = defaultIo, writeState, runPrivacySelfTest: selfTest = runPrivacyWorkerSelfTest } = {}) {
+export async function provisionShieldAssets({
+  bundlePath, gitleaksPath, gitleaksRulesPath, privacyBundlePath, write = false, paths, io = defaultIo, writeState,
+  runPrivacySelfTest: selfTest = runPrivacyWorkerSelfTest,
+  storeRoot = paths ? shieldAssetStore(paths).root : undefined, regexWorkerSource, nodePath, installRegex = installRegexWorker,
+} = {}) {
   const bundle = await validateAsset({ path: bundlePath, executable: false, label: "policy bundle", io });
   const gitleaks = await validateAsset({ path: gitleaksPath, executable: true, label: "gitleaks", io });
   const gitleaksRules = await validateAsset({ path: gitleaksRulesPath, executable: false, label: "gitleaks rules", io });
-  const privacyBundle = await validateAsset({ path: privacyBundlePath, executable: false, label: "privacy bundle", io });
-  const manifest = parsePrivacyManifest(privacyBundle.bytes);
-  const worker = await validateAsset({ path: manifest.worker.command, executable: true, label: "privacy worker", expectedDigest: manifest.worker.sha256, io });
-  const checkpoint = manifest.checkpoint ? await verifyShieldCheckpoint(manifest.checkpoint) : null;
-  const source = manifest.source ? await verifyShieldCheckpoint(manifest.source, { label: "source" }) : null;
-  const adapter = manifest.adapter ? await validateAsset({ path: manifest.adapter.path, executable: false, label: "privacy adapter", expectedDigest: manifest.adapter.sha256, io }) : null;
-  const tokenizer = manifest.tokenizer ? await validateAsset({ path: manifest.tokenizer.path, executable: false, label: "privacy tokenizer", expectedDigest: manifest.tokenizer.sha256, io }) : null;
+  // Without an OPF bundle the store records privacy as absent and the daemon
+  // runs on the regex worker until the pinned download verifies one.
+  const privacy = privacyBundlePath == null ? null : await provisionPrivacy(privacyBundlePath, io);
+  const regex = await prepareRegexWorker({ storeRoot, sourcePath: regexWorkerSource, nodePath });
   const state = Object.freeze({
     version: ASSETS_FORMAT_VERSION,
     bundle: Object.freeze({ version: policyVersion(bundle.bytes), sha256: bundle.sha256, path: bundle.path }),
@@ -33,31 +35,48 @@ export async function provisionShieldAssets({ bundlePath, gitleaksPath, gitleaks
       // hand-typed one could only ever go stale against the file it names.
       rules: Object.freeze({ path: gitleaksRules.path, sha256: gitleaksRules.sha256, version: `rules-${gitleaksRules.sha256.slice(0, 12)}` }),
     }),
-    // A bundle handed to provision lives outside the asset store, so its OPF
-    // files are adopted; only the pinned downloader records "downloaded".
-    privacy: Object.freeze({
-      state: "verified",
-      ...(checkpoint ? { origin: "adopted" } : {}),
-      version: manifest.version,
-      sha256: privacyBundle.sha256,
-      path: privacyBundle.path,
-      worker: Object.freeze({ command: worker.path, args: Object.freeze([...manifest.worker.args]), sha256: worker.sha256 }),
-      ...(checkpoint ? {
-        checkpoint,
-        source,
-        adapter: Object.freeze({ path: adapter.path, sha256: adapter.sha256 }),
-        tokenizer: Object.freeze({ path: tokenizer.path, sha256: tokenizer.sha256, version: manifest.tokenizer.version }),
-      } : {}),
-    }),
+    privacy: privacy ?? Object.freeze({ state: "absent" }),
+    regex: Object.freeze({ version: regex.version, worker: regex.worker }),
   });
-  const result = await selfTest(state);
-  if (!result || result.version !== state.privacy.version) throw new Error("shield privacy worker self-test failed");
+  if (privacy) {
+    const result = await selfTest(state);
+    if (!result || result.version !== state.privacy.version) throw new Error("shield privacy worker self-test failed");
+  }
   if (write) {
     const writer = writeState ?? (paths ? (value) => writeShieldAssetsProvision({ paths, state: value }) : null);
     if (typeof writer !== "function") throw new Error("shield asset provision writer is required");
+    // The file lands before the record that names it, so a reader never sees
+    // a regex reference without its worker.
+    await installRegex(regex);
     await writer(state);
   }
   return state;
+}
+
+async function provisionPrivacy(privacyBundlePath, io) {
+  const privacyBundle = await validateAsset({ path: privacyBundlePath, executable: false, label: "privacy bundle", io });
+  const manifest = parsePrivacyManifest(privacyBundle.bytes);
+  const worker = await validateAsset({ path: manifest.worker.command, executable: true, label: "privacy worker", expectedDigest: manifest.worker.sha256, io });
+  const checkpoint = manifest.checkpoint ? await verifyShieldCheckpoint(manifest.checkpoint) : null;
+  const source = manifest.source ? await verifyShieldCheckpoint(manifest.source, { label: "source" }) : null;
+  const adapter = manifest.adapter ? await validateAsset({ path: manifest.adapter.path, executable: false, label: "privacy adapter", expectedDigest: manifest.adapter.sha256, io }) : null;
+  const tokenizer = manifest.tokenizer ? await validateAsset({ path: manifest.tokenizer.path, executable: false, label: "privacy tokenizer", expectedDigest: manifest.tokenizer.sha256, io }) : null;
+  // A bundle handed to provision lives outside the asset store, so its OPF
+  // files are adopted; only the pinned downloader records "downloaded".
+  return Object.freeze({
+    state: "verified",
+    ...(checkpoint ? { origin: "adopted" } : {}),
+    version: manifest.version,
+    sha256: privacyBundle.sha256,
+    path: privacyBundle.path,
+    worker: Object.freeze({ command: worker.path, args: Object.freeze([...manifest.worker.args]), sha256: worker.sha256 }),
+    ...(checkpoint ? {
+      checkpoint,
+      source,
+      adapter: Object.freeze({ path: adapter.path, sha256: adapter.sha256 }),
+      tokenizer: Object.freeze({ path: tokenizer.path, sha256: tokenizer.sha256, version: manifest.tokenizer.version }),
+    } : {}),
+  });
 }
 
 async function validateAsset({ path, executable, label, expectedDigest, io }) {

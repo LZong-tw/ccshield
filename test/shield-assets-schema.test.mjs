@@ -16,7 +16,24 @@ const workerCommand = "/opt/ccshield/detectors/opf/privacy-worker.mjs";
 const base = {
   bundle: { version: "policy-1", sha256: digest("1"), path: "/opt/ccshield/policy.json" },
   gitleaks: { sha256: digest("2"), path: "/opt/ccshield/gitleaks", rules: { path: "/opt/ccshield/rules.toml", sha256: digest("3"), version: "rules-1" } },
+  regex: { version: "regex-v1", worker: { command: "/opt/ccshield/regex/regex-v1/privacy-worker.mjs", args: [], sha256: digest("a") } },
 };
+
+const { regex: _regex, ...legacyBase } = base;
+const storeRegex = (storeRoot) => ({ ...base.regex, worker: { ...base.regex.worker, command: join(storeRoot, "regex", "regex-v1", "privacy-worker.mjs") } });
+
+test("format 2 requires the installed regex detector and keeps it inside the store", () => {
+  const { regex, ...withoutRegex } = base;
+  assert.throws(() => assertShieldAssetsProvision({ version: 2, ...withoutRegex, privacy: { state: "absent" } }), /invalid/);
+  assert.deepEqual(assertShieldAssetsProvision({ version: 2, ...base, privacy: { state: "absent" } }).regex, regex);
+  for (const worker of [{ ...regex.worker, args: ["--stdio"] }, { ...regex.worker, sha256: "x" }, { ...regex.worker, command: "relative.mjs" }]) {
+    assert.throws(() => assertShieldAssetsProvision({ version: 2, ...base, regex: { ...regex, worker }, privacy: { state: "absent" } }), /regex detector reference is invalid/);
+  }
+  const storeRoot = "/home/user/.local/share/ccshield/assets";
+  assert.throws(() => assertShieldAssetsProvision({ version: 2, ...base, privacy: { state: "absent" } }, { storeRoot }), /inside the asset store/);
+  const inside = { ...regex, worker: { ...regex.worker, command: join(storeRoot, "regex", "regex-v1", "privacy-worker.mjs") } };
+  assert.equal(assertShieldAssetsProvision({ version: 2, ...base, regex: inside, privacy: { state: "absent" } }, { storeRoot }).regex.worker.command, inside.worker.command);
+});
 
 function opfPrivacy(bundle, origin = "downloaded") {
   const checkpoint = { path: bundle.checkpoint, sha256: digest("4"), version: "opf-1" };
@@ -62,27 +79,28 @@ test("verified requires the OPF references and keeps downloaded files inside the
   const store = shieldAssetStore(paths);
   const bundle = store.opfBundle(codeCommit, hfRevision);
   const privacy = opfPrivacy(bundle);
-  const accepted = assertShieldAssetsProvision({ version: 2, ...base, privacy }, { storeRoot: store.root });
+  const stored = { ...base, regex: storeRegex(store.root) };
+  const accepted = assertShieldAssetsProvision({ version: 2, ...stored, privacy }, { storeRoot: store.root });
   assert.equal(accepted.privacy.state, "verified");
   assert.equal(accepted.privacy.origin, "downloaded");
   assert.deepEqual(accepted.privacy.checkpoint, privacy.checkpoint);
 
   const { checkpoint: _checkpoint, ...withoutCheckpoint } = privacy;
-  assert.throws(() => assertShieldAssetsProvision({ version: 2, ...base, privacy: withoutCheckpoint }, { storeRoot: store.root }), /invalid/);
+  assert.throws(() => assertShieldAssetsProvision({ version: 2, ...stored, privacy: withoutCheckpoint }, { storeRoot: store.root }), /invalid/);
   const { worker: _worker, ...withoutWorker } = privacy;
-  assert.throws(() => assertShieldAssetsProvision({ version: 2, ...base, privacy: withoutWorker }, { storeRoot: store.root }), /invalid/);
-  assert.throws(() => assertShieldAssetsProvision({ version: 2, ...base, privacy: { ...privacy, origin: undefined } }, { storeRoot: store.root }), /origin/);
-  assert.throws(() => assertShieldAssetsProvision({ version: 2, ...base, privacy }), /asset store/);
+  assert.throws(() => assertShieldAssetsProvision({ version: 2, ...stored, privacy: withoutWorker }, { storeRoot: store.root }), /invalid/);
+  assert.throws(() => assertShieldAssetsProvision({ version: 2, ...stored, privacy: { ...privacy, origin: undefined } }, { storeRoot: store.root }), /origin/);
+  assert.throws(() => assertShieldAssetsProvision({ version: 2, ...stored, privacy }), /asset store/);
 
   const outside = opfPrivacy({ src: "/srv/opf/src", checkpoint: "/srv/opf/checkpoint", venv: "/srv/opf/venv", tokenizer: "/srv/opf/tokenizer" });
-  assert.throws(() => assertShieldAssetsProvision({ version: 2, ...base, privacy: outside }, { storeRoot: store.root }), /inside the asset store/);
-  const adopted = assertShieldAssetsProvision({ version: 2, ...base, privacy: { ...outside, origin: "adopted" } }, { storeRoot: store.root });
+  assert.throws(() => assertShieldAssetsProvision({ version: 2, ...stored, privacy: outside }, { storeRoot: store.root }), /inside the asset store/);
+  const adopted = assertShieldAssetsProvision({ version: 2, ...stored, privacy: { ...outside, origin: "adopted" } }, { storeRoot: store.root });
   assert.equal(adopted.privacy.origin, "adopted");
 });
 
 test("legacy version-1 files migrate: the old strict shape is verified, anything else is failed", async () => {
   const legacyPrivacy = { version: "privacy-1", sha256: digest("8"), path: "/opt/ccshield/privacy-filter.json", worker: { command: "/opt/ccshield/privacy-worker", args: ["--stdio"], sha256: digest("9") } };
-  const migrated = assertShieldAssetsProvision({ version: 1, ...base, privacy: legacyPrivacy });
+  const migrated = assertShieldAssetsProvision({ version: 1, ...legacyBase, privacy: legacyPrivacy });
   assert.equal(migrated.version, 2);
   assert.equal(migrated.privacy.state, "verified");
   assert.equal(migrated.privacy.origin, undefined);
@@ -90,17 +108,17 @@ test("legacy version-1 files migrate: the old strict shape is verified, anything
   const legacyOpf = { ...opfPrivacy({ src: "/srv/opf/src", checkpoint: "/srv/opf/checkpoint", venv: "/srv/opf/venv", tokenizer: "/srv/opf/tokenizer" }) };
   delete legacyOpf.state;
   delete legacyOpf.origin;
-  assert.equal(assertShieldAssetsProvision({ version: 1, ...base, privacy: legacyOpf }).privacy.origin, "adopted");
+  assert.equal(assertShieldAssetsProvision({ version: 1, ...legacyBase, privacy: legacyOpf }).privacy.origin, "adopted");
 
   for (const privacy of [{ ...legacyPrivacy, state: "verified" }, { version: "privacy-1" }, null]) {
-    assert.deepEqual(assertShieldAssetsProvision({ version: 1, ...base, privacy }).privacy, { state: "failed", reason: "legacy-schema" });
+    assert.deepEqual(assertShieldAssetsProvision({ version: 1, ...legacyBase, privacy }).privacy, { state: "failed", reason: "legacy-schema" });
   }
 
   const homeDir = await mkdtemp(join(tmpdir(), "ccshield-assets-schema-"));
   try {
     const paths = shieldPaths({ homeDir, uid: process.getuid?.() });
     await mkdir(paths.rootDir, { recursive: true, mode: 0o700 });
-    await writeFile(paths.assetsProvisionPath, JSON.stringify({ version: 1, ...base, privacy: legacyPrivacy }), { mode: 0o600 });
+    await writeFile(paths.assetsProvisionPath, JSON.stringify({ version: 1, ...legacyBase, privacy: legacyPrivacy }), { mode: 0o600 });
     assert.equal((await readShieldAssetsProvision({ paths })).privacy.state, "verified");
   } finally {
     await rm(homeDir, { recursive: true, force: true });
