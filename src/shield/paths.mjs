@@ -288,6 +288,11 @@ export function shieldAssetStore(paths) {
       return Object.freeze(Object.fromEntries([["dir", dir], ...["src", "checkpoint", "venv", "tokenizer"]
         .map((name) => [name, childPath(join(dir, name), dir, name)])]));
     },
+    gitleaks(version) {
+      if (!/^\d+\.\d+\.\d+$/.test(version ?? "")) throw new Error("shield Gitleaks version must be a plain semver");
+      const dir = childPath(join(root, "gitleaks", version), root, "gitleaksDir");
+      return Object.freeze({ dir, binary: join(dir, "gitleaks") });
+    },
   });
 }
 
