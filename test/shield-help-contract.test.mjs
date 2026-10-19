@@ -11,7 +11,7 @@ import { runShieldCli } from "../src/shield/cli.mjs";
 const CLI_PATH = fileURLToPath(new URL("../src/cli.mjs", import.meta.url));
 
 const SHIELD_COMMANDS = [
-  "ccshield install [--lane subscription|managed] [--write]",
+  "ccshield install [--lane subscription|managed] [--gitleaks-path /absolute/gitleaks] [--write]",
   "ccshield uninstall [--lane subscription|managed] [--write]",
   "ccshield start",
   "ccshield stop",

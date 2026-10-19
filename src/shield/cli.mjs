@@ -1,7 +1,8 @@
-import { dirname, resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { GITLEAKS_COMMAND_PROFILE } from "./gitleaks.mjs";
+import { doctorDetectorAssets, fetchDetectorAssets } from "./detectors.mjs";
 import { readShieldAssetsProvision, readShieldIdentity, readShieldPolicyState, shieldPaths } from "./paths.mjs";
 import { provisionShieldAssets } from "./provision.mjs";
 import { installShieldPolicyProvision, readShieldPolicyProvision } from "./policy-bundle.mjs";
@@ -65,6 +66,8 @@ async function createDefaultShieldDependencies(dependencies) {
   const nodePath = dependencies.nodePath ?? process.execPath;
   const daemonPath = dependencies.daemonPath ?? resolve(repoRoot, "src", "shieldd.mjs");
   const readAssets = dependencies.readShieldAssetsProvision ?? readShieldAssetsProvision;
+  const fetchDetectors = dependencies.fetchDetectorAssets ?? fetchDetectorAssets;
+  const doctorDetectors = dependencies.doctorDetectorAssets ?? doctorDetectorAssets;
   const readPolicyProvision = dependencies.readShieldPolicyProvision ?? readShieldPolicyProvision;
   const installService = dependencies.installShieldService ?? installShieldService;
   const provisionAssets = dependencies.provisionShieldAssets ?? provisionShieldAssets;
@@ -84,8 +87,9 @@ async function createDefaultShieldDependencies(dependencies) {
   });
   const common = { paths, nodePath, daemonPath, env, ...(dependencies.io ? { io: dependencies.io } : {}), ...(dependencies.runLaunchctl ? { runLaunchctl: dependencies.runLaunchctl } : {}) };
   return {
-    async install({ write, lane }) {
+    async install({ write, lane, gitleaksPath }) {
       const lanePaths = shieldPaths({ env, lane });
+      const detectors = await fetchDetectors({ paths: lanePaths, gitleaksPath, write });
       const assets = await readAssets({ paths: lanePaths, io: dependencies.io });
       if (!assets) throw new Error("shield assets are missing; run ccshield privacy provision with Gitleaks before install");
       const { loadShieldPolicy } = dependencies.loadShieldPolicy ? { loadShieldPolicy: dependencies.loadShieldPolicy } : await import("./policy.mjs");
@@ -105,7 +109,7 @@ async function createDefaultShieldDependencies(dependencies) {
         },
       };
       const service = await installService({ ...common, paths: lanePaths, config, write });
-      return { state: write ? "degraded" : "preview", exitCode: write ? 1 : 0, write, lane, service: { label: service.label, planned: true } };
+      return { state: write ? "degraded" : "preview", exitCode: write ? 1 : 0, write, lane, detectors, service: { label: service.label, planned: true } };
     },
     async uninstall({ write, lane }) {
       const service = await uninstallShieldService({ ...common, paths: shieldPaths({ env, lane }), write });
@@ -128,11 +132,13 @@ async function createDefaultShieldDependencies(dependencies) {
       const operational = await readOperational({ env, audit: await readAuditHealth({ paths: lanePaths }) });
       const selected = operational.lanes?.find((entry) => entry.lane === lane);
       const key = await inspectKey();
+      const detectors = await doctorDetectors({ paths: lanePaths, assets: await readAssets({ paths: lanePaths, io: dependencies.io }) });
       return {
         ...status,
         state: status.state === "healthy" && selected?.state !== "protected" ? "degraded" : status.state,
         operational,
         masterKey: { source: key.source, ...(key.warning ? { warning: key.warning } : {}) },
+        detectors,
         checked: true,
       };
     },
@@ -260,16 +266,21 @@ function parseLaunch(argv) {
 function isLoopbackTarget(value) { try { const url = new URL(value); return url.protocol === "http:" && url.hostname === "127.0.0.1" && Number.isInteger(Number(url.port)) && Number(url.port) > 0 && url.pathname === "/" && !url.search && !url.hash; } catch { return false; } }
 
 function parseInstall(argv, command = "ccshield install") {
+  const acceptsGitleaksPath = command === "ccshield install";
   let write = false;
   let lane = null;
+  let gitleaksPath = null;
   for (let index = 0; index < argv.length; index += 1) {
     if (argv[index] === "--write" && !write) { write = true; continue; }
     if (argv[index] === "--lane" && lane === null && (argv[index + 1] === "subscription" || argv[index + 1] === "managed")) {
       lane = argv[index + 1]; index += 1; continue;
     }
-    throw new Error(`usage: ${command} [--lane subscription|managed] [--write]`);
+    if (acceptsGitleaksPath && argv[index] === "--gitleaks-path" && gitleaksPath === null && isAbsolute(argv[index + 1] ?? "")) {
+      gitleaksPath = argv[index + 1]; index += 1; continue;
+    }
+    throw new Error(`usage: ${command} [--lane subscription|managed]${acceptsGitleaksPath ? " [--gitleaks-path /absolute/gitleaks]" : ""} [--write]`);
   }
-  return { write, lane: lane ?? "subscription" };
+  return { write, lane: lane ?? "subscription", ...(gitleaksPath ? { gitleaksPath } : {}) };
 }
 
 function parseLaneCommand(argv, command) {
@@ -317,7 +328,7 @@ function parsePolicyInstall(argv) {
 }
 
 function renderShieldHelp() {
-  return `Commands:\n  ccshield install [--lane subscription|managed] [--write]\n  ccshield uninstall [--lane subscription|managed] [--write]\n  ccshield start [--lane subscription|managed]\n  ccshield stop [--lane subscription|managed]\n  ccshield status [--lane subscription|managed]\n  ccshield doctor [--lane subscription|managed]\n  ccshield policy <status [--lane subscription|managed]|install --bundle /absolute/policy-bundle --public-key /absolute/policy-public-key [--lane subscription|managed] [--write]>\n  ccshield privacy provision --gitleaks /absolute/gitleaks --gitleaks-rules /absolute/gitleaks-rules.toml [--bundle /absolute/privacy-manifest] [--policy-bundle /absolute/policy-bundle] [--lane subscription|managed] [--write]\n  ccshield launch --lane subscription|managed [--target http://127.0.0.1:port] -- command [args...]\n`;
+  return `Commands:\n  ccshield install [--lane subscription|managed] [--gitleaks-path /absolute/gitleaks] [--write]\n  ccshield uninstall [--lane subscription|managed] [--write]\n  ccshield start [--lane subscription|managed]\n  ccshield stop [--lane subscription|managed]\n  ccshield status [--lane subscription|managed]\n  ccshield doctor [--lane subscription|managed]\n  ccshield policy <status [--lane subscription|managed]|install --bundle /absolute/policy-bundle --public-key /absolute/policy-public-key [--lane subscription|managed] [--write]>\n  ccshield privacy provision --gitleaks /absolute/gitleaks --gitleaks-rules /absolute/gitleaks-rules.toml [--bundle /absolute/privacy-manifest] [--policy-bundle /absolute/policy-bundle] [--lane subscription|managed] [--write]\n  ccshield launch --lane subscription|managed [--target http://127.0.0.1:port] -- command [args...]\n`;
 }
 
 function renderShieldResult(command, result = {}) {
