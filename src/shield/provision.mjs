@@ -4,7 +4,7 @@ import { basename, dirname, isAbsolute, resolve } from "node:path";
 
 import { runPrivacyWorkerSelfTest } from "./privacy.mjs";
 import { verifyShieldCheckpoint } from "./checkpoint.mjs";
-import { ASSETS_FORMAT_VERSION, shieldAssetStore, writeShieldAssetsProvision } from "./paths.mjs";
+import { ASSETS_FORMAT_VERSION, readShieldAssetsProvision, shieldAssetStore, writeShieldAssetsProvision } from "./paths.mjs";
 import { installRegexWorker, prepareRegexWorker } from "./regex-detector.mjs";
 import { isValidOpfWorkerArgs } from "./opf-args.mjs";
 import { PRIVACY_PROTOCOL } from "./protocol.mjs";
@@ -43,7 +43,7 @@ export async function provisionShieldAssets({
     if (!result || result.version !== state.privacy.version) throw new Error("shield privacy worker self-test failed");
   }
   if (write) {
-    const writer = writeState ?? (paths ? (value) => writeShieldAssetsProvision({ paths, state: value }) : null);
+    const writer = writeState ?? (paths ? async (value) => writeShieldAssetsProvision({ paths, state: keepInstallRecord(value, await readShieldAssetsProvision({ paths }).catch(() => null)) }) : null);
     if (typeof writer !== "function") throw new Error("shield asset provision writer is required");
     // The file lands before the record that names it, so a reader never sees
     // a regex reference without its worker.
@@ -51,6 +51,18 @@ export async function provisionShieldAssets({
     await writer(state);
   }
   return state;
+}
+
+// `ccshield install --write` owns the opf block and the Gitleaks origin; a
+// re-provision keeps them, the origin only while it still names the same binary.
+export function keepInstallRecord(state, current) {
+  if (!current) return state;
+  const sameGitleaks = current.gitleaks.origin && current.gitleaks.path === state.gitleaks.path && current.gitleaks.sha256 === state.gitleaks.sha256;
+  return {
+    ...state,
+    ...(sameGitleaks ? { gitleaks: { origin: current.gitleaks.origin, version: current.gitleaks.version, ...state.gitleaks } } : {}),
+    ...(current.opf ? { opf: current.opf } : {}),
+  };
 }
 
 async function provisionPrivacy(privacyBundlePath, io) {

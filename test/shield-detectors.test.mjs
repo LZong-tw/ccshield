@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import { runShieldCli } from "../src/shield/cli.mjs";
 import { doctorDetectorAssets, fetchDetectorAssets } from "../src/shield/detectors.mjs";
-import { shieldPaths } from "../src/shield/paths.mjs";
+import { readShieldAssetsProvision, shieldAssetStore, shieldPaths, writeShieldAssetsProvision } from "../src/shield/paths.mjs";
 
 const pins = {
   code: { commit: "f".repeat(40) },
@@ -140,3 +140,78 @@ test("ccshield doctor surfaces detector warnings", async () => {
   });
   assert.match(out.text(), /detectors\.warnings\.0: shield Gitleaks binary differs from the pinned build/);
 });
+
+function memoryAssets(initial) {
+  const box = { record: initial, writes: [] };
+  return {
+    box,
+    io: {
+      readAssets: async () => box.record,
+      writeAssets: async ({ state }) => { box.writes.push(state); box.record = state; },
+    },
+  };
+}
+
+const provisioned = Object.freeze({
+  version: 3,
+  bundle: { version: "policy-1", sha256: "1".repeat(64), path: "/opt/policy.json" },
+  gitleaks: { sha256: "2".repeat(64), path: "/opt/gitleaks", rules: { path: "/opt/rules.toml", sha256: "3".repeat(64), version: "rules-1" } },
+  privacy: { state: "verified", version: "privacy-1" },
+  regex: { version: "regex-v1" },
+});
+
+test("install --write records the downloaded Gitleaks and the verified OPF bundle without touching privacy", () => withHome(async (paths) => {
+  const { box, io } = memoryAssets(provisioned);
+  const result = await fetchDetectorAssets({ paths, write: true, io: { ...fakes([]), ...io } });
+  assert.equal(result.recorded, "written");
+  const [written] = box.writes;
+  assert.deepEqual(written.gitleaks, { origin: "downloaded", version: "8.30.1", path: "/store/gitleaks", sha256: "a".repeat(64), rules: provisioned.gitleaks.rules });
+  assert.deepEqual(written.opf, { state: "verified", platform: "darwin-arm64", bundle: shieldAssetStore(paths).opfBundle(pins.code.commit, pins.checkpoint.revision).dir });
+  for (const key of ["version", "bundle", "privacy", "regex"]) assert.equal(written[key], provisioned[key]);
+}));
+
+test("install --write records an override and a failed or unsupported OPF with its reason", () => withHome(async (paths) => {
+  const failed = memoryAssets(provisioned);
+  await fetchDetectorAssets({ paths, write: true, gitleaksPath: "/usr/local/bin/gitleaks", io: { ...fakes([], { buildOpfVenv: async () => ({ state: "failed", reason: "Python 3.10 or newer was not found" }) }), ...failed.io } });
+  assert.deepEqual(failed.box.record.gitleaks, { origin: "override", version: "8.29.0", path: "/usr/local/bin/gitleaks", sha256: "b".repeat(64), rules: provisioned.gitleaks.rules });
+  assert.deepEqual(failed.box.record.opf, { state: "failed", platform: "darwin-arm64", reason: "Python 3.10 or newer was not found" });
+
+  const none = memoryAssets(provisioned);
+  await fetchDetectorAssets({ paths, write: true, io: { ...fakes([], { detectPlatform: async () => unsupported }), ...none.io } });
+  assert.deepEqual(none.box.record.opf, { state: "unsupported", platform: "none", reason: "macOS 13 is not supported" });
+}));
+
+test("install --write leaves a missing or version-1 record alone and says why", () => withHome(async (paths) => {
+  const missing = memoryAssets(null);
+  assert.match((await fetchDetectorAssets({ paths, write: true, io: { ...fakes([]), ...missing.io } })).recorded, /no asset record/);
+  const legacy = memoryAssets({ ...provisioned, regex: null });
+  assert.match((await fetchDetectorAssets({ paths, write: true, io: { ...fakes([]), ...legacy.io } })).recorded, /legacy/);
+  assert.deepEqual([...missing.box.writes, ...legacy.box.writes], []);
+}));
+
+test("install --write round-trips through the real asset record", () => withHome(async (paths) => {
+  const store = shieldAssetStore(paths);
+  await mkdir(paths.rootDir, { recursive: true, mode: 0o700 });
+  const regex = { version: "regex-v1", worker: { command: join(store.root, "regex", "regex-v1", "privacy-worker.mjs"), args: [], sha256: "4".repeat(64) } };
+  await writeShieldAssetsProvision({ paths, state: { ...provisioned, regex, privacy: { state: "absent" } } });
+  await fetchDetectorAssets({ paths, write: true, io: fakes([], { exists: async () => true }) });
+  const record = await readShieldAssetsProvision({ paths });
+  assert.equal(record.gitleaks.origin, "downloaded");
+  assert.equal(record.opf.state, "verified");
+  assert.equal(record.privacy.state, "absent");
+  assert.deepEqual(record.regex, regex);
+}));
+
+test("doctor compares OPF against the recorded install", () => withHome(async (paths) => {
+  const pinnedDir = shieldAssetStore(paths).opfBundle(pins.code.commit, pins.checkpoint.revision).dir;
+  const doctor = async (opf, overrides = {}) => (await doctorDetectorAssets({
+    paths,
+    assets: { ...(opf ? { opf } : {}) },
+    io: fakes([], { exists: async () => true, ...overrides }),
+  })).warnings;
+  assert.deepEqual(await doctor({ state: "verified", platform: "darwin-arm64", bundle: pinnedDir }), []);
+  assert.match((await doctor(undefined))[0], /not installed/);
+  assert.match((await doctor({ state: "failed", platform: "darwin-arm64", reason: "boom" }))[0], /install failed: boom/);
+  assert.match((await doctor({ state: "verified", platform: "darwin-arm64", bundle: "/old/bundle" }))[0], /differs from the pinned revision/);
+  assert.match((await doctor({ state: "verified", platform: "darwin-arm64", bundle: pinnedDir }, { exists: async () => false }))[0], /venv .* is missing/);
+}));

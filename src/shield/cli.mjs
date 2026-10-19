@@ -89,9 +89,11 @@ async function createDefaultShieldDependencies(dependencies) {
   return {
     async install({ write, lane, gitleaksPath }) {
       const lanePaths = shieldPaths({ env, lane });
+      const provisioned = await readAssets({ paths: lanePaths, io: dependencies.io });
+      if (!provisioned) throw new Error("shield assets are missing; run ccshield privacy provision with Gitleaks before install");
       const detectors = await fetchDetectors({ paths: lanePaths, gitleaksPath, write });
-      const assets = await readAssets({ paths: lanePaths, io: dependencies.io });
-      if (!assets) throw new Error("shield assets are missing; run ccshield privacy provision with Gitleaks before install");
+      // A write records the installed Gitleaks, which the service then runs.
+      const assets = write ? await readAssets({ paths: lanePaths, io: dependencies.io }) : provisioned;
       const { loadShieldPolicy } = dependencies.loadShieldPolicy ? { loadShieldPolicy: dependencies.loadShieldPolicy } : await import("./policy.mjs");
       const provision = await readPolicyProvision({ paths: lanePaths, io: dependencies.io });
       await loadShieldPolicy(provision);

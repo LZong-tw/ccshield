@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { buildOpfWorkerArgs } from "../src/shield/opf-args.mjs";
-import { assertShieldAssetsProvision, readShieldAssetsProvision, shieldAssetStore, shieldPaths } from "../src/shield/paths.mjs";
+import { ASSETS_FORMAT_VERSION, assertShieldAssetsProvision, readShieldAssetsProvision, shieldAssetStore, shieldPaths, writeShieldAssetsProvision } from "../src/shield/paths.mjs";
 
 const digest = (char) => char.repeat(64);
 const codeCommit = "a".repeat(40);
@@ -101,7 +101,7 @@ test("verified requires the OPF references and keeps downloaded files inside the
 test("legacy version-1 files migrate: the old strict shape is verified, anything else is failed", async () => {
   const legacyPrivacy = { version: "privacy-1", sha256: digest("8"), path: "/opt/ccshield/privacy-filter.json", worker: { command: "/opt/ccshield/privacy-worker", args: ["--stdio"], sha256: digest("9") } };
   const migrated = assertShieldAssetsProvision({ version: 1, ...legacyBase, privacy: legacyPrivacy });
-  assert.equal(migrated.version, 2);
+  assert.equal(migrated.version, ASSETS_FORMAT_VERSION);
   assert.equal(migrated.privacy.state, "verified");
   assert.equal(migrated.privacy.origin, undefined);
 
@@ -120,6 +120,48 @@ test("legacy version-1 files migrate: the old strict shape is verified, anything
     await mkdir(paths.rootDir, { recursive: true, mode: 0o700 });
     await writeFile(paths.assetsProvisionPath, JSON.stringify({ version: 1, ...legacyBase, privacy: legacyPrivacy }), { mode: 0o600 });
     assert.equal((await readShieldAssetsProvision({ paths })).privacy.state, "verified");
+  } finally {
+    await rm(homeDir, { recursive: true, force: true });
+  }
+});
+
+const v3Gitleaks = { origin: "downloaded", version: "8.30.1", ...base.gitleaks };
+
+test("format 3 records the installed Gitleaks origin and the OPF install state", () => {
+  const storeRoot = "/opt/ccshield/assets";
+  const stored = { ...base, regex: storeRegex(storeRoot), privacy: { state: "absent" } };
+  const bundle = join(storeRoot, "opf", "opfBundle");
+  const record = assertShieldAssetsProvision({ version: 3, ...stored, gitleaks: v3Gitleaks, opf: { state: "verified", platform: "darwin-arm64", bundle } }, { storeRoot });
+  assert.deepEqual(record.gitleaks, v3Gitleaks);
+  assert.deepEqual(record.opf, { state: "verified", platform: "darwin-arm64", bundle });
+  assert.deepEqual(assertShieldAssetsProvision({ version: 3, ...stored, opf: { state: "unsupported", platform: "none", reason: "macOS 13 is not supported" } }).opf.state, "unsupported");
+
+  assert.throws(() => assertShieldAssetsProvision({ version: 3, ...stored, opf: { state: "verified", platform: "darwin-arm64", bundle: "/elsewhere/opf" } }, { storeRoot }), /inside the asset store/);
+  assert.throws(() => assertShieldAssetsProvision({ version: 3, ...stored, opf: { state: "failed", platform: "darwin-arm64" } }), /OPF install record is invalid/);
+  assert.throws(() => assertShieldAssetsProvision({ version: 3, ...stored, gitleaks: { ...v3Gitleaks, origin: "guessed" } }), /invalid/);
+  assert.throws(() => assertShieldAssetsProvision({ version: 3, ...stored, gitleaks: { origin: "override", ...base.gitleaks } }), /invalid/);
+  // Only format 3 may carry install fields.
+  assert.throws(() => assertShieldAssetsProvision({ version: 2, ...stored, gitleaks: v3Gitleaks }), /invalid/);
+  assert.throws(() => assertShieldAssetsProvision({ version: 2, ...stored, opf: { state: "failed", platform: "none", reason: "x" } }), /invalid/);
+});
+
+test("format 2 records stay readable and normalize to the current version", async () => {
+  const homeDir = await mkdtemp(join(tmpdir(), "ccshield-assets-v2-"));
+  try {
+    const paths = shieldPaths({ homeDir, uid: process.getuid?.() });
+    const store = shieldAssetStore(paths);
+    await mkdir(paths.rootDir, { recursive: true, mode: 0o700 });
+    await writeFile(paths.assetsProvisionPath, JSON.stringify({ version: 2, ...base, regex: storeRegex(store.root), privacy: { state: "absent" } }), { mode: 0o600 });
+    const record = await readShieldAssetsProvision({ paths });
+    assert.equal(record.version, ASSETS_FORMAT_VERSION);
+    assert.equal(record.opf, undefined);
+    assert.equal(record.gitleaks.origin, undefined);
+    // A normalized record round-trips through the writer.
+    await writeShieldAssetsProvision({ paths, state: { ...record, gitleaks: v3Gitleaks, opf: { state: "failed", platform: "darwin-arm64", reason: "Python 3.10 or newer was not found" } } });
+    const updated = await readShieldAssetsProvision({ paths });
+    assert.deepEqual(updated.gitleaks, v3Gitleaks);
+    assert.equal(updated.opf.state, "failed");
+    assert.equal(updated.privacy.state, "absent");
   } finally {
     await rm(homeDir, { recursive: true, force: true });
   }

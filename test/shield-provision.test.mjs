@@ -5,9 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { provisionShieldAssets } from "../src/shield/provision.mjs";
+import { keepInstallRecord, provisionShieldAssets } from "../src/shield/provision.mjs";
 import { prepareRegexWorker } from "../src/shield/regex-detector.mjs";
-import { assertShieldAssetsProvision, readShieldAssetsProvision, shieldPaths } from "../src/shield/paths.mjs";
+import { ASSETS_FORMAT_VERSION, assertShieldAssetsProvision, readShieldAssetsProvision, shieldPaths } from "../src/shield/paths.mjs";
 
 const policyPath = "/opt/ccshield/policy.json";
 const gitleaksPath = "/opt/ccshield/gitleaks";
@@ -49,7 +49,7 @@ test("asset provision previews without writes and only records opaque references
 
   assert.equal(writes.length, 0);
   assert.deepEqual(preview, {
-    version: 2,
+    version: ASSETS_FORMAT_VERSION,
     bundle: { version: "policy-1", sha256: sha256(bytes[policyPath]), path: policyPath },
     gitleaks: {
       sha256: sha256(bytes[gitleaksPath]),
@@ -258,3 +258,18 @@ function fixtureIo({ symlink = null, owner = process.getuid?.(), executable = tr
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
+
+test("re-provisioning keeps the install record, the Gitleaks origin only for the same binary", () => {
+  const gitleaks = { sha256: "a".repeat(64), path: "/store/gitleaks", rules: { path: "/r.toml", sha256: "b".repeat(64), version: "rules-1" } };
+  const state = { version: ASSETS_FORMAT_VERSION, gitleaks, privacy: { state: "absent" } };
+  const opf = { state: "verified", platform: "darwin-arm64", bundle: "/store/opf/x" };
+  const current = { gitleaks: { origin: "downloaded", version: "8.30.1", ...gitleaks }, opf };
+  assert.equal(keepInstallRecord(state, null), state);
+  const kept = keepInstallRecord(state, current);
+  assert.deepEqual(kept.gitleaks, { origin: "downloaded", version: "8.30.1", ...gitleaks });
+  assert.deepEqual(kept.opf, opf);
+  assert.equal(kept.privacy, state.privacy);
+  const swapped = keepInstallRecord({ ...state, gitleaks: { ...gitleaks, sha256: "c".repeat(64) } }, current);
+  assert.equal(swapped.gitleaks.origin, undefined);
+  assert.deepEqual(swapped.opf, opf);
+});

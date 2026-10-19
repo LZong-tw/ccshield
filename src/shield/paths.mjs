@@ -269,8 +269,10 @@ function assertCanonicalAssetsProvisionPath(paths) {
   }
 }
 
-export const ASSETS_FORMAT_VERSION = 2;
+export const ASSETS_FORMAT_VERSION = 3;
 const PRIVACY_ORIGINS = new Set(["downloaded", "adopted"]);
+const GITLEAKS_ORIGINS = new Set(["downloaded", "override"]);
+const OPF_INSTALL_STATES = new Set(["verified", "failed", "unsupported"]);
 
 // Lane-independent detector assets. Downloads land in staging and move into
 // opf/<codeCommit>-<hfRev>/ only after their digests check out.
@@ -300,12 +302,19 @@ export function shieldAssetStore(paths) {
 // required only when verified. A version-1 file predates the field: a shape the
 // old check accepted is read as verified (OPF there counts as adopted); any
 // other version-1 privacy block is failed with reason legacy-schema.
+// Version 3 adds what `ccshield install --write` did: the Gitleaks origin and
+// version, and an optional opf block. Versions 1 and 2 still read unchanged.
 export function assertShieldAssetsProvision(state, { storeRoot } = {}) {
+  const v3 = state?.version === ASSETS_FORMAT_VERSION;
   const keys = state?.version === 1 ? ["bundle", "gitleaks", "privacy", "version"] : ["bundle", "gitleaks", "privacy", "regex", "version"];
-  if (!isPlainObject(state) || !exactKeys(state, keys)
-    || (state.version !== 1 && state.version !== ASSETS_FORMAT_VERSION)
+  const gitleaksKeys = v3 && isPlainObject(state.gitleaks) && "origin" in state.gitleaks
+    ? ["origin", "path", "rules", "sha256", "version"]
+    : ["path", "rules", "sha256"];
+  if (!isPlainObject(state) || !exactKeys(state, v3 && "opf" in state ? [...keys, "opf"].sort() : keys)
+    || (state.version !== 1 && state.version !== 2 && !v3)
     || !isPlainObject(state.bundle) || !exactKeys(state.bundle, ["path", "sha256", "version"])
-    || !isPlainObject(state.gitleaks) || !exactKeys(state.gitleaks, ["path", "rules", "sha256"])
+    || !isPlainObject(state.gitleaks) || !exactKeys(state.gitleaks, gitleaksKeys)
+    || (state.gitleaks.origin !== undefined && !GITLEAKS_ORIGINS.has(state.gitleaks.origin))
     || !isPlainObject(state.gitleaks.rules) || !exactKeys(state.gitleaks.rules, ["path", "sha256", "version"])) {
     throw new Error("shield asset provision is invalid");
   }
@@ -316,14 +325,35 @@ export function assertShieldAssetsProvision(state, { storeRoot } = {}) {
     version: ASSETS_FORMAT_VERSION,
     bundle: Object.freeze({ version: state.bundle.version, sha256: state.bundle.sha256, path: state.bundle.path }),
     gitleaks: Object.freeze({
+      ...(state.gitleaks.origin ? { origin: state.gitleaks.origin, version: state.gitleaks.version } : {}),
       sha256: state.gitleaks.sha256,
       path: state.gitleaks.path,
       rules: Object.freeze({ path: state.gitleaks.rules.path, sha256: state.gitleaks.rules.sha256, version: state.gitleaks.rules.version }),
     }),
     privacy: state.version === 1 ? legacyPrivacyAssets(state.privacy) : privacyAssets(state.privacy, storeRoot),
     regex: state.version === 1 ? null : regexAssets(state.regex, storeRoot),
+    ...(v3 && "opf" in state ? { opf: opfInstallAssets(state.opf, storeRoot) } : {}),
   });
 }
+
+// state is verified (with the bundle directory), failed or unsupported (with
+// a reason); platform is the detected key or "none".
+function opfInstallAssets(value, storeRoot) {
+  const keys = value?.state === "verified" ? ["bundle", "platform", "state"] : ["platform", "reason", "state"];
+  if (!isPlainObject(value) || !OPF_INSTALL_STATES.has(value.state) || !exactKeys(value, keys)
+    || !safeIdentifier(value.platform)
+    || (value.state === "verified" ? !safePath(value.bundle) : !safeReason(value.reason))) {
+    throw new Error("shield OPF install record is invalid");
+  }
+  if (value.state === "verified" && typeof storeRoot === "string" && !isInside(value.bundle, join(storeRoot, "opf"))) {
+    throw new Error("shield OPF install record must stay inside the asset store");
+  }
+  return Object.freeze(value.state === "verified"
+    ? { state: value.state, platform: value.platform, bundle: value.bundle }
+    : { state: value.state, platform: value.platform, reason: value.reason });
+}
+
+function safeReason(value) { return typeof value === "string" && value.length > 0 && value.length <= 500 && !/[\u0000-\u001f\u007f]/.test(value); }
 
 // The regex detector is copied into the store at install time, so the daemon
 // runs a pinned file rather than whatever the package currently ships.
