@@ -24,6 +24,7 @@ function fakes(calls, overrides = {}) {
     gitleaksOverride: async ({ path }) => { calls.push(["override", path]); return { origin: "override", version: "8.29.0", path, sha256: "b".repeat(64) }; },
     fetchOpfBundle: async () => { calls.push(["opf"]); },
     buildOpfVenv: async ({ venvDir }) => { calls.push(["venv", venvDir.endsWith("/venv")]); return { state: "verified" }; },
+    provisionOpfPrivacy: async () => { calls.push(["privacy"]); },
     exists: async () => false,
     ...overrides,
   };
@@ -43,19 +44,19 @@ test("detector preview plans downloads without touching the network", () => with
   assert.deepEqual(calls, []);
 }));
 
-test("detector write installs pinned Gitleaks, the OPF bundle, then the venv", () => withHome(async (paths) => {
+test("detector write installs pinned Gitleaks, the OPF bundle, the venv, then privacy", () => withHome(async (paths) => {
   const calls = [];
   const result = await fetchDetectorAssets({ paths, write: true, io: fakes(calls) });
   assert.equal(result.state, "verified");
   assert.deepEqual(result.gitleaks, { origin: "downloaded", version: "8.30.1", sha256: "a".repeat(64) });
-  assert.deepEqual(calls, [["gitleaks", "darwin-arm64"], ["opf"], ["venv", true]]);
+  assert.deepEqual(calls, [["gitleaks", "darwin-arm64"], ["opf"], ["venv", true], ["privacy"]]);
 }));
 
-test("detector write skips an installed bundle and venv", () => withHome(async (paths) => {
+test("detector write skips an installed bundle and venv but still provisions privacy", () => withHome(async (paths) => {
   const calls = [];
   const result = await fetchDetectorAssets({ paths, write: true, io: fakes(calls, { exists: async () => true }) });
   assert.equal(result.state, "verified");
-  assert.deepEqual(calls, [["gitleaks", "darwin-arm64"]]);
+  assert.deepEqual(calls, [["gitleaks", "darwin-arm64"], ["privacy"]]);
 }));
 
 test("--gitleaks-path override records version and sha256 and skips the download", () => withHome(async (paths) => {

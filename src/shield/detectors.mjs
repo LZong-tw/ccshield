@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { loadPins, opfDownloadPlan } from "./opf-fetch.mjs";
 import { fetchOpfBundle } from "./opf-install.mjs";
 import { liveOpfJob, readOpfJob, runOpfJob, startOpfJob } from "./opf-job.mjs";
+import { provisionOpfPrivacy } from "./opf-privacy.mjs";
 import { buildOpfVenv } from "./opf-venv.mjs";
 import { doctorGitleaksWarnings, gitleaksOverride, installGitleaks, pinnedGitleaksSha256 } from "./gitleaks-install.mjs";
 import { detectPlatform } from "./platform.mjs";
@@ -29,6 +30,7 @@ function defaults(io = {}) {
     startOpfJob: io.startOpfJob ?? startOpfJob,
     liveOpfJob: io.liveOpfJob ?? liveOpfJob,
     readOpfJob: io.readOpfJob ?? readOpfJob,
+    provisionOpfPrivacy: io.provisionOpfPrivacy ?? provisionOpfPrivacy,
   };
 }
 
@@ -97,6 +99,13 @@ async function installOpf({ paths, pins, platform, deps, onProgress }) {
   const venvReady = await deps.exists(join(bundle.venv, "bin", "python"));
   const venv = venvReady ? { state: "verified" } : await deps.buildOpfVenv({ venvDir: bundle.venv, platform });
   if (venv.state !== "verified") return { state: "failed", platform: platformKey, reason: venv.reason ?? "venv build failed" };
+  // OPF only counts once the daemon can use it: a failed self-test or digest
+  // leaves privacy as it was, so the daemon stays on regex.
+  try {
+    await deps.provisionOpfPrivacy({ paths, pins, bundle });
+  } catch (error) {
+    return { state: "failed", platform: platformKey, reason: `privacy provision failed: ${error?.message ?? String(error)}`.slice(0, 500) };
+  }
   return { state: "verified", platform: platformKey, bundle: bundle.dir, ...(venv.python ? { python: venv.python, torch: venv.torch } : {}) };
 }
 

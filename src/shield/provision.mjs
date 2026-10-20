@@ -9,7 +9,7 @@ import { installRegexWorker, prepareRegexWorker } from "./regex-detector.mjs";
 import { isValidOpfWorkerArgs } from "./opf-args.mjs";
 import { PRIVACY_PROTOCOL } from "./protocol.mjs";
 
-const MANIFEST_FORMAT_VERSION = 1;
+export const MANIFEST_FORMAT_VERSION = 1;
 const O200K_CACHE_KEY = "fb374d419588a4632f3f557e76b4b70aebbca790";
 const defaultIo = { lstat, readFile, realpath };
 
@@ -38,10 +38,7 @@ export async function provisionShieldAssets({
     privacy: privacy ?? Object.freeze({ state: "absent" }),
     regex: Object.freeze({ version: regex.version, worker: regex.worker }),
   });
-  if (privacy) {
-    const result = await selfTest(state);
-    if (!result || result.version !== state.privacy.version) throw new Error("shield privacy worker self-test failed");
-  }
+  if (privacy) await proveSelfTest(state, selfTest);
   if (write) {
     const writer = writeState ?? (paths ? async (value) => writeShieldAssetsProvision({ paths, state: keepInstallRecord(value, await readShieldAssetsProvision({ paths }).catch(() => null)) }) : null);
     if (typeof writer !== "function") throw new Error("shield asset provision writer is required");
@@ -65,7 +62,28 @@ export function keepInstallRecord(state, current) {
   };
 }
 
-async function provisionPrivacy(privacyBundlePath, io) {
+// The OPF job's half of `ccshield privacy`: the same manifest checks and worker
+// self-test, after which only the privacy block of the existing record changes.
+export async function provisionPrivacyRecord({
+  paths, privacyBundlePath, io = defaultIo, runPrivacySelfTest: selfTest = runPrivacyWorkerSelfTest,
+  readState = readShieldAssetsProvision, writeState = writeShieldAssetsProvision,
+} = {}) {
+  const current = await readState({ paths });
+  // No record, or a version-1 one without a regex worker: `ccshield privacy`
+  // has to run first, exactly as for the opf block.
+  if (!current?.regex) return "skipped";
+  const state = { ...current, privacy: await provisionPrivacy(privacyBundlePath, io, "downloaded") };
+  await proveSelfTest(state, selfTest);
+  await writeState({ paths, state });
+  return "written";
+}
+
+async function proveSelfTest(state, selfTest) {
+  const result = await selfTest(state);
+  if (!result || result.version !== state.privacy.version) throw new Error("shield privacy worker self-test failed");
+}
+
+async function provisionPrivacy(privacyBundlePath, io, origin = "adopted") {
   const privacyBundle = await validateAsset({ path: privacyBundlePath, executable: false, label: "privacy bundle", io });
   const manifest = parsePrivacyManifest(privacyBundle.bytes);
   const worker = await validateAsset({ path: manifest.worker.command, executable: true, label: "privacy worker", expectedDigest: manifest.worker.sha256, io });
@@ -73,11 +91,11 @@ async function provisionPrivacy(privacyBundlePath, io) {
   const source = manifest.source ? await verifyShieldCheckpoint(manifest.source, { label: "source" }) : null;
   const adapter = manifest.adapter ? await validateAsset({ path: manifest.adapter.path, executable: false, label: "privacy adapter", expectedDigest: manifest.adapter.sha256, io }) : null;
   const tokenizer = manifest.tokenizer ? await validateAsset({ path: manifest.tokenizer.path, executable: false, label: "privacy tokenizer", expectedDigest: manifest.tokenizer.sha256, io }) : null;
-  // A bundle handed to provision lives outside the asset store, so its OPF
-  // files are adopted; only the pinned downloader records "downloaded".
+  // A bundle handed to `ccshield privacy` lives outside the asset store, so its
+  // OPF files are adopted; only the pinned downloader records "downloaded".
   return Object.freeze({
     state: "verified",
-    ...(checkpoint ? { origin: "adopted" } : {}),
+    ...(checkpoint ? { origin } : {}),
     version: manifest.version,
     sha256: privacyBundle.sha256,
     path: privacyBundle.path,
