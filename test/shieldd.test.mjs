@@ -92,6 +92,7 @@ test("daemon activates validated policy before proxy readiness and publishes its
     targetClass: "subscription",
     policyVersion: policy.version,
     detectorVersions: policy.detectorVersions,
+    media: { documents: "blocked", images: "unscanned" },
   });
 });
 

@@ -63,6 +63,22 @@ test("identity binds a launch lane and configuration generation", () => {
   assert.throws(() => assertShieldIdentity({ ...identity, policyVersion: "" }), /policy version/i);
 });
 
+test("identity carries optional media coverage and rejects unknown values", () => {
+  assert.equal(Object.hasOwn(assertShieldIdentity(identity), "media"), false);
+  const media = { documents: "blocked", images: "unscanned" };
+  assert.deepEqual(assertShieldIdentity({ ...identity, media }).media, media);
+  for (const bad of [
+    null,
+    "blocked",
+    { documents: "blocked" },
+    { documents: "scanned", images: "unscanned" },
+    { documents: "blocked", images: "ocr-text" },
+    { documents: "blocked", images: "unscanned", audio: "blocked" },
+  ]) {
+    assert.throws(() => assertShieldIdentity({ ...identity, media: bad }), /media/i, JSON.stringify(bad));
+  }
+});
+
 test("missing identity is reported as null", async () => {
   const paths = shieldPaths({ homeDir: "/tmp/home", uid: 501 });
   const io = { async readFile() { const error = new Error("missing"); error.code = "ENOENT"; throw error; } };

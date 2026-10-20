@@ -111,7 +111,7 @@ export function assertShieldIdentity(identity) {
     throw new Error("shield identity policy version is missing or invalid");
   }
   const detectorVersions = assertDetectorVersions(identity.detectorVersions, "shield identity");
-  return {
+  const validated = {
     origin: url.origin,
     capability: identity.capability,
     version: identity.version,
@@ -122,6 +122,21 @@ export function assertShieldIdentity(identity) {
     policyVersion: identity.policyVersion,
     detectorVersions,
   };
+  if (Object.hasOwn(identity, "media")) validated.media = assertMediaCoverage(identity.media);
+  return validated;
+}
+
+// What the running daemon does with media it cannot inspect. A daemon from
+// before the media check writes no `media`, and readers treat that as unscanned.
+const MEDIA_COVERAGE_STATES = Object.freeze({ documents: ["unscanned", "blocked"], images: ["unscanned"] });
+
+function assertMediaCoverage(media) {
+  if (!media || typeof media !== "object" || Array.isArray(media)
+    || Object.keys(media).length !== 2
+    || !Object.entries(MEDIA_COVERAGE_STATES).every(([kind, allowed]) => allowed.includes(media[kind]))) {
+    throw new Error("shield identity media coverage is invalid");
+  }
+  return { documents: media.documents, images: media.images };
 }
 
 export function assertShieldPolicyState(state) {

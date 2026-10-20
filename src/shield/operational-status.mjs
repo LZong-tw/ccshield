@@ -5,9 +5,9 @@ import { readEnv } from "../compat-env.mjs";
 
 const LANES = Object.freeze(["subscription", "managed"]);
 const HEALTH = new Set(["healthy", "unavailable"]);
-// What the proxy can inspect, independent of lane health. Base64 images and documents under the body
-// limit are forwarded without OCR or text extraction, so the gap is reported rather than implied away.
-const CONTENT_COVERAGE = Object.freeze({ text: "scanned", images: "unscanned", documents: "unscanned" });
+// What a running daemon inspects. Images are forwarded without OCR; documents are blocked only by a
+// daemon whose identity says so, since one started before the media check still forwards them.
+const NOT_RUNNING_COVERAGE = Object.freeze({ text: "n/a", images: "n/a", documents: "n/a" });
 
 export async function readShieldOperationalStatus({
   env = process.env,
@@ -43,7 +43,6 @@ export async function readShieldOperationalStatus({
   return {
     state: lanes.some((lane) => lane.state === "protected") ? "protected" : "unavailable",
     lanes,
-    content_coverage: { ...CONTENT_COVERAGE },
     declared_coverage: descriptors.filter((descriptor) => descriptor.coverage === "protected").map(({ coverage: _coverage, ...descriptor }) => descriptor),
     declared_bypasses: descriptors.filter((descriptor) => descriptor.coverage === "bypass").map(({ coverage: _coverage, launcher, bypassReason }) => ({ launcher, reason: bypassReason })),
   };
@@ -82,11 +81,22 @@ async function readLaneStatus({ lane, audit, paths, inspectService, readIdentity
     result.gitleaks_version = policy.detectorVersions.gitleaks;
     result.privacy_version = policy.detectorVersions.privacy;
   }
+  result.content_coverage = contentCoverage(service, identity, serviceState);
   return result;
 }
 
 function unavailableLane(lane, audit) {
-  return { lane, state: "unavailable", service: "unavailable", policy: "unavailable", privacy: "unavailable", audit };
+  return {
+    lane, state: "unavailable", service: "unavailable", policy: "unavailable", privacy: "unavailable", audit,
+    content_coverage: { ...NOT_RUNNING_COVERAGE },
+  };
+}
+
+function contentCoverage(service, identity, serviceState) {
+  if (!service?.active) return { ...NOT_RUNNING_COVERAGE };
+  // Identity media counts only when the process that wrote it is the one running now.
+  const media = serviceState === "healthy" ? identity?.media : undefined;
+  return { text: "scanned", images: "unscanned", documents: media?.documents ?? "unscanned" };
 }
 
 function classifyService(service, identity, hadError) {

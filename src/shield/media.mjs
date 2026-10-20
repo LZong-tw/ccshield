@@ -215,6 +215,10 @@ export function extractMedia(raw) {
   return result;
 }
 
+// Published in the daemon identity so status reports what this build does,
+// not what a newer build on disk would do.
+export const MEDIA_COVERAGE = Object.freeze({ documents: "blocked", images: "unscanned" });
+
 export function mediaOutcomeFor(reasonCodes) {
   if (reasonCodes.length === 0) return null;
   return reasonCodes.includes("media_document_blocked") ? "blocked_document" : "blocked_source";

@@ -13,7 +13,7 @@ import { loadShieldPolicy } from "./shield/policy.mjs";
 import { openPrivacyDetector } from "./shield/privacy-detector.mjs";
 import { createPrivacyFilter, isVerifiedRedaction } from "./shield/privacy.mjs";
 import { createShieldFailure as shieldFailure, startShieldProxy } from "./shield/proxy.mjs";
-import { extractMedia, mediaOutcomeFor } from "./shield/media.mjs";
+import { extractMedia, MEDIA_COVERAGE, mediaOutcomeFor } from "./shield/media.mjs";
 import { createDecisionCache } from "./shield/decision-cache.mjs";
 import { defaultShieldLauncherContext, readShieldConfig } from "./shield/service.mjs";
 import { createShieldDecisionRecorder } from "./shield/audit.mjs";
@@ -178,6 +178,7 @@ export async function startShieldDaemon({
         targetClass: config.targetClass,
         policyVersion: policy.version,
         detectorVersions: policy.detectorVersions,
+        media: { ...MEDIA_COVERAGE },
       },
     });
   } catch (error) {
