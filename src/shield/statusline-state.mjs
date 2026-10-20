@@ -1,15 +1,26 @@
+import { liveOpfJob } from "./opf-job.mjs";
 import { readShieldOperationalStatus } from "./operational-status.mjs";
+import { shieldPaths } from "./paths.mjs";
 
 const STATUSLINE_LANES = Object.freeze(["subscription", "managed"]);
 const STATUSLINE_STATES = Object.freeze(["protected", "blocked", "unavailable"]);
 const STATUSLINE_DEADLINE_MS = 750;
 
 export async function readShieldStatuslineState(options = {}) {
-  const operational = await (options.readOperationalStatus ?? readShieldOperationalStatus)(options);
-  return shieldStatuslineState(operational);
+  const [operational, preparing] = await Promise.all([
+    (options.readOperationalStatus ?? readShieldOperationalStatus)(options),
+    (options.readOpfPreparing ?? readOpfPreparing)(options).catch(() => false),
+  ]);
+  return shieldStatuslineState(operational, { preparing });
 }
 
-export function shieldStatuslineState(operational) {
+// True while any lane's background OPF job is alive.
+async function readOpfPreparing({ env = process.env } = {}) {
+  const live = await Promise.all(STATUSLINE_LANES.map((lane) => liveOpfJob({ paths: shieldPaths({ env, lane }) }).catch(() => null)));
+  return live.some(Boolean);
+}
+
+export function shieldStatuslineState(operational, { preparing = false } = {}) {
   const lanes = Array.isArray(operational?.lanes) ? operational.lanes : [];
   const state = STATUSLINE_STATES.includes(operational?.state) ? operational.state : "unavailable";
   return Object.freeze({
@@ -19,6 +30,7 @@ export function shieldStatuslineState(operational) {
       state: lane.state,
       approval: lane.state === "protected" ? "available" : "blocked",
     }))),
+    ...(preparing === true ? { preparing: true } : {}),
   });
 }
 
@@ -34,7 +46,7 @@ export function shieldStatuslineSuffix(state) {
     const entry = lanes.find((candidate) => candidate?.lane === lane);
     return ` ${lane}:${STATUSLINE_STATES.includes(entry?.state) ? entry.state : "unavailable"}`;
   }).join("");
-  return ` · Shield${rendered}`;
+  return ` · Shield${rendered}${state?.preparing === true ? " · PII engine preparing" : ""}`;
 }
 
 export async function runShieldStatusline({
@@ -42,10 +54,11 @@ export async function runShieldStatusline({
   input = process.stdin,
   output = process.stdout,
   readOperationalStatus = readShieldOperationalStatus,
+  readOpfPreparing,
   runSubagentStatusLine,
   deadlineMs = STATUSLINE_DEADLINE_MS,
 } = {}) {
-  const state = await withStatuslineDeadline(readShieldStatuslineState({ env, readOperationalStatus }), deadlineMs);
+  const state = await withStatuslineDeadline(readShieldStatuslineState({ env, readOperationalStatus, readOpfPreparing }), deadlineMs);
   // AirKit injects its subagent statusline renderer (P5); standalone, print the suffix as the line.
   const runner = runSubagentStatusLine ?? (async ({ output: sink, statuslineSuffix }) => { sink.write(`${statuslineSuffix.replace(/^ · /, "")}\n`); });
   return runner({ env, input, output, statuslineSuffix: shieldStatuslineSuffix(state) });

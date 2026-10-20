@@ -915,6 +915,7 @@ test("subscription --pxpipe launch points Shield at a pxpipe hop and closes it w
   await runShieldCli(["launch", "--lane", "subscription", "--pxpipe", "--", "echo", "ok"], {
     stdout: capture().stdout,
     ensureShieldReady: async () => ({ origin: "http://127.0.0.1:8811", capability: "a".repeat(32), lane: "subscription", targetClass: "subscription" }),
+    ensureOpfJob: async () => ({ started: false }),
     startPxpipeHop: async ({ upstream }) => {
       events.push(`hop:${upstream}`);
       return { origin: "http://127.0.0.1:8805", async close() { events.push("hop-close"); } };
@@ -939,6 +940,7 @@ test("subscription --pxpipe closes the hop when the lease cannot be created", as
   await assert.rejects(runShieldCli(["launch", "--lane", "subscription", "--pxpipe", "--", "echo", "no"], {
     stdout: capture().stdout,
     ensureShieldReady: async () => ({ origin: "http://127.0.0.1:8811", capability: "a".repeat(32), lane: "subscription", targetClass: "subscription" }),
+    ensureOpfJob: async () => ({ started: false }),
     startPxpipeHop: async () => ({ origin: "http://127.0.0.1:8805", async close() { closed = true; } }),
     createShieldDestinationLease: async () => { throw new Error("lease refused"); },
   }), /lease refused/);
@@ -952,6 +954,7 @@ test("subscription target launch renews its lease until its foreground child exi
   await runShieldCli(["launch", "--lane", "subscription", "--target", "http://127.0.0.1:8804", "--", "echo", "ok"], {
     stdout: capture().stdout,
     ensureShieldReady: async () => ({ origin: "http://127.0.0.1:8811", capability: "a".repeat(32), lane: "subscription", targetClass: "subscription" }),
+    ensureOpfJob: async () => ({ started: false }),
     createShieldDestinationLease: async ({ ready, targetOrigin }) => {
       events.push(`create:${targetOrigin}`);
       return { ...ready, capability: "b".repeat(32) };
@@ -993,6 +996,7 @@ test("subscription target launch retains its lease while a matching background h
   await runShieldCli(["launch", "--lane", "subscription", "--target", "http://127.0.0.1:8804", "--", "echo", "ok"], {
     stdout: capture().stdout,
     ensureShieldReady: async () => ({ origin: "http://127.0.0.1:8811", capability: "a".repeat(32), lane: "subscription", targetClass: "subscription" }),
+    ensureOpfJob: async () => ({ started: false }),
     createShieldDestinationLease: async ({ ready }) => ({ ...ready, capability: "b".repeat(32) }),
     renewShieldDestinationLease: async () => events.push("renew"),
     revokeShieldDestinationLease: async () => events.push("revoke"),

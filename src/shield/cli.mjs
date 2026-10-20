@@ -2,7 +2,7 @@ import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { GITLEAKS_COMMAND_PROFILE } from "./gitleaks.mjs";
-import { doctorDetectorAssets, fetchDetectorAssets } from "./detectors.mjs";
+import { doctorDetectorAssets, ensureOpfJob, fetchDetectorAssets, runOpfJobForLane } from "./detectors.mjs";
 import { readShieldAssetsProvision, readShieldIdentity, readShieldPolicyState, shieldPaths } from "./paths.mjs";
 import { provisionShieldAssets } from "./provision.mjs";
 import { installShieldPolicyProvision, readShieldPolicyProvision } from "./policy-bundle.mjs";
@@ -31,6 +31,11 @@ const SENSITIVE_KEYS = new Set(["capability", "origin", "path", "target", "targe
 export async function runShieldCli(argv = [], dependencies = {}) {
   const stdout = dependencies.stdout ?? process.stdout;
   const [command = "help", ...rest] = argv;
+  if (command === "__opf-job") {
+    const { lane } = parseLaneCommand(rest, "ccshield __opf-job");
+    const job = await (dependencies.runOpfJobForLane ?? runOpfJobForLane)({ paths: shieldPaths({ env: dependencies.env ?? process.env, lane }) });
+    return job.state === "verified" ? 0 : 1;
+  }
   if (["help", "-h", "--help"].includes(command)) {
     stdout.write(renderShieldHelp());
     return 0;
@@ -91,7 +96,7 @@ async function createDefaultShieldDependencies(dependencies) {
       const lanePaths = shieldPaths({ env, lane });
       const provisioned = await readAssets({ paths: lanePaths, io: dependencies.io });
       if (!provisioned) throw new Error("shield assets are missing; run ccshield privacy provision with Gitleaks before install");
-      const detectors = await fetchDetectors({ paths: lanePaths, gitleaksPath, write });
+      const detectors = await fetchDetectors({ paths: lanePaths, gitleaksPath, write, background: write });
       // A write records the installed Gitleaks, which the service then runs.
       const assets = write ? await readAssets({ paths: lanePaths, io: dependencies.io }) : provisioned;
       const { loadShieldPolicy } = dependencies.loadShieldPolicy ? { loadShieldPolicy: dependencies.loadShieldPolicy } : await import("./policy.mjs");
@@ -186,6 +191,7 @@ async function createDefaultShieldDependencies(dependencies) {
     async launch({ lane, targetOrigin: fixedTarget, pxpipe = false, command, args }) {
       const lanePaths = shieldPaths({ env, lane });
       let ready = await ensureReady({ lane, env, paths: lanePaths, io: dependencies.io, inspectService: dependencies.inspectService, isProcessAlive: dependencies.isProcessAlive, probeShield: dependencies.probeShield });
+      await (dependencies.ensureOpfJob ?? ensureOpfJob)({ paths: lanePaths }).catch(() => null);
       // pxpipe sits behind Shield, so it only sees redacted traffic. It lives
       // exactly as long as the lease that points Shield at it.
       const hop = pxpipe ? await (dependencies.startPxpipeHop ?? startPxpipeHop)({ upstream: ANTHROPIC_ORIGIN, env }) : null;
