@@ -50,15 +50,20 @@ export async function provisionShieldAssets({
   return state;
 }
 
-// `ccshield install --write` owns the opf block and the Gitleaks origin; a
-// re-provision keeps them, the origin only while it still names the same binary.
+// `ccshield install --write` owns the opf block and the Gitleaks origin, and
+// its OPF job owns the privacy block it downloaded; a re-provision keeps them,
+// the origin only while it still names the same binary. Dropping the job's
+// privacy block would leave opf verified with nothing to rerun the job, and
+// the daemon falls back to regex on its own if that block stops validating.
 export function keepInstallRecord(state, current) {
   if (!current) return state;
   const sameGitleaks = current.gitleaks.origin && current.gitleaks.path === state.gitleaks.path && current.gitleaks.sha256 === state.gitleaks.sha256;
+  const keepPrivacy = state.privacy.state === "absent" && current.privacy?.origin === "downloaded";
   return {
     ...state,
     ...(sameGitleaks ? { gitleaks: { origin: current.gitleaks.origin, version: current.gitleaks.version, ...state.gitleaks } } : {}),
     ...(current.opf ? { opf: current.opf } : {}),
+    ...(keepPrivacy ? { privacy: current.privacy } : {}),
   };
 }
 

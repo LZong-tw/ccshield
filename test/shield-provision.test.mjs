@@ -273,3 +273,17 @@ test("re-provisioning keeps the install record, the Gitleaks origin only for the
   assert.equal(swapped.gitleaks.origin, undefined);
   assert.deepEqual(swapped.opf, opf);
 });
+
+test("re-provisioning without a bundle keeps the privacy block the OPF job downloaded", () => {
+  const gitleaks = { sha256: "a".repeat(64), path: "/store/gitleaks", rules: { path: "/r.toml", sha256: "b".repeat(64), version: "rules-1" } };
+  const state = { version: ASSETS_FORMAT_VERSION, gitleaks, privacy: { state: "absent" } };
+  const opf = { state: "verified", platform: "darwin-arm64", bundle: "/store/opf/x" };
+  const downloaded = { state: "verified", origin: "downloaded", version: "opf-1", sha256: "d".repeat(64), path: "/store/opf/x/privacy-manifest.json" };
+  assert.equal(keepInstallRecord(state, { gitleaks, opf, privacy: downloaded }).privacy, downloaded);
+  // An adopted bundle belongs to `ccshield privacy`, which is free to drop it.
+  const adopted = { ...downloaded, origin: "adopted" };
+  assert.equal(keepInstallRecord(state, { gitleaks, opf, privacy: adopted }).privacy, state.privacy);
+  // A bundle handed to this provision replaces the job's block.
+  const handed = { state: "verified", version: "regex-2", sha256: "e".repeat(64), path: "/b.json" };
+  assert.equal(keepInstallRecord({ ...state, privacy: handed }, { gitleaks, opf, privacy: downloaded }).privacy, handed);
+});
