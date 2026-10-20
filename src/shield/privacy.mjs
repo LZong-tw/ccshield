@@ -495,7 +495,7 @@ export function isVerifiedRedaction({ original, result } = {}) {
 }
 
 // Exact-path table shared in meaning with the OPF adapter's collectOpaqueValues; kept independent on purpose.
-function opaqueValues(body) {
+export function opaqueValues(body) {
   let root;
   try { root = JSON.parse(body.toString("utf8")); } catch { return null; }
   const entries = [];
