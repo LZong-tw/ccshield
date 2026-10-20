@@ -63,7 +63,11 @@ async function withBundle(fn) {
 function jobIo({ pins, selfTest }) {
   const box = { record: { version: 3, privacy: { state: "absent" }, regex: regexAssets } };
   const readState = async () => box.record;
-  const writeState = async ({ state }) => { box.record = state; };
+  // The record lock, in memory: each update merges into whatever is current.
+  const updateState = async ({ update }) => {
+    const next = await update(box.record);
+    if (next !== undefined) box.record = next;
+  };
   return {
     box,
     io: {
@@ -73,10 +77,10 @@ function jobIo({ pins, selfTest }) {
       fetchOpfBundle: async () => assert.fail("the bundle is already present"),
       buildOpfVenv: async () => ({ state: "verified", python: "3.11.9", torch: "2.4.1" }),
       readAssets: readState,
-      writeAssets: writeState,
+      updateAssets: updateState,
       provisionOpfPrivacy: (options) => provisionOpfPrivacy({
         ...options,
-        provision: (args) => provisionPrivacyRecord({ ...args, runPrivacySelfTest: selfTest, readState, writeState }),
+        provision: (args) => provisionPrivacyRecord({ ...args, runPrivacySelfTest: selfTest, readState, updateState }),
       }),
     },
   };
@@ -106,7 +110,7 @@ function daemon(box) {
     probe: async () => {},
     clock: () => now,
     recheckMs: 1000,
-    onUpgradeFailure: (error) => assert.fail(error.message),
+    onOpfFailure: (error) => assert.fail(error.message),
   });
   return { detector, created, advance: (ms) => { now += ms; } };
 }
@@ -153,6 +157,25 @@ test("a failed self-test ends the job failed, leaves privacy alone and keeps the
   await privacy.refresh();
   assert.equal(privacy.detectorVersions().privacy, "regex-v1");
   assert.deepEqual(created, ["regex-v1"]);
+}));
+
+test("a provision written while the job self-tests keeps its change and still gains the job's privacy block", () => withBundle(async ({ paths, pins }) => {
+  const manual = { origin: "preinstalled", version: "8.30.1", path: "/opt/gitleaks", sha256: "e".repeat(64), rules: { path: "/opt/rules.toml", sha256: "f".repeat(64) } };
+  const { box, io } = jobIo({
+    pins,
+    selfTest: async (state) => {
+      // `ccshield privacy provision --write` lands mid self-test.
+      box.record = { ...box.record, gitleaks: manual };
+      return { version: state.privacy.version };
+    },
+  });
+
+  await runJob(paths, io);
+
+  assert.equal((await readOpfJob({ paths })).state, "verified");
+  assert.deepEqual(box.record.gitleaks, manual);
+  assert.equal(box.record.privacy.state, "verified");
+  assert.equal(box.record.privacy.version, WORKER_VERSION);
 }));
 
 test("a checkpoint that drifted from its pin ends the job failed before any self-test", () => withBundle(async ({ paths, bundle, pins }) => {

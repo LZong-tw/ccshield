@@ -4,7 +4,7 @@ import { basename, dirname, isAbsolute, resolve } from "node:path";
 
 import { runPrivacyWorkerSelfTest } from "./privacy.mjs";
 import { verifyShieldCheckpoint } from "./checkpoint.mjs";
-import { ASSETS_FORMAT_VERSION, readShieldAssetsProvision, shieldAssetStore, writeShieldAssetsProvision } from "./paths.mjs";
+import { ASSETS_FORMAT_VERSION, readShieldAssetsProvision, shieldAssetStore, updateShieldAssetsProvision } from "./paths.mjs";
 import { installRegexWorker, prepareRegexWorker } from "./regex-detector.mjs";
 import { isValidOpfWorkerArgs } from "./opf-args.mjs";
 import { PRIVACY_PROTOCOL } from "./protocol.mjs";
@@ -40,7 +40,7 @@ export async function provisionShieldAssets({
   });
   if (privacy) await proveSelfTest(state, selfTest);
   if (write) {
-    const writer = writeState ?? (paths ? async (value) => writeShieldAssetsProvision({ paths, state: keepInstallRecord(value, await readShieldAssetsProvision({ paths }).catch(() => null)) }) : null);
+    const writer = writeState ?? (paths ? (value) => updateShieldAssetsProvision({ paths, replaceInvalid: true, update: async (current) => keepInstallRecord(value, current) }) : null);
     if (typeof writer !== "function") throw new Error("shield asset provision writer is required");
     // The file lands before the record that names it, so a reader never sees
     // a regex reference without its worker.
@@ -71,16 +71,27 @@ export function keepInstallRecord(state, current) {
 // self-test, after which only the privacy block of the existing record changes.
 export async function provisionPrivacyRecord({
   paths, privacyBundlePath, io = defaultIo, runPrivacySelfTest: selfTest = runPrivacyWorkerSelfTest,
-  readState = readShieldAssetsProvision, writeState = writeShieldAssetsProvision,
+  readState = readShieldAssetsProvision, updateState = updateShieldAssetsProvision,
 } = {}) {
   const current = await readState({ paths });
   // No record, or a version-1 one without a regex worker: `ccshield privacy`
   // has to run first, exactly as for the opf block.
   if (!current?.regex) return "skipped";
-  const state = { ...current, privacy: await provisionPrivacy(privacyBundlePath, io, "downloaded") };
-  await proveSelfTest(state, selfTest);
-  await writeState({ paths, state });
-  return "written";
+  const privacy = await provisionPrivacy(privacyBundlePath, io, "downloaded");
+  await proveSelfTest({ ...current, privacy }, selfTest);
+  // The checks above take up to a minute, so the record is re-read under the
+  // lock and only its privacy block replaced: a provision that landed in the
+  // meantime keeps everything else it wrote.
+  let outcome = "skipped";
+  await updateState({
+    paths,
+    update: async (latest) => {
+      if (!latest?.regex) return undefined;
+      outcome = "written";
+      return { ...latest, privacy };
+    },
+  });
+  return outcome;
 }
 
 async function proveSelfTest(state, selfTest) {

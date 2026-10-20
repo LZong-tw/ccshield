@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import { readEnv } from "../compat-env.mjs";
+import { withFileLock } from "./file-lock.mjs";
 
 const SHIELD_LABEL = "com.ccshield";
 const defaultIo = { chmod, constants, lstat, mkdir, open, readFile, rename, unlink };
@@ -216,7 +217,24 @@ export async function writeShieldAssetsProvision({ paths, state, io = defaultIo 
   return validated;
 }
 
-async function writePrivateShieldState({ paths, path, value, io, raw = false }) {
+// Every writer of the asset record goes through here. The background OPF job
+// and a manual provision each own different blocks, so the read-merge-write
+// runs under a per-record lock and neither can drop the other's change.
+// `update` gets the current record (or null) and returns the next one, or
+// undefined to leave it alone; it must stay cheap, since it runs locked. A full
+// re-provision passes `replaceInvalid`, so an unreadable record reads as none.
+export async function updateShieldAssetsProvision({ paths, update, replaceInvalid = false, io = defaultIo, lock = withFileLock } = {}) {
+  if (!paths?.rootDir || !paths.assetsProvisionPath) throw new TypeError("shield asset provision paths are required");
+  if (typeof update !== "function") throw new TypeError("shield asset provision update is required");
+  await ensureStateRoot(paths, io);
+  return lock(`${paths.assetsProvisionPath}.lock`, async () => {
+    const read = readShieldAssetsProvision({ paths, io });
+    const next = await update(await (replaceInvalid ? read.catch(() => null) : read));
+    return next === undefined ? null : writeShieldAssetsProvision({ paths, state: next, io });
+  });
+}
+
+async function ensureStateRoot(paths, io) {
   assertWritablePaths(paths);
   const [homeDir, localDir, stateDir, rootDir] = stateComponents(paths.rootDir);
   const ownerUid = process.getuid?.();
@@ -225,6 +243,11 @@ async function writePrivateShieldState({ paths, path, value, io, raw = false }) 
   await ensureDirectory(stateDir, io, ownerUid, true);
   await ensureDirectory(rootDir, io, ownerUid, true);
   await assertDirectory(rootDir, io, ownerUid);
+  return { rootDir, ownerUid };
+}
+
+async function writePrivateShieldState({ paths, path, value, io, raw = false }) {
+  const { rootDir, ownerUid } = await ensureStateRoot(paths, io);
   const rootHandle = await openPrivateRoot(rootDir, io, ownerUid);
   try {
     await rootHandle.chmod(0o700);

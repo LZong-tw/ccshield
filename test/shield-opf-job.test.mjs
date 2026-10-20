@@ -192,7 +192,10 @@ test("background install records Gitleaks and hands OPF to the job", () => withH
     fetchOpfBundle: async () => { calls.push("opf"); },
     buildOpfVenv: async () => { calls.push("venv"); return { state: "verified" }; },
     readAssets: async () => null,
-    writeAssets: async ({ state }) => writes.push(state),
+    updateAssets: async ({ update }) => {
+      const next = await update(null);
+      if (next !== undefined) writes.push(next);
+    },
     startOpfJob: async () => { calls.push("job"); return { started: true, state: "running" }; },
   };
   const result = await fetchDetectorAssets({ paths, write: true, background: true, io });

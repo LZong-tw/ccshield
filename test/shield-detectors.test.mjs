@@ -148,7 +148,10 @@ function memoryAssets(initial) {
     box,
     io: {
       readAssets: async () => box.record,
-      writeAssets: async ({ state }) => { box.writes.push(state); box.record = state; },
+      updateAssets: async ({ update }) => {
+        const next = await update(box.record);
+        if (next !== undefined) { box.writes.push(next); box.record = next; }
+      },
     },
   };
 }

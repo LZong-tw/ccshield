@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
-import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { acquireLock, defaultIsProcessAlive, lockHolder } from "./file-lock.mjs";
 import { shieldAssetStore } from "./paths.mjs";
 
 export const OPF_JOB_MAX_ATTEMPTS = 3;
@@ -60,7 +61,7 @@ export async function runOpfJob({ paths, prepare, record, io, sleep = defaultSle
   const deps = defaults(io);
   const files = opfJobFiles(paths);
   await mkdir(files.dir, { recursive: true, mode: 0o700 });
-  if (!await acquireLock(files.lock, deps)) return Object.freeze({ state: "busy" });
+  if (!await acquireLock(files.lock, { pid: deps.pid, isProcessAlive: deps.isProcessAlive })) return Object.freeze({ state: "busy" });
   try {
     const prior = await readOpfJob({ paths });
     let attempt = prior && !TERMINAL.has(prior.state) && Number.isInteger(prior.attempt) ? prior.attempt : 0;
@@ -104,31 +105,6 @@ export async function runOpfJob({ paths, prepare, record, io, sleep = defaultSle
   }
 }
 
-async function acquireLock(lockPath, deps) {
-  for (let tries = 0; tries < 2; tries += 1) {
-    try {
-      const handle = await open(lockPath, "wx", 0o600);
-      try { await handle.writeFile(`${deps.pid}\n`); } finally { await handle.close(); }
-      return true;
-    } catch (error) {
-      if (error?.code !== "EEXIST") throw error;
-      const holder = await lockHolder(lockPath);
-      if (holder !== null && await deps.isProcessAlive(holder)) return false;
-      await rm(lockPath, { force: true });
-    }
-  }
-  return false;
-}
-
-async function lockHolder(lockPath) {
-  try {
-    const pid = Number.parseInt(await readFile(lockPath, "utf8"), 10);
-    return Number.isInteger(pid) && pid > 0 ? pid : null;
-  } catch {
-    return null;
-  }
-}
-
 async function writeJob(path, job) {
   const temporary = `${path}.${process.pid}.tmp`;
   await writeFile(temporary, `${JSON.stringify({ version: 1, ...job })}\n`, { mode: 0o600 });
@@ -137,15 +113,6 @@ async function writeJob(path, job) {
 
 function defaultSleep(ms) {
   return new Promise((settle) => setTimeout(settle, ms));
-}
-
-async function defaultIsProcessAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === "EPERM";
-  }
 }
 
 async function defaultSpawnJob({ lane }) {

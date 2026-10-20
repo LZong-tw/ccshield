@@ -7,7 +7,7 @@ import { provisionOpfPrivacy } from "./opf-privacy.mjs";
 import { buildOpfVenv } from "./opf-venv.mjs";
 import { doctorGitleaksWarnings, gitleaksOverride, installGitleaks, pinnedGitleaksSha256 } from "./gitleaks-install.mjs";
 import { detectPlatform } from "./platform.mjs";
-import { readShieldAssetsProvision, shieldAssetStore, writeShieldAssetsProvision } from "./paths.mjs";
+import { readShieldAssetsProvision, shieldAssetStore, updateShieldAssetsProvision } from "./paths.mjs";
 
 const UNSUPPORTED_NOTICE = "OPF is unsupported on this platform; Shield stays on regex + Gitleaks";
 const FALLBACK_NOTICE = "Shield is degraded: PII detection runs on the regex fallback until OPF is verified";
@@ -26,7 +26,7 @@ function defaults(io = {}) {
     pinnedGitleaksSha256: io.pinnedGitleaksSha256 ?? pinnedGitleaksSha256,
     exists: io.exists ?? (async (path) => access(path).then(() => true, () => false)),
     readAssets: io.readAssets ?? readShieldAssetsProvision,
-    writeAssets: io.writeAssets ?? writeShieldAssetsProvision,
+    updateAssets: io.updateAssets ?? updateShieldAssetsProvision,
     startOpfJob: io.startOpfJob ?? startOpfJob,
     liveOpfJob: io.liveOpfJob ?? liveOpfJob,
     readOpfJob: io.readOpfJob ?? readOpfJob,
@@ -133,22 +133,29 @@ function opfRecord(opf) {
 // rules, policy bundle, regex and privacy fields stay as provision wrote them.
 // A version-1 record has no regex worker, so it cannot be rewritten until
 // `ccshield privacy provision` runs again. Without an opf outcome the
-// recorded one is kept.
+// recorded one is kept. The merge runs under the record's lock, so a
+// provision that lands while the job runs keeps what it wrote.
 async function recordDetectorInstall({ paths, gitleaks, opf, deps }) {
-  const current = await deps.readAssets({ paths });
-  if (!current) return "skipped: no asset record; run ccshield privacy provision";
-  if (!current.regex) return "skipped: legacy asset record; rerun ccshield privacy provision";
-  const { opf: recordedOpf, ...rest } = current;
-  const nextOpf = opf ? opfRecord(opf) : recordedOpf;
-  await deps.writeAssets({
+  let outcome = "skipped: no asset record; run ccshield privacy provision";
+  await deps.updateAssets({
     paths,
-    state: {
-      ...rest,
-      ...(gitleaks ? { gitleaks: { origin: gitleaks.origin, version: gitleaks.version, path: gitleaks.path, sha256: gitleaks.sha256, rules: current.gitleaks.rules } } : {}),
-      ...(nextOpf ? { opf: nextOpf } : {}),
+    update: async (current) => {
+      if (!current) return undefined;
+      if (!current.regex) {
+        outcome = "skipped: legacy asset record; rerun ccshield privacy provision";
+        return undefined;
+      }
+      const { opf: recordedOpf, ...rest } = current;
+      const nextOpf = opf ? opfRecord(opf) : recordedOpf;
+      outcome = "written";
+      return {
+        ...rest,
+        ...(gitleaks ? { gitleaks: { origin: gitleaks.origin, version: gitleaks.version, path: gitleaks.path, sha256: gitleaks.sha256, rules: current.gitleaks.rules } } : {}),
+        ...(nextOpf ? { opf: nextOpf } : {}),
+      };
     },
   });
-  return "written";
+  return outcome;
 }
 
 // The background job's outcome lands in each lane record that exists.
