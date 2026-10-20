@@ -77,7 +77,7 @@ export async function startShieldDaemon({
       policy,
       readAssets: readAssetsProvision,
       createPrivacy,
-      onUpgradeFailure: () => process.stderr.write("ccshieldd: OPF probe failed; staying on the regex detector\n"),
+      onOpfFailure: () => process.stderr.write("ccshieldd: OPF is unusable; staying on the regex detector\n"),
     });
     recorder = await createDecisionRecorder({ config, paths, policy, assets });
     if (typeof recorder?.recordShieldDecision !== "function") throw new Error("shield audit recorder is unavailable");

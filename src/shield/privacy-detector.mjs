@@ -5,8 +5,9 @@ import { probePrivacyFilter } from "./privacy.mjs";
 // signed policy must name the installed regex worker as its fallback, or the
 // daemon refuses to start. While on regex, `refresh()` re-reads the store at
 // most once per `recheckMs` and swaps OPF in after it passes a live probe, so
-// a finished background download takes effect without a restart. A probe
-// failure leaves regex active and is not retried until the store changes.
+// a finished background download takes effect without a restart. An OPF that
+// fails to open or probe, at start or mid-run, leaves regex active and is not
+// retried until the store changes.
 export async function openPrivacyDetector({
   paths,
   assets,
@@ -16,24 +17,31 @@ export async function openPrivacyDetector({
   probe = probePrivacyFilter,
   clock = Date.now,
   recheckMs = 5_000,
-  onUpgradeFailure = () => {},
+  onOpfFailure = () => {},
 } = {}) {
   const expected = policy.detectorVersions.privacy;
   const usableOpf = (privacy) => privacy?.state === "verified" && privacy.version === expected;
 
+  const fallback = policy.detectorFallbacks?.privacy;
+  const regexAllowed = Boolean(assets.regex) && fallback !== undefined && fallback === assets.regex.version;
+
   let opf = null;
   let regex = null;
+  let failedState = null;
   if (usableOpf(assets.privacy)) {
-    opf = await createPrivacy({ provision: { privacy: assets.privacy } });
-    if (opf?.version !== expected) {
-      opf?.close?.();
-      throw new Error("shield privacy version does not match policy metadata");
+    try {
+      opf = await openOpf(assets.privacy);
+    } catch (error) {
+      // A record can outlive the files it names (an upgrade whose self-test
+      // failed, a pruned store). With a signed fallback that is a degraded
+      // start, not a refusal; the same record is not retried until it changes.
+      if (!regexAllowed) throw error;
+      failedState = JSON.stringify(assets.privacy);
+      try { onOpfFailure(error); } catch {}
     }
-  } else {
-    const fallback = policy.detectorFallbacks?.privacy;
-    if (!assets.regex || fallback === undefined || fallback !== assets.regex.version) {
-      throw new Error("shield privacy version does not match policy metadata");
-    }
+  }
+  if (!opf) {
+    if (!regexAllowed) throw new Error("shield privacy version does not match policy metadata");
     regex = await createPrivacy({ provision: { privacy: assets.regex } });
     if (regex?.version !== fallback) {
       regex?.close?.();
@@ -44,8 +52,16 @@ export async function openPrivacyDetector({
   let closed = false;
   let upgrading = null;
   let lastCheck = clock();
-  let failedState = null;
   const current = () => opf ?? regex;
+
+  async function openOpf(privacy) {
+    const filter = await createPrivacy({ provision: { privacy } });
+    if (filter?.version !== expected) {
+      filter?.close?.();
+      throw new Error("shield privacy version does not match policy metadata");
+    }
+    return filter;
+  }
 
   const upgrade = async () => {
     const next = await readAssets({ paths });
@@ -54,8 +70,7 @@ export async function openPrivacyDetector({
     if (signature === failedState) return;
     let filter = null;
     try {
-      filter = await createPrivacy({ provision: { privacy: next.privacy } });
-      if (filter?.version !== expected) throw new Error("shield privacy version does not match policy metadata");
+      filter = await openOpf(next.privacy);
       await probe(filter, { opf: true });
     } catch (error) {
       failedState = signature;
@@ -76,7 +91,7 @@ export async function openPrivacyDetector({
       if (closed || opf || upgrading || clock() - lastCheck < recheckMs) return upgrading ?? undefined;
       lastCheck = clock();
       upgrading = upgrade()
-        .catch((error) => { try { onUpgradeFailure(error); } catch {} })
+        .catch((error) => { try { onOpfFailure(error); } catch {} })
         .finally(() => { upgrading = null; });
       return upgrading;
     },

@@ -32,7 +32,7 @@ function harness({ assets, stored = assets, probe = async () => {}, failures = [
     probe,
     clock: () => now,
     recheckMs: 1000,
-    onUpgradeFailure: (error) => failures.push(error.message),
+    onOpfFailure: (error) => failures.push(error.message),
   });
   return { detector, log, state, created, advance: (ms) => { now += ms; } };
 }
@@ -122,4 +122,45 @@ test("OPF recorded for a different privacy version is never swapped in", async (
   await privacy.refresh();
   assert.deepEqual(created, ["regex-v1"]);
   assert.equal(privacy.detectorVersions().privacy, "regex-v1");
+});
+
+test("a recorded OPF that no longer opens starts the daemon on the signed regex fallback", async () => {
+  const failures = [];
+  const created = [];
+  let stored = { privacy: opfAssets, regex: regexAssets };
+  let now = 0;
+  const privacy = await openPrivacyDetector({
+    assets: stored,
+    policy,
+    readAssets: async () => stored,
+    createPrivacy: async ({ provision }) => {
+      created.push(provision.privacy.version);
+      if (provision.privacy.version === "privacy-1") throw new Error("shield privacy worker validation failed");
+      return fakeFilter(provision.privacy.version, []);
+    },
+    probe: async () => {},
+    clock: () => now,
+    recheckMs: 1000,
+    onOpfFailure: (error) => failures.push(error.message),
+  });
+  assert.equal(privacy.detectorVersions().privacy, "regex-v1");
+  assert.deepEqual(failures, ["shield privacy worker validation failed"]);
+
+  now += 1000;
+  await privacy.refresh();
+  assert.deepEqual(created, ["privacy-1", "regex-v1"], "the same broken record is not reopened");
+
+  stored = { privacy: { ...opfAssets, worker: { ...opfAssets.worker, sha256: "c".repeat(64) } }, regex: regexAssets };
+  now += 1000;
+  await privacy.refresh();
+  assert.deepEqual(created, ["privacy-1", "regex-v1", "privacy-1"], "a changed record is tried again");
+});
+
+test("a recorded OPF that no longer opens still refuses to start without a signed fallback", async () => {
+  await assert.rejects(openPrivacyDetector({
+    assets: { privacy: opfAssets, regex: regexAssets },
+    policy: { ...policy, detectorFallbacks: undefined },
+    readAssets: async () => null,
+    createPrivacy: async () => { throw new Error("shield privacy worker validation failed"); },
+  }), /worker validation failed/);
 });
