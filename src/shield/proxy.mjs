@@ -47,7 +47,10 @@ const INTERNAL_HEADERS = new Set([
   "x-airkit-shield-control",
   "x-airkit-shield-approval",
   "x-airkit-shield-approval-socket",
+  "x-airkit-shield-launch",
 ]);
+const MAX_APPROVAL_CHANNELS = 32;
+const LAUNCH_ID = /^[a-f0-9]{32}$/;
 
 export async function startShieldProxy({ capability, controlCapability, targetOrigin, allowDestinationLeases = false, decide, decisionCache = null, decisionContext = null, approvalBroker = null, recordShieldDecision = null, onDecision = null, isReady = null, scanStats = null, scanTotals = null, now = Date.now, port = 0 } = {}) {
   assertCapability(capability);
@@ -70,11 +73,11 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
   if (decisionCache !== null && (typeof decisionCache.getOrCompute !== "function" || !validDecisionContext(resolveDecisionContext(decisionContext)))) {
     throw new TypeError("shield decision cache configuration is invalid");
   }
-  const approvalRegistration = { channel: null };
+  const approvalChannels = new Map();
   const destinationLeases = new Map();
   const failures = [];
   const server = createServer((request, response) => {
-    void handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision: record, isReady, approvalRegistration, now, failures, scanStats, scanTotals });
+    void handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision: record, isReady, approvalChannels, now, failures, scanStats, scanTotals });
   });
   await listenLoopback(server, port);
   const address = server.address();
@@ -88,7 +91,7 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
   };
 }
 
-async function handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision, isReady, approvalRegistration, now, failures, scanStats, scanTotals }) {
+async function handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision, isReady, approvalChannels, now, failures, scanStats, scanTotals }) {
   const startedAt = Date.now();
   const fail = (stage, reason, bytes = 0) => recordFailure(failures, { stage, reason, bytes, elapsedMs: Date.now() - startedAt });
   if (isDiagnosticsPath(request.url)) {
@@ -197,18 +200,22 @@ async function handleShieldRequest({ request, response, capability, controlCapab
       return;
     }
     if (request.method === "DELETE") {
-      request.resume();
-      approvalRegistration.channel = null;
+      const launchId = await readApprovalUnregistration(request);
+      if (launchId === null) {
+        await finish(response, { status: 403, code: "shield_blocked" });
+        return;
+      }
+      approvalChannels.delete(launchId);
       response.writeHead(204, { "cache-control": "no-store" });
       response.end();
       return;
     }
-    const channel = await readApprovalRegistration(request);
-    if (channel === null || approvalRegistration.channel !== null) {
+    const registration = await readApprovalRegistration(request);
+    if (registration === null || approvalChannels.has(registration.launchId) || approvalChannels.size >= MAX_APPROVAL_CHANNELS) {
       await finish(response, { status: 403, code: "shield_blocked" });
       return;
     }
-    approvalRegistration.channel = channel;
+    approvalChannels.set(registration.launchId, registration.channel);
     response.writeHead(204, { "cache-control": "no-store" });
     response.end();
     return;
@@ -272,7 +279,7 @@ async function handleShieldRequest({ request, response, capability, controlCapab
     permitted = true;
   }
   if (decision?.action === "require_approval") {
-    permitted = await approveRequest({ approvalBroker, approvalChannel: approvalRegistration.channel, decision, inspection, auditDecision, signal: lifecycle.signal });
+    permitted = await approveRequest({ approvalBroker, approvalChannel: launchApprovalChannel(approvalChannels, request.headers["x-airkit-shield-launch"]), decision, inspection, auditDecision, signal: lifecycle.signal });
     auditDecision.override = permitted;
   }
   try {
@@ -405,7 +412,27 @@ function mediaFields(decision) {
   return Object.fromEntries(MEDIA_FIELDS.filter((key) => decision && Object.hasOwn(decision, key)).map((key) => [key, decision[key]]));
 }
 
+function launchApprovalChannel(approvalChannels, launchId) {
+  return typeof launchId === "string" && LAUNCH_ID.test(launchId) ? approvalChannels.get(launchId) ?? null : null;
+}
+
 async function readApprovalRegistration(request) {
+  const value = await readSmallJson(request);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (Object.keys(value).some((key) => !["socketPath", "capability", "launchId"].includes(key))) return null;
+  const { launchId, ...rest } = value;
+  if (typeof launchId !== "string" || !LAUNCH_ID.test(launchId)) return null;
+  const channel = readApprovalChannelRegistration(rest);
+  return channel === null ? null : { launchId, channel };
+}
+
+async function readApprovalUnregistration(request) {
+  const value = await readSmallJson(request);
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length !== 1) return null;
+  return typeof value.launchId === "string" && LAUNCH_ID.test(value.launchId) ? value.launchId : null;
+}
+
+async function readSmallJson(request) {
   const chunks = [];
   let bytes = 0;
   try {
@@ -415,7 +442,7 @@ async function readApprovalRegistration(request) {
       if (bytes > 16 * 1024) return null;
       chunks.push(buffer);
     }
-    return readApprovalChannelRegistration(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
   } catch {
     return null;
   }

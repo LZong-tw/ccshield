@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
@@ -303,15 +303,16 @@ export async function launchShieldChild({ command, args = [], ready, env = proce
   if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string" || arg.includes("\0"))) throw new Error("shield launch arguments must be strings");
   assertNoShieldEndpointOverride(args, ready?.origin);
   await assertNoPersistedShieldEndpointOverride(ready?.origin, env);
+  const launchId = createShieldLaunchId();
   const channel = await openShieldApprovalChannel({ approvalBroker, createApprovalChannel: createChannel });
   let registered = false;
   try {
     if (channel !== null) {
-      await registerChannel({ ready, channel });
+      await registerChannel({ ready, channel, launchId });
       registered = true;
     }
     const child = spawnChild(command, args, {
-      env: buildShieldChildEnv(ready, env),
+      env: buildShieldChildEnv(ready, env, launchId),
       shell: false,
       stdio: "inherit",
     });
@@ -320,18 +321,27 @@ export async function launchShieldChild({ command, args = [], ready, env = proce
       child.once("close", (code, signal) => resolvePromise({ code, signal }));
     });
   } finally {
-    if (registered) await unregisterChannel({ ready }).catch(() => {});
+    if (registered) await unregisterChannel({ ready, launchId }).catch(() => {});
     await channel?.close?.();
   }
+}
+
+export function createShieldLaunchId() {
+  return randomBytes(16).toString("hex");
+}
+
+function assertShieldLaunchId(launchId) {
+  if (typeof launchId !== "string" || !/^[a-f0-9]{32}$/.test(launchId)) throw new Error("shield launch id is invalid");
 }
 
 export async function openShieldApprovalChannel({ approvalBroker, createApprovalChannel: createChannel = createLauncherApprovalChannel } = {}) {
   return await createChannel({ broker: approvalBroker ?? createApprovalBroker({ tty: defaultApprovalTty() }) });
 }
 
-export async function registerShieldApprovalChannel({ ready, channel, paths, io, fetchImpl = fetch } = {}) {
+export async function registerShieldApprovalChannel({ ready, channel, launchId, paths, io, fetchImpl = fetch } = {}) {
   if (!ready?.origin || !ready?.capability || channel === null || channel === undefined) throw new Error("shield approval registration requires a fresh ready identity");
-  const registration = approvalChannelRegistration(channel);
+  assertShieldLaunchId(launchId);
+  const registration = { ...approvalChannelRegistration(channel), launchId };
   const config = await readShieldConfig({ paths: paths ?? shieldPaths({ lane: ready.lane }), io });
   let response;
   try {
@@ -346,12 +356,14 @@ export async function registerShieldApprovalChannel({ ready, channel, paths, io,
   if (response?.status !== 204) throw new Error("shield approval registration failed");
 }
 
-export async function unregisterShieldApprovalChannel({ ready, paths, io, fetchImpl = fetch } = {}) {
+export async function unregisterShieldApprovalChannel({ ready, launchId, paths, io, fetchImpl = fetch } = {}) {
   if (!ready?.origin) return;
+  assertShieldLaunchId(launchId);
   const config = await readShieldConfig({ paths: paths ?? shieldPaths({ lane: ready.lane }), io });
   const response = await fetchImpl(`${ready.origin}/_airkit/shield/approval-channel`, {
     method: "DELETE",
-    headers: { "x-airkit-shield-control": config.controlCapability },
+    headers: { "x-airkit-shield-control": config.controlCapability, "content-type": "application/json" },
+    body: JSON.stringify({ launchId }),
   }).catch(() => null);
   if (response?.status !== 204) throw new Error("shield approval unregister failed");
 }
@@ -392,13 +404,14 @@ export async function renewShieldDestinationLease({ ready, targetOrigin, paths, 
   return response?.status === 204;
 }
 
-export function buildShieldChildEnv(ready, env = process.env) {
+export function buildShieldChildEnv(ready, env = process.env, launchId) {
   if (!ready?.origin || !ready?.capability || ready.targetClass !== ready.lane || (ready.lane !== "subscription" && ready.lane !== "managed")) {
     throw new Error("shield launch requires a fresh lane-bound loopback identity");
   }
   if (/[\r\n]/.test(ready.capability)) {
     throw new Error("shield capability cannot be represented as an HTTP header");
   }
+  if (launchId !== undefined) assertShieldLaunchId(launchId);
   const keptHeaders = String(env.ANTHROPIC_CUSTOM_HEADERS ?? "")
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -408,7 +421,11 @@ export function buildShieldChildEnv(ready, env = process.env) {
     ANTHROPIC_API_BASE_URL: ready.origin,
     ANTHROPIC_BASE_URL: ready.origin,
     CLAUDE_AGENT_API_BASE_URL: ready.origin,
-    ANTHROPIC_CUSTOM_HEADERS: [...keptHeaders, `x-airkit-shield: ${ready.capability}`].join("\n"),
+    ANTHROPIC_CUSTOM_HEADERS: [
+      ...keptHeaders,
+      `x-airkit-shield: ${ready.capability}`,
+      ...(launchId === undefined ? [] : [`x-airkit-shield-launch: ${launchId}`]),
+    ].join("\n"),
   };
   for (const name of ["CCSHIELD_CONTROL_CAPABILITY", "CCSHIELD_APPROVAL_CAPABILITY", "CCSHIELD_APPROVAL_SOCKET", "CCSHIELD_CAPABILITY"]) {
     for (const key of envNamesFor(name)) delete childEnv[key];

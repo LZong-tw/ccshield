@@ -719,7 +719,7 @@ test("AirKit keeps capability out of argv and injects Claude's Shield transport 
       ANTHROPIC_API_BASE_URL: "https://stale-provider.invalid",
       ANTHROPIC_BASE_URL: "https://stale-provider.invalid",
       CLAUDE_AGENT_API_BASE_URL: "https://stale-provider.invalid",
-      ANTHROPIC_CUSTOM_HEADERS: "x-tenant: fixture\nX-AirKit-Shield: stale-capability",
+      ANTHROPIC_CUSTOM_HEADERS: "x-tenant: fixture\nX-AirKit-Shield: stale-capability\nx-airkit-shield-launch: ffffffffffffffffffffffffffffffff",
       CLAUDE_CODE_OAUTH_TOKEN: "subscription-oauth-sentinel",
       PATH: "/usr/bin",
     },
@@ -734,10 +734,11 @@ test("AirKit keeps capability out of argv and injects Claude's Shield transport 
   assert.equal(calls[0].options.env.ANTHROPIC_API_BASE_URL, "http://127.0.0.1:8811");
   assert.equal(calls[0].options.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8811");
   assert.equal(calls[0].options.env.CLAUDE_AGENT_API_BASE_URL, "http://127.0.0.1:8811");
-  assert.equal(
+  assert.match(
     calls[0].options.env.ANTHROPIC_CUSTOM_HEADERS,
-    `x-tenant: fixture\nx-airkit-shield: ${capability}`,
+    new RegExp(`^x-tenant: fixture\\nx-airkit-shield: ${capability}\\nx-airkit-shield-launch: [0-9a-f]{32}$`),
   );
+  assert.equal(calls[0].options.env.ANTHROPIC_CUSTOM_HEADERS.includes("f".repeat(32)), false);
   assert.equal(calls[0].options.env.AIRKIT_SHIELD_CAPABILITY, undefined);
   assert.equal(calls[0].options.env.CLAUDE_CODE_OAUTH_TOKEN, "subscription-oauth-sentinel");
   assert.equal(calls[0].args.includes(capability), false);
@@ -1054,6 +1055,35 @@ test("sequential interactive Shield children unregister each approval channel be
     "register:/tmp/approval-one.sock", "unregister", "close:one",
     "register:/tmp/approval-two.sock", "unregister", "close:two",
   ]);
+});
+
+test("each Shield launch registers, routes, and unregisters its own fresh launch id", async () => {
+  const ready = { origin: "http://127.0.0.1:8811", capability: "c".repeat(32), lane: "subscription", targetClass: "subscription" };
+  const launches = [];
+  for (let index = 0; index < 2; index += 1) {
+    const seen = {};
+    await launchShieldChild({
+      command: "echo",
+      ready,
+      env: { PATH: "/usr/bin" },
+      createApprovalChannel: async () => ({ socketPath: `/tmp/approval-${index}.sock`, capability: "a".repeat(32), async close() {} }),
+      registerApprovalChannel: async ({ launchId }) => { seen.registered = launchId; },
+      unregisterApprovalChannel: async ({ launchId }) => { seen.unregistered = launchId; },
+      spawnChild: (_command, _args, options) => {
+        seen.header = /^x-airkit-shield-launch: (.*)$/m.exec(options.env.ANTHROPIC_CUSTOM_HEADERS)?.[1];
+        const child = new EventEmitter();
+        queueMicrotask(() => child.emit("close", 0, null));
+        return child;
+      },
+    });
+    launches.push(seen);
+  }
+  for (const seen of launches) {
+    assert.match(seen.registered, /^[0-9a-f]{32}$/);
+    assert.equal(seen.unregistered, seen.registered);
+    assert.equal(seen.header, seen.registered);
+  }
+  assert.notEqual(launches[0].registered, launches[1].registered);
 });
 
 test("shield install applies lifecycle only with --write", async () => {

@@ -17,6 +17,8 @@ import { startShieldDaemon } from "../src/shieldd.mjs";
 
 const CAPABILITY = "c".repeat(32);
 const CONTROL_CAPABILITY = "d".repeat(32);
+const LAUNCH_A = "1".repeat(32);
+const LAUNCH_B = "2".repeat(32);
 // Worst case is 16 failures, 32 recent scans with a graph detail and saturated totals with every field at its bound: ~8.7 KB.
 const DIAGNOSTICS_MAX_BYTES = 12_288;
 
@@ -1143,11 +1145,12 @@ test("proxy obtains one approval through the launcher-registered private channel
     decide: async () => ({ action: "require_approval", reasonCodes: ["internal-subscription"], lane: "subscription", destinationClass: "subscription", bundleVersion: "policy-1", detectorVersions: { gitleaks: "8", privacy: "1" } }),
   });
   await registerApprovalChannel(shield, channel);
-  const headers = { "x-airkit-shield": CAPABILITY };
+  const headers = { "x-airkit-shield": CAPABILITY, "x-airkit-shield-launch": LAUNCH_A };
   assert.equal((await fetch(`${shield.origin}/v1/messages`, { method: "POST", headers, body: '{"content":"ordinary"}' })).status, 200);
   assert.equal((await fetch(`${shield.origin}/v1/messages`, { method: "POST", headers, body: '{"content":"ordinary"}' })).status, 403);
   assert.equal(upstreamHeaders["x-airkit-shield-approval"], undefined);
   assert.equal(upstreamHeaders["x-airkit-shield-approval-socket"], undefined);
+  assert.equal(upstreamHeaders["x-airkit-shield-launch"], undefined);
 });
 
 test("proxy blocks a client-spoofed approval socket even when it reports approval", async (t) => {
@@ -1184,6 +1187,7 @@ test("proxy blocks a client-spoofed approval socket even when it reports approva
     method: "POST",
     headers: {
       "x-airkit-shield": CAPABILITY,
+      "x-airkit-shield-launch": LAUNCH_A,
       "x-airkit-shield-approval-socket": attackerSocket,
       "x-airkit-shield-approval": "b".repeat(32),
     },
@@ -1193,7 +1197,7 @@ test("proxy blocks a client-spoofed approval socket even when it reports approva
   assert.equal(upstreamCalls, 0);
 });
 
-test("approval channel registration is control-only and can be replaced after lifecycle unregister", async (t) => {
+test("approval channel registration is control-only, launch-scoped, and rebindable after its own unregister", async (t) => {
   const firstDirectory = await mkdtemp("/tmp/as1-");
   const secondDirectory = await mkdtemp("/tmp/as2-");
   t.after(() => rm(firstDirectory, { recursive: true, force: true }));
@@ -1207,27 +1211,92 @@ test("approval channel registration is control-only and can be replaced after li
     targetOrigin: "https://api.anthropic.com",
     decide: async () => ({ action: "require_approval", reasonCodes: ["internal-subscription"], lane: "subscription", destinationClass: "subscription", bundleVersion: "policy-1", detectorVersions: { gitleaks: "8", privacy: "1" } }),
   });
-  await registerApprovalChannel(shield, first);
-  const secondWhileBound = await fetch(`${shield.origin}/_airkit/shield/approval-channel`, {
-    method: "POST", headers: { "x-airkit-shield-control": CONTROL_CAPABILITY, "content-type": "application/json" }, body: JSON.stringify(approvalChannelRegistration(second)),
-  });
-  assert.equal(secondWhileBound.status, 403);
-  const normalDelete = await fetch(`${shield.origin}/_airkit/shield/approval-channel`, { method: "DELETE", headers: { "x-airkit-shield": CAPABILITY } });
+  await registerApprovalChannel(shield, first, LAUNCH_A);
+  assert.equal((await postApprovalChannel(shield, { ...approvalChannelRegistration(second), launchId: LAUNCH_A })).status, 403);
+  assert.equal((await postApprovalChannel(shield, approvalChannelRegistration(second))).status, 403);
+  assert.equal((await postApprovalChannel(shield, { ...approvalChannelRegistration(second), launchId: "Z".repeat(32) })).status, 403);
+  assert.equal((await postApprovalChannel(shield, { ...approvalChannelRegistration(second), launchId: LAUNCH_B }, { "x-airkit-shield": CAPABILITY })).status, 401);
+  assert.equal((await postApprovalChannel(shield, { ...approvalChannelRegistration(second), launchId: LAUNCH_B })).status, 204);
+  const normalDelete = await deleteApprovalChannel(shield, LAUNCH_A, { "x-airkit-shield": CAPABILITY });
   assert.equal(normalDelete.status, 401);
-  const unregister = await fetch(`${shield.origin}/_airkit/shield/approval-channel`, { method: "DELETE", headers: { "x-airkit-shield-control": CONTROL_CAPABILITY } });
-  assert.equal(unregister.status, 204);
-  const secondRegistration = await fetch(`${shield.origin}/_airkit/shield/approval-channel`, {
-    method: "POST", headers: { "x-airkit-shield-control": CONTROL_CAPABILITY, "content-type": "application/json" }, body: JSON.stringify(approvalChannelRegistration(second)),
-  });
-  assert.equal(secondRegistration.status, 204);
+  assert.equal((await deleteApprovalChannel(shield, undefined)).status, 403);
+  assert.equal((await deleteApprovalChannel(shield, LAUNCH_A)).status, 204);
+  assert.equal((await postApprovalChannel(shield, { ...approvalChannelRegistration(first), launchId: LAUNCH_A })).status, 204);
 });
 
-async function registerApprovalChannel(shield, channel) {
-  const response = await fetch(`${shield.origin}/_airkit/shield/approval-channel`, {
-    method: "POST",
-    headers: { "x-airkit-shield-control": CONTROL_CAPABILITY, "content-type": "application/json" },
-    body: JSON.stringify(approvalChannelRegistration(channel)),
+test("proxy routes each approval to the launcher whose launch header sent the request", async (t) => {
+  let upstreamCalls = 0;
+  const upstream = await startFixture(t, (request, response) => { upstreamCalls += 1; request.resume(); response.end('{"ok":true}'); });
+  const prompts = [];
+  const channels = {};
+  for (const [name, capability] of [["A", "a"], ["B", "b"]]) {
+    const directory = await mkdtemp(join(tmpdir(), `airkit-shield-approval-${name}-`));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    channels[name] = await createApprovalChannel({
+      directory,
+      capability: capability.repeat(32),
+      broker: createApprovalBroker({ tty: { interactive: true, write() {}, prompt: async () => { prompts.push(name); return "y"; } } }),
+    });
+    t.after(() => channels[name].close());
+  }
+  const shield = await startShield(t, {
+    targetOrigin: upstream.origin,
+    decide: async () => ({ action: "require_approval", reasonCodes: ["internal-subscription"], lane: "subscription", destinationClass: "subscription", bundleVersion: "policy-1", detectorVersions: { gitleaks: "8", privacy: "1" } }),
   });
+  await registerApprovalChannel(shield, channels.A, LAUNCH_A);
+  await registerApprovalChannel(shield, channels.B, LAUNCH_B);
+  const send = (extra) => fetch(`${shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield": CAPABILITY, ...extra }, body: '{"content":"ordinary"}' });
+
+  // Each launcher channel answers exactly one approval, so every channel is used once.
+  assert.equal((await send({})).status, 403);
+  assert.equal((await send({ "x-airkit-shield-launch": "3".repeat(32) })).status, 403);
+  assert.equal((await send({ "x-airkit-shield-launch": "not-a-launch" })).status, 403);
+  assert.deepEqual(prompts, []);
+  assert.equal((await send({ "x-airkit-shield-launch": LAUNCH_A })).status, 200);
+  assert.deepEqual(prompts, ["A"]);
+
+  assert.equal((await deleteApprovalChannel(shield, LAUNCH_A)).status, 204);
+  assert.equal((await send({ "x-airkit-shield-launch": LAUNCH_A })).status, 403);
+  assert.equal((await send({ "x-airkit-shield-launch": LAUNCH_B })).status, 200);
+  assert.deepEqual(prompts, ["A", "B"]);
+  assert.equal(upstreamCalls, 2);
+});
+
+test("approval channel registrations are capped", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "airkit-shield-approval-cap-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const channel = await createApprovalChannel({
+    directory,
+    capability: "a".repeat(32),
+    broker: createApprovalBroker({ tty: { interactive: true, write() {}, prompt: async () => "n" } }),
+  });
+  t.after(() => channel.close());
+  const shield = await startShield(t, { targetOrigin: "https://api.anthropic.com", decide: async () => ({ action: "allow" }) });
+  const launchId = (index) => index.toString(16).padStart(32, "0");
+  for (let index = 0; index < 32; index += 1) await registerApprovalChannel(shield, channel, launchId(index));
+  assert.equal((await postApprovalChannel(shield, { ...approvalChannelRegistration(channel), launchId: launchId(32) })).status, 403);
+  assert.equal((await deleteApprovalChannel(shield, launchId(0))).status, 204);
+  await registerApprovalChannel(shield, channel, launchId(32));
+});
+
+async function postApprovalChannel(shield, body, headers = { "x-airkit-shield-control": CONTROL_CAPABILITY }) {
+  return await fetch(`${shield.origin}/_airkit/shield/approval-channel`, {
+    method: "POST",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+async function deleteApprovalChannel(shield, launchId, headers = { "x-airkit-shield-control": CONTROL_CAPABILITY }) {
+  return await fetch(`${shield.origin}/_airkit/shield/approval-channel`, {
+    method: "DELETE",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify(launchId === undefined ? {} : { launchId }),
+  });
+}
+
+async function registerApprovalChannel(shield, channel, launchId = LAUNCH_A) {
+  const response = await postApprovalChannel(shield, { ...approvalChannelRegistration(channel), launchId });
   assert.equal(response.status, 204);
 }
 
