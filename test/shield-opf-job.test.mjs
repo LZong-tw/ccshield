@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,7 +7,7 @@ import test from "node:test";
 
 import { runShieldCli } from "../src/shield/cli.mjs";
 import { doctorDetectorAssets, ensureOpfJob, fetchDetectorAssets } from "../src/shield/detectors.mjs";
-import { liveOpfJob, OPF_JOB_MAX_ATTEMPTS, opfJobFiles, readOpfJob, runOpfJob, startOpfJob } from "../src/shield/opf-job.mjs";
+import { liveOpfJob, OPF_JOB_ENTRY, OPF_JOB_MAX_ATTEMPTS, opfJobFiles, readOpfJob, runOpfJob, startOpfJob } from "../src/shield/opf-job.mjs";
 import { shieldPaths } from "../src/shield/paths.mjs";
 import { readShieldStatuslineState, shieldStatuslineSuffix } from "../src/shield/statusline-state.mjs";
 
@@ -309,5 +310,16 @@ test("statusline reads a live lock from the lane store", async () => {
     await writeLock(paths, process.pid);
     const state = await readShieldStatuslineState({ env: { HOME: home }, readOperationalStatus: async () => ({ lanes: [] }) });
     assert.equal(state.preparing, true);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+// The detached job is spawned by path, so that path must be the real CLI entry:
+// a module that is not the entrypoint exits 0 without running the job.
+test("the OPF job entry is the CLI entrypoint and dispatches __opf-job", async () => {
+  const home = await mkdtemp(join(tmpdir(), "ccshield-opf-entry-"));
+  try {
+    const run = spawnSync(process.execPath, [OPF_JOB_ENTRY, "__opf-job", "--lane", "bogus"], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+    assert.notEqual(run.status, 0);
+    assert.match(run.stderr, /ccshield:/);
   } finally { await rm(home, { recursive: true, force: true }); }
 });

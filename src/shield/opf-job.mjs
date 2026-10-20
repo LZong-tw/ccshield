@@ -7,7 +7,7 @@ import { shieldAssetStore } from "./paths.mjs";
 export const OPF_JOB_MAX_ATTEMPTS = 3;
 const BACKOFF_MS = Object.freeze([30_000, 120_000]);
 const TERMINAL = new Set(["verified", "failed", "unsupported"]);
-const CLI_PATH = fileURLToPath(new URL("./cli.mjs", import.meta.url));
+export const OPF_JOB_ENTRY = fileURLToPath(new URL("../cli.mjs", import.meta.url));
 
 // The first OPF install downloads ~3 GB and builds a torch venv, so install
 // and launch hand it to a detached job. The job owns assets/opf/job.lock while
@@ -149,7 +149,7 @@ async function defaultIsProcessAlive(pid) {
 }
 
 async function defaultSpawnJob({ lane }) {
-  const child = spawn(process.execPath, [CLI_PATH, "__opf-job", "--lane", lane], { detached: true, stdio: "ignore" });
+  const child = spawn(process.execPath, [OPF_JOB_ENTRY, "__opf-job", "--lane", lane], { detached: true, stdio: "ignore" });
   child.unref();
   return child.pid;
 }
