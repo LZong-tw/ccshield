@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, copyFile, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -32,29 +32,51 @@ export async function provisionOpfPrivacy({ paths, pins, bundle, sourceDir = DEF
 // The worker loads its adapter and Python helpers from its own directory and
 // must be executable, but the package ships them 0644 in a nested layout. The
 // job copies them flat into the bundle, so the provisioned worker lives in the
-// asset store next to the files it serves.
+// asset store next to the files it serves. The directory is named after the
+// staged bytes and never replaced: a daemon may be running the worker another
+// lane's job (or a foreground install) would otherwise overwrite under it.
 export async function stageOpfWorker({ bundleDir, sourceDir = DEFAULT_OPF_SOURCE_DIR }) {
-  const target = join(bundleDir, "worker");
-  const staging = `${target}.tmp-${process.pid}`;
-  const helpers = (await readdir(join(sourceDir, "python"))).filter((name) => name.endsWith(".py"));
-  await rm(staging, { recursive: true, force: true });
+  const helpers = (await readdir(join(sourceDir, "python"))).filter((name) => name.endsWith(".py")).sort();
+  const files = [
+    [WORKER_NAME, join(sourceDir, WORKER_NAME), 0o755],
+    ["opf-adapter.mjs", join(sourceDir, "opf-adapter.mjs"), 0o644],
+    ...helpers.map((name) => [name, join(sourceDir, "python", name), 0o644]),
+  ];
+  const digest = createHash("sha256");
+  const contents = [];
+  for (const [name, source, mode] of files) {
+    const bytes = await readFile(source);
+    digest.update(`${name}\0${mode}\0${bytes.length}\0`).update(bytes);
+    contents.push([name, bytes, mode]);
+  }
+  const target = join(bundleDir, `worker-${digest.digest("hex").slice(0, 16)}`);
+  if (await isDirectory(target)) return join(target, WORKER_NAME);
+  const staging = await mkdtemp(`${target}.tmp-`);
   try {
-    await mkdir(staging, { mode: 0o700 });
-    await copyFile(join(sourceDir, WORKER_NAME), join(staging, WORKER_NAME));
-    await chmod(join(staging, WORKER_NAME), 0o755);
-    await copyFile(join(sourceDir, "opf-adapter.mjs"), join(staging, "opf-adapter.mjs"));
-    await chmod(join(staging, "opf-adapter.mjs"), 0o644);
-    for (const name of helpers) {
-      await copyFile(join(sourceDir, "python", name), join(staging, name));
-      await chmod(join(staging, name), 0o644);
+    for (const [name, bytes, mode] of contents) {
+      await writeFile(join(staging, name), bytes, { mode, flag: "wx" });
+      await chmod(join(staging, name), mode);
     }
     await chmod(staging, 0o755);
-    await rm(target, { recursive: true, force: true });
-    await rename(staging, target);
+    try {
+      await rename(staging, target);
+    } catch (error) {
+      // Another stager landed the same bytes first.
+      if (!["ENOTEMPTY", "EEXIST"].includes(error?.code) || !await isDirectory(target)) throw error;
+    }
   } finally {
     await rm(staging, { recursive: true, force: true });
   }
   return join(target, WORKER_NAME);
+}
+
+async function isDirectory(path) {
+  try {
+    return (await lstat(path)).isDirectory();
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 export async function opfPrivacyManifest({ pins, bundle, workerPath }) {

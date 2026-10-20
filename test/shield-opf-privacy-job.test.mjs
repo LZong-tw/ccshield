@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import test from "node:test";
 
 import { prepareOpf, recordOpfOutcome } from "../src/shield/detectors.mjs";
 import { readOpfJob, runOpfJob } from "../src/shield/opf-job.mjs";
-import { provisionOpfPrivacy } from "../src/shield/opf-privacy.mjs";
+import { provisionOpfPrivacy, stageOpfWorker } from "../src/shield/opf-privacy.mjs";
 import { openPrivacyDetector } from "../src/shield/privacy-detector.mjs";
 import { provisionPrivacyRecord } from "../src/shield/provision.mjs";
 import { shieldAssetStore, shieldPaths } from "../src/shield/paths.mjs";
@@ -126,7 +126,9 @@ test("a successful first run provisions privacy and the running daemon swaps to 
   assert.equal(box.record.privacy.version, WORKER_VERSION);
   assert.deepEqual(box.record.regex, regexAssets);
   const worker = box.record.privacy.worker.command;
-  assert.equal(worker, join(bundle.dir, "worker", "privacy-opf-worker.mjs"));
+  assert.equal(dirname(dirname(worker)), bundle.dir);
+  assert.match(basename(dirname(worker)), /^worker-[0-9a-f]{16}$/);
+  assert.equal(basename(worker), "privacy-opf-worker.mjs");
   assert.equal((await stat(worker)).mode & 0o777, 0o755);
   assert.equal(box.record.privacy.checkpoint.path, join(bundle.checkpoint, "original"));
 
@@ -164,3 +166,18 @@ test("a checkpoint that drifted from its pin ends the job failed before any self
   assert.match(job.reason, /privacy provision failed/);
   assert.deepEqual(box.record.privacy, { state: "absent" });
 }));
+
+test("concurrent worker staging lands one copy and never replaces a worker a daemon may be running", async () => {
+  const bundleDir = await realpath(await mkdtemp(join(tmpdir(), "ccshield-stage-")));
+  try {
+    const paths = await Promise.all(Array.from({ length: 4 }, () => stageOpfWorker({ bundleDir })));
+    assert.equal(new Set(paths).size, 1);
+    const [worker] = paths;
+    const before = await stat(worker);
+    assert.equal(await stageOpfWorker({ bundleDir }), worker);
+    assert.equal((await stat(worker)).ino, before.ino);
+    assert.deepEqual((await readdir(bundleDir)).filter((name) => name.includes(".tmp-")), []);
+  } finally {
+    await rm(bundleDir, { recursive: true, force: true });
+  }
+});
