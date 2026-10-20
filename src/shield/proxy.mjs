@@ -8,6 +8,7 @@ const DIAGNOSTICS_PATH = "/_airkit/shield/diagnostics";
 const FAILURE_REASONS = new Map([
   ["body_read", new Set(["body_read_failed", "body_too_large"])],
   ["evaluation", new Set(["evaluation_unavailable"])],
+  ["media_scan", new Set(["media_scan_failed"])],
   ["secret_scan", new Set(["scanner_unavailable"])],
   ["privacy_scan", new Set([
     "privacy_unavailable", "worker_closed", "body_invalid", "admission_limit", "frame_limit", "queue_timeout",
@@ -377,7 +378,7 @@ async function cachedDecision({ decisionCache, decisionContext: contextSource, b
     const reasonCodes = validReasonCodes(decision?.reasonCodes)
       ? decision.reasonCodes
       : [action === "allow" ? "policy_allow" : "policy_blocked"];
-    return { ...key, action, reasonCodes, transformCount: decision?.transformCount ?? 0, body: redactedBody };
+    return { ...key, ...mediaFields(decision), action, reasonCodes, transformCount: decision?.transformCount ?? 0, body: redactedBody };
   }, { signal });
   if (!result || typeof result !== "object" || !["evaluated", "cache_hit", "coalesced"].includes(result.source)) {
     throw new Error("shield decision cache result provenance is invalid");
@@ -393,7 +394,15 @@ async function cachedDecision({ decisionCache, decisionContext: contextSource, b
     bundleVersion: decisionContext.policyVersion,
     detectorVersions: decisionContext.detectorVersions,
     decisionSource: result.source,
+    ...mediaFields(cached),
   };
+}
+
+const MEDIA_FIELDS = ["noCache", "imageCount", "documentCount", "mediaOutcome"];
+
+// Media facts ride along with the decision so the audit can record them; the audit validates their values.
+function mediaFields(decision) {
+  return Object.fromEntries(MEDIA_FIELDS.filter((key) => decision && Object.hasOwn(decision, key)).map((key) => [key, decision[key]]));
 }
 
 async function readApprovalRegistration(request) {
@@ -624,7 +633,13 @@ function buildDecisionMetadata(decision, startedAt) {
       : "evaluated",
     override: false,
     elapsedMs: Math.max(0, Date.now() - startedAt),
+    ...auditMediaFields(decision),
   };
+}
+
+function auditMediaFields(decision) {
+  const { noCache, ...media } = mediaFields(decision);
+  return media;
 }
 
 function resolveDecisionRecorder(recordShieldDecision, onDecision) {

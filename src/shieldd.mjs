@@ -13,6 +13,7 @@ import { loadShieldPolicy } from "./shield/policy.mjs";
 import { openPrivacyDetector } from "./shield/privacy-detector.mjs";
 import { createPrivacyFilter, isVerifiedRedaction } from "./shield/privacy.mjs";
 import { createShieldFailure as shieldFailure, startShieldProxy } from "./shield/proxy.mjs";
+import { extractMedia, mediaOutcomeFor } from "./shield/media.mjs";
 import { createDecisionCache } from "./shield/decision-cache.mjs";
 import { defaultShieldLauncherContext, readShieldConfig } from "./shield/service.mjs";
 import { createShieldDecisionRecorder } from "./shield/audit.mjs";
@@ -87,6 +88,28 @@ export async function startShieldDaemon({
         ...(requestLauncherContext ?? config.launcherContext ?? defaultShieldLauncherContext(destinationClass)),
         destinationClass,
       };
+      // Shield sees the original request, before pxpipe renders anything to images.
+      let media;
+      try {
+        media = extractMedia(body);
+      } catch {
+        throw shieldFailure("media_scan", "media_scan_failed", "shield media scan failed");
+      }
+      const hasMedia = media.imageCount > 0 || media.documentCount > 0 || media.reasonCodes.length > 0;
+      const mediaFacts = hasMedia
+        ? { noCache: true, imageCount: media.imageCount, documentCount: media.documentCount, mediaOutcome: mediaOutcomeFor(media.reasonCodes) ?? "none" }
+        : {};
+      const shape = (decision) => ({
+        ...decision,
+        ...mediaFacts,
+        lane: config.lane,
+        destinationClass,
+        bundleVersion: policy.version,
+        detectorVersions: { ...detectorVersions },
+      });
+      // Documents and unscannable images stop here, before any scanner sees them. Base64 images are
+      // forwarded unscanned in this phase; the text pipeline below still covers the rest of the body.
+      if (media.reasonCodes.length > 0) return shape({ action: "block", reasonCodes: media.reasonCodes, transformCount: 0 });
       const facts = classifyShieldRequest({ body, launcherContext });
       let secretScan;
       let confirmedSecret;
@@ -118,14 +141,10 @@ export async function startShieldDaemon({
       if (decision.action === "redact" && !isVerifiedRedaction({ original: body, result: privacyScan })) {
         throw shieldFailure("redaction", "redaction_invalid", "shield privacy redaction is invalid");
       }
-      return {
+      return shape({
         ...decision,
-        lane: config.lane,
-        destinationClass,
-        bundleVersion: policy.version,
-        detectorVersions: { ...detectorVersions },
         ...(decision.action === "redact" ? { redactedBody: privacyScan.redactedBody, transformCount: privacyScan.redactions.reduce((total, item) => total + item.count, 0) } : {}),
-      };
+      });
     };
 
     await writePolicyState({ paths, state: { version: policy.version, detectorVersions: policy.detectorVersions } });

@@ -1,5 +1,7 @@
 const ACTIONS = new Set(["allow", "block", "require_approval", "redact"]);
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
+// The audit validates the media values; the cache only carries them.
+const MEDIA_FIELDS = ["noCache", "imageCount", "documentCount", "mediaOutcome"];
 
 export function createDecisionCache({ clock = () => Date.now(), ttlMs = 30_000, maxEntries = 128 } = {}) {
   if (typeof clock !== "function") throw new TypeError("shield decision cache clock is invalid");
@@ -70,6 +72,8 @@ export function createDecisionCache({ clock = () => Date.now(), ttlMs = 30_000, 
       flight.pending = Promise.resolve().then(() => compute(flight.controller.signal)).then((decision) => {
           if (keyFor(decision) !== key) throw new Error("shield decision cache computed identity mismatch");
           if (computeGeneration !== generation) throw new Error("shield decision cache computation was invalidated");
+          // Coalesced callers still share this result; it just never outlives the flight.
+          if (decision.noCache === true) return cloneDecision(validateDecision(decision));
           return write(decision);
         }).finally(() => {
           if (inflight.get(key) === flight) inflight.delete(key);
@@ -107,7 +111,9 @@ function validateDecision(value) {
     throw new TypeError("shield decision cache reason codes are invalid");
   }
   if (value.action !== "redact" && value.body.byteLength !== 0) throw new TypeError("shield decision cache may retain only a transformed body");
-  return Object.freeze({ ...key, action: value.action, reasonCodes: [...value.reasonCodes], transformCount: value.transformCount, body: Buffer.from(value.body) });
+  if (Object.hasOwn(value, "noCache") && typeof value.noCache !== "boolean") throw new TypeError("shield decision cache noCache flag is invalid");
+  const media = Object.fromEntries(MEDIA_FIELDS.filter((field) => Object.hasOwn(value, field)).map((field) => [field, value[field]]));
+  return Object.freeze({ ...key, ...media, action: value.action, reasonCodes: [...value.reasonCodes], transformCount: value.transformCount, body: Buffer.from(value.body) });
 }
 
 function stableVersions(value) {

@@ -9,6 +9,7 @@ import { createDefaultDecisionRecorder, startShieldDaemon } from "../src/shieldd
 import { canonicalJson } from "../src/shield/policy-bundle.mjs";
 import { createPrivacyFilter } from "../src/shield/privacy.mjs";
 import { startShieldProxy } from "../src/shield/proxy.mjs";
+import { createShieldDecisionRecorder } from "../src/shield/audit.mjs";
 
 const config = {
   capability: "c".repeat(32),
@@ -647,6 +648,124 @@ test("daemon blocks every privacy worker failure before a real upstream fetch", 
     await daemon.shield.close();
     await new Promise((resolve) => upstream.close(resolve));
   }
+});
+
+const PNG_BASE64 = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(24, 7)]).toString("base64");
+const mediaBody = (...content) => Buffer.from(JSON.stringify({ model: "claude-sonnet-5", messages: [{ role: "user", content: [{ type: "text", text: "look" }, ...content] }] }));
+const pngBlock = { type: "image", source: { type: "base64", media_type: "image/png", data: PNG_BASE64 } };
+const pdfBlock = { type: "document", source: { type: "base64", media_type: "application/pdf", data: Buffer.from("%PDF-1.7 fake").toString("base64") } };
+
+async function mediaDecide() {
+  const calls = { scanner: 0, privacy: 0, policy: 0 };
+  let decide;
+  await startDaemon({
+    config,
+    paths,
+    readPolicyBundle: async () => ({ bundle: {}, publicKey: "pinned-ed25519-public-key" }),
+    createPrivacy: async () => ({ version: "privacy-1", async scan() { calls.privacy += 1; return { status: "ok", findings: [], redactions: [] }; }, close() {} }),
+    createScanner: async () => ({ version: "8.24.0", scan: async () => { calls.scanner += 1; return { findings: [] }; } }),
+    loadPolicy: async () => ({
+      version: "2026.09.02.4",
+      detectorVersions: { gitleaks: "8.24.0", privacy: "privacy-1" },
+      async evaluate() { calls.policy += 1; return { action: "allow", reasonCodes: ["policy_allow"], approvalEligible: false, redactions: [] }; },
+    }),
+    writePolicyState: async () => {},
+    startProxy: async (options) => { decide = options.decide; return { origin: "http://127.0.0.1:8811", close: async () => {} }; },
+    writeIdentity: async () => {},
+  });
+  return { calls, decide: (body) => decide({ body }) };
+}
+
+test("daemon blocks a document before any scanner runs and marks the decision uncacheable", async () => {
+  const { calls, decide } = await mediaDecide();
+  const decision = await decide(mediaBody(pdfBlock));
+  assert.equal(decision.action, "block");
+  assert.deepEqual(decision.reasonCodes, ["media_document_blocked"]);
+  assert.equal(decision.noCache, true);
+  assert.equal(decision.documentCount, 1);
+  assert.equal(decision.imageCount, 0);
+  assert.equal(decision.mediaOutcome, "blocked_document");
+  assert.equal(decision.transformCount, 0);
+  assert.equal(decision.lane, "subscription");
+  assert.equal(decision.bundleVersion, "2026.09.02.4");
+  assert.deepEqual(calls, { scanner: 0, privacy: 0, policy: 0 });
+});
+
+test("daemon blocks an image it cannot inspect by source", async () => {
+  const { calls, decide } = await mediaDecide();
+  const decision = await decide(mediaBody({ type: "image", source: { type: "url", url: "https://example.invalid/a.png" } }));
+  assert.equal(decision.action, "block");
+  assert.deepEqual(decision.reasonCodes, ["media_image_source_blocked"]);
+  assert.equal(decision.mediaOutcome, "blocked_source");
+  assert.equal(decision.noCache, true);
+  assert.deepEqual(calls, { scanner: 0, privacy: 0, policy: 0 });
+});
+
+test("daemon forwards base64 images unscanned through the normal text pipeline, uncached", async () => {
+  const { calls, decide } = await mediaDecide();
+  const decision = await decide(mediaBody(pngBlock, pngBlock));
+  assert.equal(decision.action, "allow");
+  assert.equal(decision.noCache, true);
+  assert.equal(decision.imageCount, 2);
+  assert.equal(decision.documentCount, 0);
+  assert.equal(decision.mediaOutcome, "none");
+  assert.deepEqual(calls, { scanner: 1, privacy: 1, policy: 1 });
+});
+
+test("daemon leaves media-free decisions cacheable and without media fields", async () => {
+  const { decide } = await mediaDecide();
+  const decision = await decide(mediaBody());
+  assert.equal(decision.action, "allow");
+  for (const key of ["noCache", "imageCount", "documentCount", "mediaOutcome"]) assert.equal(Object.hasOwn(decision, key), false, key);
+});
+
+test("a media walk failure is a media_scan shield failure, not a block or an allow", async () => {
+  const { calls, decide } = await mediaDecide();
+  const deep = Buffer.from(`{"messages":${"[".repeat(600)}${"]".repeat(600)}}`);
+  await assert.rejects(decide(deep), (error) => error.shieldFailure?.stage === "media_scan" && error.shieldFailure?.reason === "media_scan_failed");
+  assert.deepEqual(calls, { scanner: 0, privacy: 0, policy: 0 });
+});
+
+test("a document block through the real proxy is an audited 403 with media columns, every time", async (t) => {
+  let upstreamCalls = 0;
+  const upstream = createServer((request, response) => { upstreamCalls += 1; request.resume(); response.end("{}"); });
+  upstream.listen(0, "127.0.0.1");
+  await once(upstream, "listening");
+  t.after(() => new Promise((resolve) => upstream.close(resolve)));
+  const events = [];
+  const recorder = createShieldDecisionRecorder({ store: { recordEvent: (event) => events.push(event) } });
+  const daemon = await startDaemon({
+    config: { ...config, targetOrigin: `http://127.0.0.1:${upstream.address().port}` },
+    paths,
+    readPolicyBundle: async () => ({ bundle: {}, publicKey: "pinned-ed25519-public-key" }),
+    createDecisionRecorder: async () => recorder,
+    createScanner: async () => ({ version: "8.24.0", scan: async () => ({ findings: [] }) }),
+    loadPolicy: async () => ({ version: "2026.09.02.4", detectorVersions: { gitleaks: "8.24.0", privacy: "privacy-1" }, async evaluate() { return { action: "allow", reasonCodes: ["policy_allow"], redactions: [] }; } }),
+    writePolicyState: async () => {},
+    writeIdentity: async () => {},
+  });
+  t.after(() => daemon.shield.close());
+  const send = (body) => fetch(`${daemon.shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield": config.capability, "content-type": "application/json" }, body });
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const response = await send(mediaBody(pdfBlock));
+    assert.equal(response.status, 403);
+    assert.deepEqual(await response.json(), { error: { code: "shield_blocked" } });
+  }
+  assert.equal((await send(mediaBody(pngBlock))).status, 200);
+
+  assert.equal(upstreamCalls, 1);
+  assert.deepEqual(events.map((event) => event.payload.decision_source), ["evaluated", "evaluated", "evaluated"]);
+  const [blocked, , image] = events.map((event) => event.payload);
+  assert.equal(blocked.action, "block");
+  assert.deepEqual(blocked.reasons, ["media_document_blocked"]);
+  assert.equal(blocked.media_outcome, "blocked_document");
+  assert.equal(blocked.document_count, 1);
+  assert.equal(blocked.image_count, 0);
+  assert.equal(image.action, "allow");
+  assert.equal(image.media_outcome, "none");
+  assert.equal(image.image_count, 1);
+  assert.doesNotMatch(JSON.stringify(events), /JVBER|example\.invalid|iVBOR/);
 });
 
 function assetsProvision() {
