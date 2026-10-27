@@ -88,6 +88,14 @@ export async function doctorGitleaksWarnings(recorded, pins, { pinnedSha256, has
   try { current = await hashFile(recorded.path); } catch { /* reported below */ }
   if (current === null) warnings.push(`shield Gitleaks binary at ${recorded.path} is missing`);
   else if (current !== recorded.sha256) warnings.push(`shield Gitleaks binary at ${recorded.path} changed since it was recorded`);
+  // Store copies never follow an upgrade of what they were copied from; say so.
+  for (const [label, entry] of [["Gitleaks binary", recorded], ["Gitleaks rules", recorded.rules]]) {
+    if (typeof entry?.source !== "string") continue;
+    let source = null;
+    try { source = await hashFile(entry.source); } catch { /* reported below */ }
+    if (source === null) warnings.push(`shield ${label} was copied from ${entry.source}, which no longer exists; shield keeps using its stored copy. Run \`ccshield install --write\` to pick up the current one`);
+    else if (source !== entry.sha256) warnings.push(`shield ${label} at ${entry.source} was updated, but shield still uses its older stored copy. Run \`ccshield install --write\` to switch`);
+  }
   return Object.freeze(warnings);
 }
 

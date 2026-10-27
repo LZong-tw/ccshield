@@ -32,6 +32,10 @@ const rulesDigest = sha256(bytes[gitleaksRulesPath]);
 // Fixture runs have no home directory, so they name the store and skip the regex install.
 const storeRoot = "/opt/ccshield/store";
 const installRegex = async () => {};
+const adopted = [];
+const adopt = async ({ target }) => { adopted.push(target); return target; };
+const storedGitleaks = join(storeRoot, "gitleaks-override", sha256(bytes[gitleaksPath]), "gitleaks");
+const storedRules = join(storeRoot, "gitleaks-rules", rulesDigest, "gitleaks-rules.toml");
 
 test("asset provision previews without writes and only records opaque references after explicit write", async () => {
   const writes = [];
@@ -53,8 +57,9 @@ test("asset provision previews without writes and only records opaque references
     bundle: { version: "policy-1", sha256: sha256(bytes[policyPath]), path: policyPath },
     gitleaks: {
       sha256: sha256(bytes[gitleaksPath]),
-      path: gitleaksPath,
-      rules: { path: gitleaksRulesPath, sha256: rulesDigest, version: `rules-${rulesDigest.slice(0, 12)}` },
+      path: storedGitleaks,
+      source: gitleaksPath,
+      rules: { path: storedRules, sha256: rulesDigest, version: `rules-${rulesDigest.slice(0, 12)}`, source: gitleaksRulesPath },
     },
     privacy: {
       state: "verified",
@@ -74,12 +79,14 @@ test("asset provision previews without writes and only records opaque references
     write: true,
     storeRoot,
     installRegex,
+    adopt,
     io: fixtureIo(),
     runPrivacySelfTest: async () => ({ version: "privacy-1" }),
     writeState: async (value) => writes.push(value),
   });
   assert.equal(writes.length, 1);
   assert.deepEqual(writes[0], written);
+  assert.deepEqual(adopted.slice(-2), [storedGitleaks, storedRules]);
   assert.doesNotMatch(JSON.stringify(writes), /fixture|PRIVATE|secret/i);
 });
 
@@ -93,6 +100,7 @@ test("asset provision without an OPF bundle records privacy as absent and skips 
     write: true,
     storeRoot,
     installRegex,
+    adopt,
     io: fixtureIo(),
     runPrivacySelfTest: async () => { selfTests += 1; return { version: "privacy-1" }; },
     writeState: async (value) => writes.push(value),

@@ -211,3 +211,35 @@ test("the store pins Gitleaks by plain semver under assets/gitleaks/", () => {
   });
   for (const version of ["../8.30.1", "v8.30.1", "8.30", undefined]) assert.throws(() => store.gitleaks(version), /plain semver/);
 });
+
+test("doctor warns when the original a store copy was adopted from was upgraded or removed", async () => {
+  const { root, cleanup } = await fixture();
+  try {
+    const stored = join(root, "stored-gitleaks");
+    const source = join(root, "brew-gitleaks");
+    const rulesStored = join(root, "stored-rules.toml");
+    const rulesSource = join(root, "pkg-rules.toml");
+    await writeFile(stored, fakeBinary, { mode: 0o755 });
+    await writeFile(source, fakeBinary, { mode: 0o755 });
+    await writeFile(rulesStored, "rules v1");
+    await writeFile(rulesSource, "rules v1");
+    const pins = { gitleaks: { version: "8.30.1" } };
+    const recorded = {
+      origin: "override", version: "8.30.1", path: stored, source, sha256: sha256(Buffer.from(fakeBinary)),
+      rules: { path: rulesStored, source: rulesSource, sha256: sha256(Buffer.from("rules v1")), version: "rules-1" },
+    };
+    assert.deepEqual(await doctorGitleaksWarnings(recorded, pins), []);
+
+    await writeFile(source, "#!/bin/sh\necho 8.31.0\n");
+    await writeFile(rulesSource, "rules v2");
+    const upgraded = await doctorGitleaksWarnings(recorded, pins);
+    assert.equal(upgraded.length, 2);
+    assert.match(upgraded[0], /Gitleaks binary at .*brew-gitleaks was updated.*ccshield install --write/);
+    assert.match(upgraded[1], /Gitleaks rules at .*pkg-rules\.toml was updated/);
+
+    await rm(source);
+    assert.match((await doctorGitleaksWarnings(recorded, pins))[0], /brew-gitleaks, which no longer exists.*stored copy/);
+  } finally {
+    await cleanup();
+  }
+});
