@@ -11,9 +11,11 @@ const RENDERER = fileURLToPath(new URL("./render.swift", import.meta.url));
 // expect: pii = labels the scan must report; gone = text the masked image must
 // no longer read; kept = text that must survive; secret / rejected = outcome.
 // knownMiss marks a case the pipeline currently gets wrong (see the report).
+// truth, when present, is the full ground truth where it is wider than what the
+// regex worker can find (it has no person detector); the eval scores against it.
 export const CORPUS = Object.freeze([
   { file: "english.png", pii: ["email"], gone: ["bob.lee@example.com"], kept: ["Contact the owner"] },
-  { file: "chinese.png", pii: ["email"], gone: ["mei.chen@example.org"], kept: ["請於週五前回覆"] },
+  { file: "chinese.png", pii: ["email"], truth: ["email", "person"], gone: ["mei.chen@example.org"], kept: ["請於週五前回覆"] },
   { file: "rotated.png", pii: ["email"], gone: ["bob.lee@example.com"], kept: ["before Friday"] },
   { file: "exif.jpg", pii: ["email"], gone: ["bob.lee@example.com"], kept: ["Contact the owner"] },
   { file: "alpha.png", pii: ["email"], gone: ["bob.lee@example.com"], kept: ["Contact the owner"] },
