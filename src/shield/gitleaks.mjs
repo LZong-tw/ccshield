@@ -36,7 +36,7 @@ export async function createGitleaksScanner({ executable, sha256, ruleBundle, ru
   return Object.freeze({
     version,
     async scan(body) {
-      const input = boundedBody(body);
+      const input = unescapeWhitespace(boundedBody(body));
       const result = await invoke(run, {
         command: provision.executable,
         args: scanArguments(provision.ruleBundle),
@@ -45,6 +45,17 @@ export async function createGitleaksScanner({ executable, sha256, ruleBundle, ru
       return Object.freeze({ findings: freezeFindings(parseFindings(result)) });
     },
   });
+}
+
+// Request bodies are JSON, so a typed newline reaches Gitleaks as `\` `n`, and
+// that `n` glued to the next line defeats rules anchored on `\b`. Gitleaks gets
+// the whitespace it stands for. Escapes are consumed in pairs, so `\\n` stays
+// a literal backslash followed by n. Only the scanner's copy changes.
+const WHITESPACE_ESCAPES = { n: "\n", r: "\r", t: "\t" };
+
+function unescapeWhitespace(body) {
+  const text = body.toString("latin1");
+  return Buffer.from(text.replace(/\\(.)/gs, (pair, next) => WHITESPACE_ESCAPES[next] ?? pair), "latin1");
 }
 
 async function validateProvision({ executable, sha256, ruleBundle, io }) {
