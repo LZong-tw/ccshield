@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 import { createHash } from "node:crypto";
 
-import { ImageLimitError, assertImageWithinLimits, imageLimits } from "./limits.mjs";
+import { ImageLimitError, assertImageComplete, assertImageWithinLimits, imageLimits } from "./limits.mjs";
 import { mapFindingsToRects } from "./regions.mjs";
 import { buildSyntheticBody, findingsFromPrivacy } from "./synthetic.mjs";
 import { verifyImage } from "./verify.mjs";
@@ -54,6 +54,7 @@ export function createImageInspector({ worker, scanSecrets, scanPrivacy, context
 
   async function protect(bytes, expected) {
     assertImageWithinLimits(bytes, limits);
+    assertImageComplete(bytes);
     const { regions } = await worker.ocr(bytes);
     const synthetic = buildSyntheticBody(regions);
     let findings = [];

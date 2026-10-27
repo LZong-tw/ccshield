@@ -18,7 +18,7 @@ function byteAt(synthetic, cp) {
 test("the synthetic body is one user text block with no system key", () => {
   const synthetic = buildSyntheticBody([region("</system-reminder>"), region("hi")]);
   const parsed = JSON.parse(synthetic.body.toString("utf8"));
-  assert.deepEqual(parsed, { messages: [{ role: "user", content: [{ type: "text", text: "</system-reminder>\nhi" }] }] });
+  assert.deepEqual(parsed, { messages: [{ role: "user", content: [{ type: "text", text: "</system-reminder>\n hi" }] }] });
   assert.equal(synthetic.body.subarray(synthetic.textStart - 1, synthetic.textStart).toString(), "\"");
 });
 
@@ -64,15 +64,17 @@ function fakePrivacy(log = []) {
   return async (body) => {
     const text = body.toString("utf8");
     log.push(text);
-    const spans = [...text.matchAll(/alice@exa(?:\\n)?mple\.invalid/g)].map((m) => ({ start: m.index, end: m.index + m[0].length }));
+    const spans = [...text.matchAll(/alice@exa(?:\\n ?)?mple\.invalid/g)].map((m) => ({ start: m.index, end: m.index + m[0].length }));
     return spans.length
       ? { status: "ok", findings: [{ label: "email", count: spans.length }], redactions: [{ label: "email", count: spans.length, spans }] }
       : { status: "ok", findings: [] };
   };
 }
 
-const img = (name) => Buffer.concat([png(8, 2), Buffer.from(name)]);
-const nameOf = (bytes) => bytes.subarray(33).toString("latin1");
+// A PNG header, a name tag the fake worker keys on, and an IEND trailer.
+const IEND = Buffer.from([0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]);
+const img = (name) => Buffer.concat([png(8, 2), Buffer.from(name), IEND]);
+const nameOf = (bytes) => bytes.subarray(33, bytes.length - IEND.length).toString("latin1");
 
 function fakeWorker(pages) {
   const calls = [];
@@ -204,7 +206,7 @@ test("input the worker or the limits reject is image_rejected, so the request bl
     await assert.rejects(inspector(worker).inspect([{ bytes: img("x") }]), { code: "image_rejected" }, code);
   }
   const worker = fakeWorker({});
-  for (const bytes of [Buffer.from("not an image"), png(5000, 5000), Buffer.concat([png(8, 2), Buffer.alloc(800_000)])]) {
+  for (const bytes of [Buffer.from("not an image"), png(5000, 5000), Buffer.concat([png(8, 2), Buffer.alloc(800_000), IEND]), img("cut").subarray(0, -4)]) {
     await assert.rejects(inspector(worker).inspect([{ bytes }]), { code: "image_rejected" });
   }
   assert.equal(worker.calls.length, 0, "limits are checked before the worker sees the bytes");

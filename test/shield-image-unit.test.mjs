@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { ImageLimitError, SHIELD_IMAGE_LIMITS, assertImageWithinLimits, imageLimits, readImageDimensions } from "../shield-image/limits.mjs";
+import { ImageLimitError, SHIELD_IMAGE_LIMITS, assertImageComplete, assertImageWithinLimits, imageLimits, readImageDimensions } from "../shield-image/limits.mjs";
 import { buildSyntheticText, mapFindingsToRects } from "../shield-image/regions.mjs";
 import { assertContext, verifyImage } from "../shield-image/verify.mjs";
 
@@ -62,8 +62,19 @@ test("dimensions are read for GIF, JPEG and WebP headers", () => {
 
 test("synthetic text ranges are in code points", () => {
   const { text, ranges } = buildSyntheticText([region("名字 😀"), region("abc")]);
-  assert.equal(text, "名字 😀\nabc");
-  assert.deepEqual(ranges, [{ start: 0, end: 4 }, { start: 5, end: 8 }]);
+  assert.equal(text, "名字 😀\n abc");
+  assert.deepEqual(ranges, [{ start: 0, end: 4 }, { start: 6, end: 9 }]);
+});
+
+// Detectors scan the JSON-escaped body, where a bare "\n" separator becomes the
+// two characters `\n`: the `n` then sits against the next region and defeats a
+// leading \b, so a key alone on its own OCR line was missed by Gitleaks.
+test("every region starts on a word boundary once the synthetic text is JSON-escaped", () => {
+  const regions = [region("aws_access_key_id ="), region("AKIAZ7WQ3MRX2KBTLYPV"), region("tail")];
+  const { text, ranges } = buildSyntheticText(regions);
+  const escaped = JSON.stringify(text);
+  assert.match(escaped, /(?<![A-Za-z0-9_])AKIAZ7WQ3MRX2KBTLYPV\b/);
+  assert.deepEqual(ranges.map(({ start, end }) => [...text].slice(start, end).join("")), regions.map((r) => r.text));
 });
 
 test("a gateway-shaped finding with value maps to its region rect", () => {
@@ -112,4 +123,23 @@ test("verify accepts a clean PNG and rejects every kind of leak", async () => {
   assert.deepEqual(await verifyImage({ ...base, scan: { ...cleanScan, gitleaks: async () => [{}] } }), { ok: false, reason: "secret_still_visible", confirmedSecret: true });
   assert.equal((await verifyImage({ ...base, scan: { ...cleanScan, privacy: async () => [{}] } })).reason, "pii_still_visible");
   await assert.rejects(verifyImage({ ...base, bytes: png(5000, 5000), scan: cleanScan }), { code: "image_too_many_pixels" });
+});
+
+test("a truncated container is refused before any decoder sees it", () => {
+  const iend = Buffer.from([0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]);
+  const completePng = Buffer.concat([png(8, 2), iend]);
+  assert.doesNotThrow(() => assertImageComplete(completePng));
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 0xff, 0xd9]);
+  assert.doesNotThrow(() => assertImageComplete(jpeg));
+  const gif = Buffer.concat([Buffer.from("GIF89a"), Buffer.alloc(8), Buffer.from([0x3b])]);
+  assert.doesNotThrow(() => assertImageComplete(gif));
+  const webp = Buffer.alloc(20);
+  webp.write("RIFF", 0, "latin1");
+  webp.writeUInt32LE(12, 4);
+  webp.write("WEBP", 8, "latin1");
+  assert.doesNotThrow(() => assertImageComplete(webp));
+
+  for (const bytes of [completePng.subarray(0, completePng.length - 3), png(8, 2), jpeg.subarray(0, 7), gif.subarray(0, gif.length - 1), webp.subarray(0, 16), Buffer.from("plain")]) {
+    assert.throws(() => assertImageComplete(bytes), (error) => error instanceof ImageLimitError && error.code === "image_truncated");
+  }
 });

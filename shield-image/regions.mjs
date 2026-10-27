@@ -5,15 +5,20 @@ const codePoints = (text) => [...text].length;
 
 // One synthetic text block: region texts joined by "\n", with each region's
 // [start, end) in code points so detector spans map back to regions.
+// Detectors read the JSON-escaped body, where "\n" is the two characters `\n`.
+// The trailing space keeps that `n` from touching the next region, so a rule
+// anchored on \b still matches a value that starts its own OCR line.
+const SEPARATOR = "\n ";
+
 export function buildSyntheticText(regions) {
   const ranges = [];
   let offset = 0;
   for (const region of regions) {
     const length = codePoints(region.text);
     ranges.push({ start: offset, end: offset + length });
-    offset += length + 1;
+    offset += length + codePoints(SEPARATOR);
   }
-  return { text: regions.map((region) => region.text).join("\n"), ranges };
+  return { text: regions.map((region) => region.text).join(SEPARATOR), ranges };
 }
 
 function assertFinding(finding) {

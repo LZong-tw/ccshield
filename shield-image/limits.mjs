@@ -80,3 +80,27 @@ export function assertImageWithinLimits(bytes, limits = SHIELD_IMAGE_LIMITS) {
   if (dims.width * dims.height > limits.maxPixels) throw new ImageLimitError("image_too_many_pixels", `image is ${dims.width}x${dims.height}`);
   return dims;
 }
+
+// Decoders render a truncated file as far as it goes, and that partial picture
+// is not what the user sent. Each allowed container has a fixed end to check.
+export function assertImageComplete(bytes) {
+  const b = Buffer.from(bytes);
+  const truncated = () => { throw new ImageLimitError("image_truncated", "image container is incomplete"); };
+  if (b.length >= 8 && b.readUInt32BE(0) === 0x89504e47) {
+    if (b.length < 20 || b.toString("latin1", b.length - 8, b.length - 4) !== "IEND" || b.readUInt32BE(b.length - 12) !== 0) truncated();
+    return;
+  }
+  if (b.length >= 2 && b[0] === 0xff && b[1] === 0xd8) {
+    if (b.length < 4 || b[b.length - 2] !== 0xff || b[b.length - 1] !== 0xd9) truncated();
+    return;
+  }
+  if (b.length >= 6 && (b.toString("latin1", 0, 6) === "GIF87a" || b.toString("latin1", 0, 6) === "GIF89a")) {
+    if (b[b.length - 1] !== 0x3b) truncated();
+    return;
+  }
+  if (b.length >= 12 && b.toString("latin1", 0, 4) === "RIFF" && b.toString("latin1", 8, 12) === "WEBP") {
+    if (b.readUInt32LE(4) + 8 !== b.length) truncated();
+    return;
+  }
+  truncated();
+}
