@@ -364,9 +364,11 @@ export function createShieldFailure(stage, reason, message, { retryAfterSeconds 
   });
 }
 
-// Only a full queue is worth retrying later; the estimate comes from the privacy filter.
+// Only a full queue or a cooperative model timeout, whose worker keeps warming the unscanned windows, is
+// worth retrying later; the estimate comes from the privacy filter.
+const RETRYABLE_PRIVACY_REASONS = new Set(["admission_limit", "queue_timeout", "model_timeout"]);
 function validRetryAfter({ stage, reason, retryAfterSeconds }) {
-  const retryable = stage === "privacy_scan" && (reason === "admission_limit" || reason === "queue_timeout");
+  const retryable = stage === "privacy_scan" && RETRYABLE_PRIVACY_REASONS.has(reason);
   return retryable && Number.isInteger(retryAfterSeconds) && retryAfterSeconds >= 1 && retryAfterSeconds <= 60
     ? retryAfterSeconds
     : undefined;

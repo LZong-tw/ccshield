@@ -230,13 +230,16 @@ test("a client disconnect aborts the daemon's privacy scan and frees its queued 
   assert.deepEqual((await Promise.all([...held, late])).map((result) => result.reason), Array(4).fill("worker_closed"));
 });
 
-test("admission and queue failures reach the client as a Retry-After header, other 503s do not", async (t) => {
+test("admission, queue and cooperative model timeouts reach the client as a Retry-After header, other 503s do not", async (t) => {
   const upstream = await startFixture(t, async () => assert.fail("a failed decision must never forward"));
   const decisionContext = { lane: "subscription", destinationClass: "subscription", policyVersion: "policy-1", detectorVersions: { gitleaks: "1", privacy: "1" } };
   for (const [reason, retryAfterSeconds, expected, cached] of [
     ["admission_limit", 7, "7", false],
     ["queue_timeout", 60, "60", false],
     ["admission_limit", 12, "12", true],
+    ["model_timeout", 7, "7", false],
+    ["model_timeout", 61, null, false],
+    ["model_killed", 7, null, false],
     ["scan_timeout", 7, null, false],
     ["worker_unavailable", 7, null, false],
     ["admission_limit", 0, null, false],
