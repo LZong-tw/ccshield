@@ -9,6 +9,7 @@ const FAILURE_REASONS = new Map([
   ["body_read", new Set(["body_read_failed", "body_too_large"])],
   ["evaluation", new Set(["evaluation_unavailable"])],
   ["media_scan", new Set(["media_scan_failed"])],
+  ["image_scan", new Set(["image_unavailable", "image_timeout", "image_queue_full", "image_scan_unavailable", "image_splice_invalid"])],
   ["secret_scan", new Set(["scanner_unavailable"])],
   ["privacy_scan", new Set([
     "privacy_unavailable", "worker_closed", "body_invalid", "admission_limit", "frame_limit", "queue_timeout",
@@ -279,6 +280,16 @@ async function handleShieldRequest({ request, response, capability, controlCapab
     permitted = true;
   }
   if (decision?.action === "require_approval") {
+    // Normalized images make the approved body a transform of the original.
+    if (decision.redactedBody !== undefined) {
+      const transformed = validateRedactedBody(decision.redactedBody);
+      if (transformed === null) {
+        fail("redaction", "redaction_invalid", inspection.bytes);
+        await finish(response, { status: 503, code: "shield_unavailable" });
+        return;
+      }
+      forwardBody = transformed;
+    }
     permitted = await approveRequest({ approvalBroker, approvalChannel: launchApprovalChannel(approvalChannels, request.headers["x-airkit-shield-launch"]), decision, inspection, auditDecision, signal: lifecycle.signal });
     auditDecision.override = permitted;
   }
@@ -353,7 +364,7 @@ function recordFailure(failures, { stage, reason, bytes, elapsedMs }) {
 export function createShieldFailure(stage, reason, message, { retryAfterSeconds } = {}) {
   const defaults = {
     body_read: "body_read_failed", evaluation: "evaluation_unavailable", secret_scan: "scanner_unavailable",
-    privacy_scan: "privacy_unavailable", policy: "policy_unavailable", redaction: "redaction_invalid",
+    privacy_scan: "privacy_unavailable", image_scan: "image_scan_unavailable", policy: "policy_unavailable", redaction: "redaction_invalid",
     audit: "audit_unavailable", upstream: "transport_unavailable",
   };
   const safeStage = FAILURE_REASONS.has(stage) ? stage : "evaluation";
@@ -379,7 +390,8 @@ async function cachedDecision({ decisionCache, decisionContext: contextSource, b
   const key = { ...decisionContext, requestDigest };
   const result = await decisionCache.getOrCompute(key, async (sharedSignal) => {
     const decision = await evaluate(sharedSignal, decisionContext.detectorVersions);
-    const redactedBody = decision?.action === "redact" ? validateRedactedBody(decision.redactedBody) : Buffer.alloc(0);
+    const carriesBody = decision?.action === "redact" || (decision?.action === "require_approval" && decision.redactedBody !== undefined);
+    const redactedBody = carriesBody ? validateRedactedBody(decision.redactedBody) : Buffer.alloc(0);
     if (redactedBody === null) throw new Error("shield decision redaction is invalid");
     const action = decision?.action;
     const reasonCodes = validReasonCodes(decision?.reasonCodes)
@@ -395,7 +407,7 @@ async function cachedDecision({ decisionCache, decisionContext: contextSource, b
     action: cached.action,
     reasonCodes: cached.reasonCodes,
     transformCount: cached.transformCount,
-    ...(cached.action === "redact" ? { redactedBody: cached.body } : {}),
+    ...(cached.action === "redact" || (cached.action === "require_approval" && cached.body.length > 0) ? { redactedBody: cached.body } : {}),
     lane: decisionContext.lane,
     destinationClass: decisionContext.destinationClass,
     bundleVersion: decisionContext.policyVersion,

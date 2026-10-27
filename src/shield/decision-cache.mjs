@@ -110,7 +110,9 @@ function validateDecision(value) {
     || value.reasonCodes.some((code) => !/^[A-Za-z0-9._-]{1,128}$/.test(code))) {
     throw new TypeError("shield decision cache reason codes are invalid");
   }
-  if (value.action !== "redact" && value.body.byteLength !== 0) throw new TypeError("shield decision cache may retain only a transformed body");
+  // An approval may carry spliced images, but only uncached: it is never stored.
+  const transformedApproval = value.action === "require_approval" && value.noCache === true;
+  if (value.action !== "redact" && !transformedApproval && value.body.byteLength !== 0) throw new TypeError("shield decision cache may retain only a transformed body");
   if (Object.hasOwn(value, "noCache") && typeof value.noCache !== "boolean") throw new TypeError("shield decision cache noCache flag is invalid");
   const media = Object.fromEntries(MEDIA_FIELDS.filter((field) => Object.hasOwn(value, field)).map((field) => [field, value[field]]));
   return Object.freeze({ ...key, ...media, action: value.action, reasonCodes: [...value.reasonCodes], transformCount: value.transformCount, body: Buffer.from(value.body) });

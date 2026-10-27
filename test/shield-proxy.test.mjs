@@ -1429,3 +1429,44 @@ async function readBody(request) {
   for await (const chunk of request) chunks.push(chunk);
   return Buffer.concat(chunks).toString("utf8");
 }
+
+test("an approved request with normalized images forwards the spliced body, not the original", async (t) => {
+  for (const cached of [false, true]) {
+    const received = [];
+    const upstream = await startFixture(t, async (request, response) => {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      received.push(Buffer.concat(chunks).toString("utf8"));
+      response.end("ok");
+    });
+    const grant = {};
+    const masked = JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text: "masked" }] }] });
+    const shield = await startShield(t, {
+      targetOrigin: upstream.origin,
+      approvalBroker: { async request() { return grant; }, consume: (received) => received === grant },
+      ...(cached ? {
+        decisionCache: createDecisionCache(),
+        decisionContext: () => ({ lane: "subscription", destinationClass: "subscription", policyVersion: "2026.09.02.2", detectorVersions: { gitleaks: "8.24.0" } }),
+      } : {}),
+      decide: async () => ({
+        action: "require_approval",
+        reasonCodes: ["internal_repository_code"],
+        lane: "subscription",
+        destinationClass: "subscription",
+        bundleVersion: "2026.09.02.2",
+        detectorVersions: { gitleaks: "8.24.0" },
+        noCache: true,
+        imageCount: 1,
+        documentCount: 0,
+        mediaOutcome: "none",
+        transformCount: 1,
+        redactedBody: Buffer.from(masked),
+      }),
+    });
+    const result = await fetch(`${shield.origin}/v1/messages`, {
+      method: "POST", headers: { "x-airkit-shield": CAPABILITY }, body: JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text: "original" }] }] }),
+    });
+    assert.equal(result.status, 200, `cached=${cached}`);
+    assert.deepEqual(received, [masked], `cached=${cached}`);
+  }
+});

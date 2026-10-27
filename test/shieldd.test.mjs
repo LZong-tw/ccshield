@@ -845,3 +845,103 @@ function startDaemon(options) {
     ...options,
   });
 }
+
+const MASKED_PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(24, 9)]);
+const imageVersions = { gitleaks: "8.24.0", image: "image-0123456789ab", privacy: "privacy-1" };
+
+async function imageDecide({ ready = true, inspect = async (images) => images.map(() => ({ status: "ok", bytes: MASKED_PNG, maskCount: 0, lowConfidenceMasked: 0, piiFindings: [] })), evaluate, privacyScan } = {}) {
+  const calls = { scanner: [], privacy: [], policy: [], inspect: [] };
+  let decide;
+  await startDaemon({
+    config,
+    paths,
+    readPolicyBundle: async () => ({ bundle: {}, publicKey: "pinned-ed25519-public-key" }),
+    readImageProvision: async () => ({ version: "image-0123456789ab", path: "/opt/w", sha256: "a".repeat(64) }),
+    createImageScanner: async () => ({ isReady: () => ready, inspect: async (images) => { calls.inspect.push(images); return inspect(images); }, close() {} }),
+    createPrivacy: async () => ({ version: "privacy-1", async scan(body) { calls.privacy.push(Buffer.from(body)); return privacyScan?.(body) ?? { status: "ok", findings: [], redactions: [] }; }, close() {} }),
+    createScanner: async () => ({ version: "8.24.0", scan: async (body) => { calls.scanner.push(Buffer.from(body)); return { findings: [] }; } }),
+    loadPolicy: async () => ({
+      version: "2026.09.02.4",
+      detectorVersions: imageVersions,
+      async evaluate(input) {
+        calls.policy.push(input);
+        if (evaluate) return evaluate(input);
+        if (input.secretFindings.length) return { action: "block", reasonCodes: ["secret"], approvalEligible: false, redactions: [] };
+        if (input.piiFindings.length) return { action: "redact", reasonCodes: ["subscription-pii"], approvalEligible: false, redactions: [] };
+        return { action: "allow", reasonCodes: ["policy_allow"], approvalEligible: false, redactions: [] };
+      },
+    }),
+    writePolicyState: async () => {},
+    startProxy: async (options) => { decide = options.decide; return { origin: "http://127.0.0.1:8811", close: async () => {} }; },
+    writeIdentity: async () => {},
+  });
+  return { calls, decide: (body) => decide({ body }) };
+}
+
+const sourceOf = (body, index = 1) => JSON.parse(body.toString("utf8")).messages[0].content[index].source;
+const jpegBlock = { type: "image", source: { type: "base64", media_type: "image/jpeg", data: Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(24, 3)]).toString("base64") } };
+
+test("a provisioned worker that is not ready makes image requests unavailable before any scanner", async () => {
+  const { calls, decide } = await imageDecide({ ready: false });
+  await assert.rejects(decide(mediaBody(pngBlock)), (error) => error.shieldFailure?.stage === "image_scan" && error.shieldFailure?.reason === "image_unavailable");
+  assert.equal(calls.scanner.length + calls.privacy.length + calls.policy.length + calls.inspect.length, 0);
+  const plain = await decide(mediaBody());
+  assert.equal(plain.action, "allow", "text-only requests do not wait for image readiness");
+});
+
+test("a clean text request plus a PII image is redacted with the text unchanged and the masked PNG spliced in", async () => {
+  const { calls, decide } = await imageDecide({ inspect: async (images) => images.map(() => ({ status: "ok", bytes: MASKED_PNG, maskCount: 2, lowConfidenceMasked: 0, piiFindings: [{ label: "email", count: 1 }] })) });
+  const decision = await decide(mediaBody(jpegBlock));
+  assert.equal(decision.action, "redact");
+  assert.deepEqual(sourceOf(decision.redactedBody), { type: "base64", media_type: "image/png", data: MASKED_PNG.toString("base64") });
+  assert.equal(JSON.parse(decision.redactedBody.toString("utf8")).messages[0].content[0].text, "look");
+  assert.equal(decision.transformCount, 2);
+  assert.deepEqual(calls.policy[0].piiFindings, [{ category: "email", count: 1 }]);
+  assert.deepEqual(sourceOf(calls.privacy[0]).data, MASKED_PNG.toString("base64"), "text scanners see the spliced body");
+  assert.equal(calls.inspect[0][0].lastTurn, true);
+});
+
+test("an allowed clean image still leaves normalized, as a transform", async () => {
+  const { decide } = await imageDecide();
+  const decision = await decide(mediaBody(jpegBlock));
+  assert.equal(decision.action, "redact");
+  assert.deepEqual(decision.reasonCodes, ["policy_allow"]);
+  assert.equal(sourceOf(decision.redactedBody).data, MASKED_PNG.toString("base64"));
+  assert.equal(decision.transformCount, 1);
+  assert.equal(decision.noCache, true);
+});
+
+test("a secret image blocks through policy as a confirmed secret", async () => {
+  const { calls, decide } = await imageDecide({ inspect: async (images) => images.map(() => ({ status: "secret", confirmedSecret: true })) });
+  const decision = await decide(mediaBody(pngBlock));
+  assert.equal(decision.action, "block");
+  assert.deepEqual(calls.policy[0].secretFindings, [{ category: "image-ocr-secret", count: 1 }]);
+  assert.equal(calls.privacy.length, 0);
+  assert.equal(Object.hasOwn(decision, "redactedBody"), false);
+});
+
+test("too many new images in the last turn is an audited block; other inspector failures are unavailable", async () => {
+  const limit = await imageDecide({ inspect: async () => { throw Object.assign(new Error("x"), { code: "too_many_images" }); } });
+  const blocked = await limit.decide(mediaBody(pngBlock));
+  assert.equal(blocked.action, "block");
+  assert.deepEqual(blocked.reasonCodes, ["media_image_limit_blocked"]);
+  for (const code of ["image_timeout", "image_queue_full", "image_scan_unavailable"]) {
+    const { decide } = await imageDecide({ inspect: async () => { throw Object.assign(new Error("x"), { code }); } });
+    await assert.rejects(decide(mediaBody(pngBlock)), (error) => error.shieldFailure?.stage === "image_scan" && error.shieldFailure?.reason === code);
+  }
+});
+
+test("text redaction runs on the spliced body, so both the text and the image are replaced", async () => {
+  const privacyScan = (body) => {
+    const text = body.toString("utf8");
+    const start = Buffer.from(text).indexOf("look");
+    return { status: "ok", findings: [{ label: "word", count: 1 }], redactions: [{ label: "word", count: 1, spans: [{ start, end: start + 4 }] }], redactedBody: Buffer.from(text.replace('"look"', '"[WORD]"')) };
+  };
+  const { decide } = await imageDecide({ privacyScan });
+  const decision = await decide(mediaBody(jpegBlock));
+  assert.equal(decision.action, "redact");
+  const parsed = JSON.parse(decision.redactedBody.toString("utf8"));
+  assert.equal(parsed.messages[0].content[0].text, "[WORD]");
+  assert.equal(parsed.messages[0].content[1].source.data, MASKED_PNG.toString("base64"));
+  assert.equal(decision.transformCount, 2);
+});

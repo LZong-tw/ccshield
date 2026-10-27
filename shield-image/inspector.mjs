@@ -78,7 +78,10 @@ export function createImageInspector({ worker, scanSecrets, scanPrivacy, context
   async function inspect(images) {
     const expected = context();
     const keys = images.map(({ bytes }) => keyFor(bytes, expected));
-    if (new Set(keys.filter((key) => !cache.has(key))).size > limits.maxImages) throw new ImageInspectError("too_many_images");
+    // Only the newest user turn counts: history resent after a daemon restart
+    // misses the process-local cache and would otherwise never converge.
+    const fresh = new Set(keys.filter((key, index) => images[index].lastTurn !== false && !cache.has(key)));
+    if (fresh.size > limits.maxImages) throw new ImageInspectError("too_many_images");
     if (keys.every((key) => cache.has(key))) return keys.map((key) => copy(cache.get(key)));
     if (pending >= maxPending) throw new ImageInspectError("image_queue_full");
     pending += 1;

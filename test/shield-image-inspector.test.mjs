@@ -166,11 +166,19 @@ test("a per-image cache hit skips the worker", async () => {
   assert.deepEqual(second, first);
 });
 
-test("more uncached images than maxImages are refused before the worker runs", async () => {
+test("more uncached last-turn images than maxImages are refused before the worker runs", async () => {
   const worker = fakeWorker({});
-  const images = Array.from({ length: 3 }, (_, i) => ({ bytes: Buffer.from(`i${i}`) }));
+  const images = Array.from({ length: 3 }, (_, i) => ({ bytes: Buffer.from(`i${i}`), lastTurn: true }));
   await assert.rejects(inspector(worker, { limits: { maxImages: 2 } }).inspect(images), { code: "too_many_images" });
   assert.equal(worker.calls.length, 0);
+});
+
+test("history images resent after a restart do not count toward maxImages", async () => {
+  const worker = fakeWorker({});
+  const history = Array.from({ length: 5 }, (_, i) => ({ bytes: Buffer.from(`h${i}`), lastTurn: false }));
+  const results = await inspector(worker, { limits: { maxImages: 2 } }).inspect([...history, { bytes: Buffer.from("n"), lastTurn: true }]);
+  assert.equal(results.length, 6);
+  assert.ok(results.every((result) => result.status === "ok"));
 });
 
 test("the queue deadline and the pending cap fail closed", async () => {

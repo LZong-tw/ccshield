@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { extractMedia, mediaOutcomeFor, patchMedia } from "../src/shield/media.mjs";
+import { extractMedia, mediaOutcomeFor, patchImages, patchMedia } from "../src/shield/media.mjs";
 import { opaqueValues } from "../src/shield/privacy.mjs";
 
 const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(24, 7)]);
@@ -207,4 +207,30 @@ test("patchMedia splices replacements at recorded offsets and leaves every other
   assert.throws(() => patchMedia(raw, [{ rawOffset: head, rawLength: 4, text: 'a"b' }]), TypeError);
   assert.throws(() => patchMedia(raw, [replacements[0], replacements[0]]), RangeError);
   assert.throws(() => patchMedia(raw, [{ rawOffset: raw.length - 2, rawLength: 8, text: "AAAA" }]), RangeError);
+});
+
+test("images record their media_type offsets and whether they sit in the last user turn", () => {
+  const raw = body({ messages: [
+    { role: "user", content: [image(JPEG, "image/jpeg")] },
+    { role: "assistant", content: [{ type: "text", text: "ok" }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: [image(GIF, "image/gif")] }, image()] },
+  ] });
+  const { images } = extractMedia(raw);
+  assert.deepEqual(images.map((found) => found.lastTurn), [false, true, true]);
+  for (const found of images) {
+    assert.equal(raw.subarray(found.mediaTypeOffset, found.mediaTypeOffset + found.mediaTypeLength).toString(), found.mime);
+  }
+});
+
+test("patchImages swaps bytes and media_type, then re-extracts to prove the splice", () => {
+  const raw = userTurn({ type: "text", text: "før" }, image(JPEG, "image/jpeg"), image(GIF, "image/gif"));
+  const { images } = extractMedia(raw);
+  const masked = [Buffer.concat([PNG, Buffer.from([1])]), Buffer.concat([PNG, Buffer.from([2])])];
+  const patched = patchImages(raw, images.map((found, index) => ({ image: found, bytes: masked[index] })));
+  const parsed = JSON.parse(patched.toString("utf8"));
+  const original = JSON.parse(raw.toString("utf8"));
+  original.messages[0].content[1].source = { type: "base64", media_type: "image/png", data: masked[0].toString("base64") };
+  original.messages[0].content[2].source = { type: "base64", media_type: "image/png", data: masked[1].toString("base64") };
+  assert.deepEqual(parsed, original);
+  assert.throws(() => patchImages(raw, [{ image: images[0], bytes: JPEG }]), /PNG/);
 });
