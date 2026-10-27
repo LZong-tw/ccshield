@@ -5,8 +5,8 @@ import { readEnv } from "../compat-env.mjs";
 
 const LANES = Object.freeze(["subscription", "managed"]);
 const HEALTH = new Set(["healthy", "unavailable"]);
-// What a running daemon inspects. Images are forwarded without OCR; documents are blocked only by a
-// daemon whose identity says so, since one started before the media check still forwards them.
+// What a running daemon inspects. Media coverage comes only from the identity of the daemon that is
+// running now; one started before the media check forwards images and documents unscanned.
 const NOT_RUNNING_COVERAGE = Object.freeze({ text: "n/a", images: "n/a", documents: "n/a" });
 
 export async function readShieldOperationalStatus({
@@ -80,6 +80,7 @@ async function readLaneStatus({ lane, audit, paths, inspectService, readIdentity
     result.policy_version = policy.version;
     result.gitleaks_version = policy.detectorVersions.gitleaks;
     result.privacy_version = policy.detectorVersions.privacy;
+    if (policy.detectorVersions.image) result.image_version = policy.detectorVersions.image;
   }
   result.content_coverage = contentCoverage(service, identity, serviceState);
   return result;
@@ -96,7 +97,7 @@ function contentCoverage(service, identity, serviceState) {
   if (!service?.active) return { ...NOT_RUNNING_COVERAGE };
   // Identity media counts only when the process that wrote it is the one running now.
   const media = serviceState === "healthy" ? identity?.media : undefined;
-  return { text: "scanned", images: "unscanned", documents: media?.documents ?? "unscanned" };
+  return { text: "scanned", images: media?.images ?? "unscanned", documents: media?.documents ?? "unscanned" };
 }
 
 function classifyService(service, identity, hadError) {
@@ -122,7 +123,7 @@ function classifyPrivacy(assets, identity, policy, hadError) {
 }
 
 function sameDetectors(left, right) {
-  return left?.gitleaks === right?.gitleaks && left?.privacy === right?.privacy;
+  return left?.gitleaks === right?.gitleaks && left?.privacy === right?.privacy && left?.image === right?.image;
 }
 
 function safeLauncherDescriptors(value) {

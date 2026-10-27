@@ -13,7 +13,7 @@ import { loadShieldPolicy } from "./shield/policy.mjs";
 import { openPrivacyDetector } from "./shield/privacy-detector.mjs";
 import { createPrivacyFilter, isVerifiedRedaction } from "./shield/privacy.mjs";
 import { createShieldFailure as shieldFailure, startShieldProxy } from "./shield/proxy.mjs";
-import { extractMedia, MEDIA_COVERAGE, mediaOutcomeFor, patchImages } from "./shield/media.mjs";
+import { DOCUMENT_COVERAGE, extractMedia, mediaOutcomeFor, patchImages } from "./shield/media.mjs";
 import { createImageInspector } from "../shield-image/inspector.mjs";
 import { checkImageReadiness } from "../shield-image/readiness.mjs";
 import { createImageWorker } from "../shield-image/worker.mjs";
@@ -73,7 +73,13 @@ export async function startShieldDaemon({
   let shield;
   let recorder;
   let images = null;
+  // Image coverage starts as `pending` with a worker and changes once its
+  // background readiness check settles; the identity is republished then.
+  let imageCoverage = image ? "pending" : "unscanned";
+  let publish = null;
+  let closed = false;
   const close = async () => {
+    closed = true;
     try { await shield?.close(); }
     finally {
       try { await privacy?.close?.(); }
@@ -102,6 +108,12 @@ export async function startShieldDaemon({
         scanSecrets: (body) => scanner.scan(body),
         scanPrivacy: (body) => privacy.scan(body, { version: privacy.detectorVersions().privacy }),
         context: () => ({ policyVersion: policy.version, detectorVersions: { ...policy.detectorVersions } }),
+        onReadiness: (result) => {
+          imageCoverage = result.ready ? "ocr-text" : "unavailable";
+          if (publish && !closed) {
+            publish().catch(() => process.stderr.write("ccshieldd: could not republish image coverage\n"));
+          }
+        },
       });
     }
     const decide = async ({ body, signal, launcherContext: requestLauncherContext = null, detectorVersions: keyedVersions }) => {
@@ -130,8 +142,8 @@ export async function startShieldDaemon({
         bundleVersion: policy.version,
         detectorVersions: { ...detectorVersions },
       });
-      // Documents and unscannable images stop here, before any scanner sees them. Base64 images are
-      // forwarded unscanned in this phase; the text pipeline below still covers the rest of the body.
+      // Documents and unscannable images stop here, before any scanner sees them. Base64 images go
+      // through the image worker below, or forward unscanned when no worker is provisioned.
       if (media.reasonCodes.length > 0) return shape({ action: "block", reasonCodes: media.reasonCodes, transformCount: 0 });
       // Masked images are spliced in first, so the text scanners and any text
       // redaction work on exactly the body that will leave.
@@ -227,7 +239,7 @@ export async function startShieldDaemon({
       scanStats: () => privacy.recentScans(),
       scanTotals: () => privacy.scanTotals(),
     });
-    await writeIdentity({
+    publish = () => writeIdentity({
       paths,
       identity: {
         origin: shield.origin,
@@ -239,9 +251,10 @@ export async function startShieldDaemon({
         targetClass: config.targetClass,
         policyVersion: policy.version,
         detectorVersions: policy.detectorVersions,
-        media: { ...MEDIA_COVERAGE },
+        media: { documents: DOCUMENT_COVERAGE, images: imageCoverage },
       },
     });
+    await publish();
   } catch (error) {
     await close().catch(() => {});
     throw error;
@@ -311,7 +324,7 @@ function withImageSecrets(findings, count) {
 
 const IMAGE_TIMEOUT_MS = 60_000;
 
-async function createDefaultImageScanner({ image, scanSecrets, scanPrivacy, context }) {
+async function createDefaultImageScanner({ image, scanSecrets, scanPrivacy, context, onReadiness }) {
   const worker = createImageWorker({ path: image.path, sha256: image.sha256 });
   const inspector = createImageInspector({ worker, scanSecrets, scanPrivacy, context, timeoutMs: IMAGE_TIMEOUT_MS });
   let state = { ready: false, reason: "pending" };
@@ -319,6 +332,7 @@ async function createDefaultImageScanner({ image, scanSecrets, scanPrivacy, cont
   // only image requests wait on it.
   void checkImageReadiness({ worker }).then((result) => {
     state = result;
+    onReadiness?.(result);
     if (!result.ready) process.stderr.write(`ccshieldd: image worker is not ready (${result.reason}); image requests stay unavailable\n`);
   });
   return Object.freeze({ isReady: () => state.ready, readiness: () => ({ ...state }), inspect: (images) => inspector.inspect(images), close: () => worker.close() });

@@ -138,9 +138,11 @@ export function assertShieldIdentity(identity) {
   return validated;
 }
 
-// What the running daemon does with media it cannot inspect. A daemon from
-// before the media check writes no `media`, and readers treat that as unscanned.
-const MEDIA_COVERAGE_STATES = Object.freeze({ documents: ["unscanned", "blocked"], images: ["unscanned"] });
+// What the running daemon does with media. A daemon from before the media
+// check writes no `media`, and readers treat that as unscanned. Images are
+// `unscanned` without a worker, `pending` while its startup readiness check
+// runs, then `ocr-text` or `unavailable` (image requests fail closed).
+const MEDIA_COVERAGE_STATES = Object.freeze({ documents: ["unscanned", "blocked"], images: ["unscanned", "pending", "ocr-text", "unavailable"] });
 
 function assertMediaCoverage(media) {
   if (!media || typeof media !== "object" || Array.isArray(media)

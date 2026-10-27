@@ -166,3 +166,34 @@ test("operational Shield status isolates an unreadable lane instead of hiding th
   });
   assert.doesNotMatch(JSON.stringify(result), /Users|private/i);
 });
+
+test("operational Shield status shows image coverage and the image detector version", async () => {
+  const threeKey = { ...detectors, image: "image-0123456789ab" };
+  const status = ({ identityDetectors = threeKey, images }) => readShieldOperationalStatus({
+    shieldPaths: ({ lane }) => ({ lane }),
+    inspectService: async ({ paths }) => paths.lane === "subscription"
+      ? { installed: true, loaded: true, active: true, pid: 42 }
+      : { installed: false, loaded: false, active: false },
+    readIdentity: async ({ paths }) => paths.lane === "subscription"
+      ? { pid: 42, policyVersion: "policy-1", detectorVersions: identityDetectors, media: { documents: "blocked", images } }
+      : null,
+    readPolicy: async () => ({ version: "policy-1", detectorVersions: threeKey }),
+    readAssets: async () => ({ privacy: { version: threeKey.privacy } }),
+    ensureReady: async () => true,
+    launcherDescriptors: () => [],
+  });
+
+  for (const images of ["pending", "ocr-text", "unavailable", "unscanned"]) {
+    const [lane] = (await status({ images })).lanes;
+    assert.deepEqual(lane.content_coverage, { text: "scanned", images, documents: "blocked" });
+    assert.equal(lane.image_version, "image-0123456789ab");
+    assert.equal(lane.policy, "healthy");
+  }
+
+  // A daemon started on a 2-key bundle does not match a 3-key policy on disk.
+  const [stale] = (await status({ identityDetectors: detectors, images: "unscanned" })).lanes;
+  assert.equal(stale.policy, "degraded");
+  assert.equal(stale.privacy, "degraded");
+  assert.equal(Object.hasOwn(stale, "image_version"), false);
+  assert.equal(stale.content_coverage.images, "unscanned");
+});

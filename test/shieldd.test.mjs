@@ -951,3 +951,30 @@ test("text redaction runs on the spliced body, so both the text and the image ar
   assert.equal(parsed.messages[0].content[1].source.data, MASKED_PNG.toString("base64"));
   assert.equal(decision.transformCount, 2);
 });
+
+test("daemon publishes image coverage and republishes it when readiness settles", async () => {
+  const published = async ({ image, settle }) => {
+    const identities = [];
+    let report;
+    await startDaemon({
+      config,
+      paths,
+      readPolicyBundle: async () => ({ bundle: {}, publicKey: "pinned-ed25519-public-key" }),
+      readImageProvision: async () => image,
+      createImageScanner: async ({ onReadiness }) => { report = onReadiness; return { isReady: () => false, inspect: async () => [], close() {} }; },
+      createScanner: async () => ({ version: "8.24.0", scan: async () => ({ findings: [] }) }),
+      loadPolicy: async () => ({ version: "2026.09.02.4", detectorVersions: image ? imageVersions : { gitleaks: "8.24.0", privacy: "privacy-1" }, evaluate: async () => ({ action: "allow", reasonCodes: [], approvalEligible: false, redactions: [] }) }),
+      writePolicyState: async () => {},
+      startProxy: async () => ({ origin: "http://127.0.0.1:8811", close: async () => {} }),
+      writeIdentity: async ({ identity }) => { identities.push(identity.media.images); },
+    });
+    if (settle) { report(settle); await new Promise((resolve) => setImmediate(resolve)); }
+    return identities;
+  };
+  const worker = { version: "image-0123456789ab", path: "/opt/w", sha256: "a".repeat(64) };
+
+  assert.deepEqual(await published({ image: null }), ["unscanned"]);
+  assert.deepEqual(await published({ image: worker }), ["pending"]);
+  assert.deepEqual(await published({ image: worker, settle: { ready: true } }), ["pending", "ocr-text"]);
+  assert.deepEqual(await published({ image: worker, settle: { ready: false, reason: "fixture_missing" } }), ["pending", "unavailable"]);
+});

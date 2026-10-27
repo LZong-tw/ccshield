@@ -69,6 +69,23 @@ detector over them.
 - root and administrator accounts are out of scope: they can change the Shield
   itself.
 
+## Image coverage
+
+Each lane's status reports `content_coverage.images`, taken from the identity
+of the daemon that is running now:
+
+| Value | Meaning |
+| --- | --- |
+| `unscanned` | No image worker is provisioned, or the daemon predates image support. Base64 images forward without OCR. |
+| `pending` | A worker is pinned and its startup readiness check is running (~30 s for the first Vision request). Image requests fail with 503 until it passes. |
+| `ocr-text` | Readiness passed. Images are OCR'd, scanned by Gitleaks and Privacy, and forwarded only as masked PNGs. |
+| `unavailable` | Readiness failed. Image requests fail with 503 until the daemon restarts. |
+
+`ocr-text` means the text Vision can read, not every visual detail. With a
+pinned worker the policy bundle must name it (`detectorVersions.image`), and
+status shows that as `image_version`. The worker is macOS-only and built with
+`ccshield image provision`.
+
 ## License
 
 MIT. See `LICENSE` and `NOTICE`.
