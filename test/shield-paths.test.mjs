@@ -47,6 +47,15 @@ test("Shield paths isolate managed and subscription state and services", () => {
   assert.notEqual(subscription.launchdTarget, managed.launchdTarget);
 });
 
+test("the OPF window cache lives inside each lane's private state directory", () => {
+  for (const lane of ["subscription", "managed"]) {
+    const paths = shieldPaths({ homeDir: "/tmp/home", uid: 501, lane });
+    assert.equal(paths.windowCachePath, join(paths.rootDir, "opf-window-cache"));
+  }
+  const linux = shieldPaths({ env: { XDG_DATA_HOME: "/tmp/xdg" }, homeDir: "/tmp/home", lane: "subscription", platform: "linux" });
+  assert.equal(linux.windowCachePath, "/tmp/xdg/ccshield/subscription/opf-window-cache");
+});
+
 test("shield paths reject relative and escaping overrides", () => {
   assert.throws(() => shieldPaths({ homeDir: "/tmp/home", rootDir: "relative" }), /absolute/);
   assert.throws(() => shieldPaths({ homeDir: "/tmp/home", rootDir: "/tmp/other-state" }), /canonical/);

@@ -31,6 +31,7 @@ export function shieldPaths({ env = process.env, homeDir = homeFromEnv(env), uid
     assetsProvisionPath: childPath(join(root, "assets-provision.json"), root, "assetsProvisionPath"),
     socketPath: childPath(socketPath ?? join(root, "shield.sock"), root, "socketPath"),
     auditDatabasePath: childPath(join(root, "audit.sqlite"), root, "auditDatabasePath"),
+    windowCachePath: childPath(join(root, "opf-window-cache"), root, "windowCachePath"),
     platform: linux ? "linux" : "darwin",
   };
   if (linux) {
