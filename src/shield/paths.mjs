@@ -10,10 +10,12 @@ const SHIELD_LABEL = "com.ccshield";
 const defaultIo = { chmod, constants, lstat, mkdir, open, readFile, rename, unlink };
 const canonicalShieldPaths = new WeakSet();
 
-export function shieldPaths({ env = process.env, homeDir = homeFromEnv(env), uid = readEnv(env, "CCSHIELD_GUI_UID") ?? env.UID ?? process.getuid?.(), lane = "subscription", rootDir, configPath, identityPath, socketPath, launchAgentPath } = {}) {
+export function shieldPaths({ env = process.env, homeDir = homeFromEnv(env), uid = readEnv(env, "CCSHIELD_GUI_UID") ?? env.UID ?? process.getuid?.(), lane = "subscription", platform = process.platform, rootDir, configPath, identityPath, socketPath, launchAgentPath, serviceUnitPath } = {}) {
   assertLane(lane);
   const home = absolutePath(homeDir, "homeDir");
-  const canonicalRoot = join(home, ".local", "share", "ccshield", lane);
+  const linux = platform === "linux";
+  const dataHome = linux ? xdgDir(env, "XDG_DATA_HOME", join(home, ".local", "share")) : join(home, ".local", "share");
+  const canonicalRoot = join(dataHome, "ccshield", lane);
   const root = absolutePath(rootDir ?? readEnv(env, "CCSHIELD_ROOT_DIR") ?? canonicalRoot, "rootDir");
   if (resolve(root) !== resolve(canonicalRoot)) throw new Error("rootDir must be the canonical ccshield state directory");
   const serviceLabel = `${SHIELD_LABEL}.${lane}`;
@@ -29,9 +31,18 @@ export function shieldPaths({ env = process.env, homeDir = homeFromEnv(env), uid
     assetsProvisionPath: childPath(join(root, "assets-provision.json"), root, "assetsProvisionPath"),
     socketPath: childPath(socketPath ?? join(root, "shield.sock"), root, "socketPath"),
     auditDatabasePath: childPath(join(root, "audit.sqlite"), root, "auditDatabasePath"),
-    launchAgentPath: launchAgentPath ?? join(home, "Library", "LaunchAgents", `${serviceLabel}.plist`),
-    launchdDomain: `gui/${numericUid(uid)}`,
+    platform: linux ? "linux" : "darwin",
   };
+  if (linux) {
+    const unitDir = join(xdgDir(env, "XDG_CONFIG_HOME", join(home, ".config")), "systemd", "user");
+    paths.serviceUnitPath = absolutePath(serviceUnitPath ?? join(unitDir, `ccshield-${lane}.service`), "serviceUnitPath");
+    if (resolve(dirname(paths.serviceUnitPath)) !== resolve(unitDir)) throw new Error("serviceUnitPath must be under the systemd user unit directory");
+    Object.freeze(paths);
+    canonicalShieldPaths.add(paths);
+    return paths;
+  }
+  paths.launchAgentPath = launchAgentPath ?? join(home, "Library", "LaunchAgents", `${serviceLabel}.plist`);
+  paths.launchdDomain = `gui/${numericUid(uid)}`;
   paths.launchAgentPath = absolutePath(paths.launchAgentPath, "launchAgentPath");
   if (resolve(dirname(paths.launchAgentPath)) !== resolve(home, "Library", "LaunchAgents")) {
     throw new Error("launchAgentPath must be under homeDir/Library/LaunchAgents");
@@ -559,6 +570,12 @@ function assertDetectorVersions(value, label) {
     result[name] = version;
   }
   return Object.freeze(result);
+}
+
+// XDG base directories must be absolute; a relative value is ignored, as the spec requires.
+function xdgDir(env, name, fallback) {
+  const value = env?.[name];
+  return typeof value === "string" && isAbsolute(value) ? value : fallback;
 }
 
 function homeFromEnv(env) { return typeof env?.HOME === "string" && env.HOME.length > 0 ? env.HOME : homedir(); }

@@ -8,6 +8,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { promisify } from "node:util";
 import { describePlistDrift } from "../launchd-plist.mjs";
+import { describeUnitDrift, renderUnit, unitLabel } from "../systemd-unit.mjs";
 import { envNamesFor } from "../compat-env.mjs";
 
 import { readShieldIdentity, readShieldPolicyState, shieldPaths, writeShieldConfig } from "./paths.mjs";
@@ -22,7 +23,34 @@ const UNKNOWN_REMOTE_HASH = "0".repeat(64);
 
 const defaultIo = { chmod, constants, lstat, mkdir, open, readFile, rename, unlink, writeFile };
 
-export function planShieldService({ paths, nodePath, daemonPath } = {}) {
+// Each platform's service manager sits behind one backend; the exported functions below only pick it.
+const backendFor = (paths) => (paths?.platform === "linux" ? systemdBackend : launchdBackend);
+
+export function planShieldService(options = {}) {
+  return backendFor(options.paths).plan(options);
+}
+
+export async function installShieldService(options = {}) {
+  return backendFor(options.paths).install(options);
+}
+
+export async function startShieldService(options = {}) {
+  return backendFor(options.paths).start(options);
+}
+
+export async function stopShieldService(options = {}) {
+  return backendFor(options.paths).stop(options);
+}
+
+export async function uninstallShieldService(options = {}) {
+  return backendFor(options.paths).uninstall(options);
+}
+
+export async function inspectShieldService(options = {}) {
+  return backendFor(options.paths).inspect(options);
+}
+
+function planLaunchdService({ paths, nodePath, daemonPath } = {}) {
   assertShieldPaths(paths);
   for (const [name, value] of Object.entries({ nodePath, daemonPath })) {
     if (typeof value !== "string" || !isAbsolute(value)) throw new Error(`${name} must be an absolute path`);
@@ -52,8 +80,8 @@ export function planShieldService({ paths, nodePath, daemonPath } = {}) {
   };
 }
 
-export async function installShieldService({ write = false, io = defaultIo, runLaunchctl = defaultLaunchctl, ...options } = {}) {
-  const plan = planShieldService(options);
+async function installLaunchdService({ write = false, io = defaultIo, runLaunchctl = defaultLaunchctl, ...options } = {}) {
+  const plan = planLaunchdService(options);
   if (!write) return plan;
   const config = createShieldConfig(options.config);
   await writeShieldConfig({ paths: options.paths, config, io });
@@ -96,9 +124,9 @@ export function createShieldConfig(config = {}) {
   return validated;
 }
 
-export async function startShieldService(options = {}) {
+async function startLaunchdService(options = {}) {
   const { io = defaultIo, runLaunchctl = defaultLaunchctl, ...rest } = options;
-  const plan = planShieldService(rest);
+  const plan = planLaunchdService(rest);
   let missing = false;
   try {
     await io.readFile(plan.plistPath, "utf8");
@@ -115,7 +143,7 @@ export async function startShieldService(options = {}) {
   return { ...plan, started: true };
 }
 
-export async function stopShieldService({ paths, runLaunchctl = defaultLaunchctl } = {}) {
+async function stopLaunchdService({ paths, runLaunchctl = defaultLaunchctl } = {}) {
   assertShieldPaths(paths);
   await launch(runLaunchctl, ["bootout", paths.launchdTarget], true);
   return { label: SHIELD_SERVICE_LABEL, stopped: true };
@@ -123,7 +151,7 @@ export async function stopShieldService({ paths, runLaunchctl = defaultLaunchctl
 
 // Removes only the lane's LaunchAgent so a retired lane stops coming back at login.
 // Pins, policy and config stay, so a later install needs no re-provisioning.
-export async function uninstallShieldService({ paths, write = false, io = defaultIo, runLaunchctl = defaultLaunchctl, uid = process.getuid?.() } = {}) {
+async function uninstallLaunchdService({ paths, write = false, io = defaultIo, runLaunchctl = defaultLaunchctl, uid = process.getuid?.() } = {}) {
   assertShieldPaths(paths);
   // Bootout must reach the domain the job actually runs in, or unlink would leave it loaded until logout.
   if (write && uid !== undefined && paths.launchdDomain !== `gui/${uid}`) throw new Error(`shield launchd domain ${paths.launchdDomain} is not this user's gui/${uid}`);
@@ -146,17 +174,17 @@ export async function uninstallShieldService({ paths, write = false, io = defaul
   return { label: paths.serviceLabel, installed: true, removed: true };
 }
 
-export async function transitionShieldPolicy({ paths, installPolicy, io = defaultIo, runLaunchctl = defaultLaunchctl, inspectService = inspectShieldService, stopService = stopShieldService, startService = startShieldService, isProcessAlive = defaultIsProcessAlive, probeShield = defaultProbeShield, ensureReady = ensureShieldReady, recordShieldPolicyTransition = null } = {}) {
+export async function transitionShieldPolicy({ paths, installPolicy, io = defaultIo, runLaunchctl = defaultLaunchctl, runSystemctl = defaultSystemctl, inspectService = inspectShieldService, stopService = stopShieldService, startService = startShieldService, isProcessAlive = defaultIsProcessAlive, probeShield = defaultProbeShield, ensureReady = ensureShieldReady, recordShieldPolicyTransition = null } = {}) {
   if (typeof installPolicy !== "function") throw new TypeError("shield policy transition installer is required");
   if (recordShieldPolicyTransition !== null && typeof recordShieldPolicyTransition !== "function") {
     throw new TypeError("shield policy transition recorder is invalid");
   }
   const previous = await readShieldIdentity({ paths, io });
-  const service = await inspectService({ paths, io, runLaunchctl });
+  const service = await inspectService({ paths, io, runLaunchctl, runSystemctl });
   if (service.active) {
     if (!previous || service.pid !== previous.pid) throw new Error("shield policy transition cannot quiesce an unbound active daemon");
-    await stopService({ paths, runLaunchctl });
-    const stopped = await inspectService({ paths, io, runLaunchctl });
+    await stopService({ paths, runLaunchctl, runSystemctl });
+    const stopped = await inspectService({ paths, io, runLaunchctl, runSystemctl });
     if (stopped.active) throw new Error("shield policy transition could not stop the prior daemon");
     if (await isProcessAlive(previous.pid)) throw new Error("shield policy transition could not stop the prior daemon");
     if (await probeShield(previous.origin, previous.capability)) throw new Error("shield policy transition prior proxy remains reachable");
@@ -184,7 +212,7 @@ export async function transitionShieldPolicy({ paths, installPolicy, io = defaul
     await recordTransition();
     return installed;
   }
-  await startService({ paths, io, runLaunchctl });
+  await startService({ paths, io, runLaunchctl, runSystemctl });
   const config = await readShieldConfig({ paths, io });
   const ready = await ensureReady({
     lane: config.lane,
@@ -202,7 +230,7 @@ export async function transitionShieldPolicy({ paths, installPolicy, io = defaul
   return installed;
 }
 
-export async function inspectShieldService({ paths, io = defaultIo, runLaunchctl = defaultLaunchctl } = {}) {
+async function inspectLaunchdService({ paths, io = defaultIo, runLaunchctl = defaultLaunchctl } = {}) {
   assertShieldPaths(paths);
   const installed = await io.readFile(paths.launchAgentPath, "utf8").then(() => true, () => false);
   const printed = await launch(runLaunchctl, ["print", paths.launchdTarget], true);
@@ -530,6 +558,13 @@ function normalizeShieldTargetOrigin(value, label) {
 }
 
 function assertShieldPaths(paths) {
+  if (paths?.platform === "linux") {
+    if (typeof paths.serviceUnitPath !== "string" || !isAbsolute(paths.serviceUnitPath) || basename(paths.serviceUnitPath) !== `ccshield-${paths.lane}.service`) {
+      throw new Error("paths.serviceUnitPath must be the absolute lane-specific shield unit path");
+    }
+    assertShieldStateLayout(paths);
+    return;
+  }
   if (!paths?.rootDir || !paths.lane || !paths.serviceLabel || !paths.configPath || !paths.identityPath || !paths.policyStatePath || !paths.launchAgentPath || !paths.launchdDomain || !paths.launchdTarget) {
     throw new TypeError("shield service paths are required");
   }
@@ -538,6 +573,13 @@ function assertShieldPaths(paths) {
   }
   if (!isAbsolute(paths.launchAgentPath) || basename(paths.launchAgentPath) !== `${paths.serviceLabel}.plist`) {
     throw new Error("paths.launchAgentPath must be the absolute lane-specific shield plist path");
+  }
+  assertShieldStateLayout(paths);
+}
+
+function assertShieldStateLayout(paths) {
+  if (!paths.rootDir || !paths.lane || !paths.serviceLabel || !paths.configPath || !paths.identityPath || !paths.policyStatePath) {
+    throw new TypeError("shield service paths are required");
   }
   if ((paths.lane !== "subscription" && paths.lane !== "managed") || paths.serviceLabel !== `${SHIELD_SERVICE_LABEL}.${paths.lane}` || !isAbsolute(paths.rootDir) || paths.configPath !== resolve(paths.rootDir, "config.json") || paths.identityPath !== resolve(paths.rootDir, "identity.json") || paths.policyStatePath !== resolve(paths.rootDir, "policy-state.json")) {
     throw new Error("shield service paths must use the canonical shield state layout");
@@ -555,6 +597,137 @@ function assertCompleteDetectorVersions(value) {
   if (!value || typeof value !== "object" || Object.keys(value).length !== 2
     || typeof value.gitleaks !== "string" || typeof value.privacy !== "string") {
     throw new Error("shield detector binding must include Gitleaks and Privacy");
+  }
+}
+
+const launchdBackend = {
+  plan: planLaunchdService,
+  install: installLaunchdService,
+  start: startLaunchdService,
+  stop: stopLaunchdService,
+  uninstall: uninstallLaunchdService,
+  inspect: inspectLaunchdService,
+};
+
+function planSystemdService({ paths, nodePath, daemonPath } = {}) {
+  assertShieldPaths(paths);
+  for (const [name, value] of Object.entries({ nodePath, daemonPath })) {
+    if (typeof value !== "string" || !isAbsolute(value)) throw new Error(`${name} must be an absolute path`);
+  }
+  const unit = renderUnit({ nodePath, daemonPath, configPath: paths.configPath, label: paths.serviceLabel });
+  const unitName = basename(paths.serviceUnitPath);
+  return {
+    label: paths.serviceLabel,
+    unitPath: paths.serviceUnitPath,
+    unitName,
+    unit,
+    operations: [
+      { op: "mkdir", path: dirname(paths.serviceUnitPath), mode: 0o700 },
+      { op: "writeFileAtomic", path: paths.serviceUnitPath, mode: 0o600, content: unit },
+      { op: "daemon-reload" },
+      { op: "enable", unit: unitName, now: true },
+    ],
+  };
+}
+
+async function installSystemdService({ write = false, io = defaultIo, runSystemctl = defaultSystemctl, ...options } = {}) {
+  const plan = planSystemdService(options);
+  if (!write) return plan;
+  const config = createShieldConfig(options.config);
+  await writeShieldConfig({ paths: options.paths, config, io });
+  await io.mkdir(dirname(plan.unitPath), { recursive: true, mode: 0o700 });
+  const temporaryPath = `${plan.unitPath}.tmp-${process.pid}`;
+  await io.writeFile(temporaryPath, plan.unit, { mode: 0o600 });
+  await io.chmod(temporaryPath, 0o600);
+  await io.rename(temporaryPath, plan.unitPath);
+  await systemctl(runSystemctl, ["daemon-reload"]);
+  await systemctl(runSystemctl, ["enable", "--now", plan.unitName]);
+  return { ...plan, written: true };
+}
+
+async function startSystemdService({ io = defaultIo, runSystemctl = defaultSystemctl, ...rest } = {}) {
+  const plan = planSystemdService(rest);
+  let existing;
+  try {
+    existing = await io.readFile(plan.unitPath, "utf8");
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    throw new Error("shield service is not installed; run 'ccshield install --write' before start");
+  }
+  if (existing !== plan.unit) throw new Error(`shield service unit path drift detected: ${plan.unitPath} (${describeUnitDrift(existing, plan.unit)}); run the install command from the checkout that should own this unit`);
+  await systemctl(runSystemctl, ["daemon-reload"]);
+  await systemctl(runSystemctl, ["start", plan.unitName]);
+  return { ...plan, started: true };
+}
+
+async function stopSystemdService({ paths, runSystemctl = defaultSystemctl } = {}) {
+  assertShieldPaths(paths);
+  await systemctl(runSystemctl, ["stop", basename(paths.serviceUnitPath)]);
+  return { label: SHIELD_SERVICE_LABEL, stopped: true };
+}
+
+// Removes only the lane's unit; pins, policy and config stay, as with the LaunchAgent.
+async function uninstallSystemdService({ paths, write = false, io = defaultIo, runSystemctl = defaultSystemctl, uid = process.getuid?.() } = {}) {
+  assertShieldPaths(paths);
+  const unitName = basename(paths.serviceUnitPath);
+  let stat;
+  try {
+    stat = await io.lstat(paths.serviceUnitPath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    // A unit file deleted by hand can leave its service running until the manager reloads.
+    if (write) await systemctl(runSystemctl, ["stop", unitName], UNKNOWN_UNIT);
+    return { label: paths.serviceLabel, installed: false, removed: false };
+  }
+  if (!stat.isFile() || (uid !== undefined && stat.uid !== uid)) throw new Error(`shield service unit is not a regular file owned by this user: ${paths.serviceUnitPath}`);
+  const unit = await io.readFile(paths.serviceUnitPath, "utf8");
+  if (unitLabel(unit) !== paths.serviceLabel) throw new Error(`shield service unit does not belong to ${paths.serviceLabel}: ${paths.serviceUnitPath}`);
+  if (!write) return { label: paths.serviceLabel, installed: true, removed: false, operations: [{ op: "disable", unit: unitName, now: true }, { op: "unlink", path: paths.serviceUnitPath }, { op: "daemon-reload" }] };
+  await systemctl(runSystemctl, ["disable", "--now", unitName]);
+  await io.unlink(paths.serviceUnitPath);
+  await systemctl(runSystemctl, ["daemon-reload"]);
+  return { label: paths.serviceLabel, installed: true, removed: true };
+}
+
+// `systemctl show` succeeds even for a unit it has never heard of, so loaded comes from LoadState, not the exit code.
+async function inspectSystemdService({ paths, io = defaultIo, runSystemctl = defaultSystemctl } = {}) {
+  assertShieldPaths(paths);
+  const installed = await io.readFile(paths.serviceUnitPath, "utf8").then(() => true, () => false);
+  const shown = await systemctl(runSystemctl, ["show", "-p", "ActiveState,MainPID,LoadState", basename(paths.serviceUnitPath)], /.*/s);
+  const property = (name) => new RegExp(`^${name}=(.*)$`, "m").exec(shown.stdout ?? "")?.[1]?.trim();
+  const state = shown.ok ? (property("ActiveState") ?? null) : null;
+  const pidValue = property("MainPID");
+  const pid = shown.ok && /^\d+$/.test(pidValue ?? "") && Number(pidValue) > 0 ? Number(pidValue) : null;
+  const loaded = shown.ok && property("LoadState") === "loaded";
+  const active = loaded && state === "active" && pid !== null;
+  return { label: paths.serviceLabel, installed, loaded, active, pid, state, stale: installed && !active };
+}
+
+const systemdBackend = {
+  plan: planSystemdService,
+  install: installSystemdService,
+  start: startSystemdService,
+  stop: stopSystemdService,
+  uninstall: uninstallSystemdService,
+  inspect: inspectSystemdService,
+};
+
+const UNKNOWN_UNIT = /not loaded|not found|does not exist/i;
+
+async function systemctl(runSystemctl, args, tolerated = null) {
+  const result = await runSystemctl(["--user", ...args]);
+  if (result?.ok === false && !(tolerated && tolerated.test(result.stderr ?? ""))) {
+    throw new Error(`systemctl --user ${args[0]} failed: ${result.stderr ?? "unknown error"}`);
+  }
+  return { ok: result?.ok !== false, ...result };
+}
+
+async function defaultSystemctl(args) {
+  try {
+    const result = await execFileAsync("systemctl", args);
+    return { ok: true, status: 0, stdout: result.stdout, stderr: result.stderr };
+  } catch (error) {
+    return { ok: false, status: error.code, stderr: error.stderr ?? error.message };
   }
 }
 
