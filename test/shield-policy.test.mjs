@@ -53,6 +53,15 @@ test("policy activation requires both Gitleaks and Privacy detector versions", a
   );
 });
 
+test("policy activation accepts exactly two or three detector keys", async () => {
+  const three = await loadTestPolicy({ bundle: signedBundle({ detectorVersions: { gitleaks: "8.24.0", image: "image-0123456789ab", privacy: "privacy-1" } }) });
+  assert.deepEqual(three.detectorVersions, { gitleaks: "8.24.0", image: "image-0123456789ab", privacy: "privacy-1" });
+  for (const detectorVersions of [{ gitleaks: "8.24.0", image: "image-0123456789ab" }, { image: "image-0123456789ab", privacy: "privacy-1" },
+    { gitleaks: "8.24.0", image: "image-0123456789ab", privacy: "privacy-1", extra: "1" }, { gitleaks: "8.24.0", image: "", privacy: "privacy-1" }]) {
+    await assert.rejects(loadTestPolicy({ bundle: signedBundle({ detectorVersions }) }), /detector version/i, JSON.stringify(detectorVersions));
+  }
+});
+
 test("policy activation exposes a signed Privacy fallback and rejects malformed ones", async () => {
   assert.deepEqual((await loadTestPolicy()).detectorFallbacks, {});
   const policy = await loadTestPolicy({ bundle: signedBundle({ detectorFallbacks: { privacy: "regex-v1" } }) });

@@ -427,6 +427,7 @@ test("daemon composes provisioned Privacy findings and sends only a valid policy
     paths,
     readPolicyBundle: async () => ({ bundle: {}, publicKey: "pinned-ed25519-public-key" }),
     readAssetsProvision: async () => assetsProvision(),
+    readImageProvision: async () => null,
     createPrivacy: async () => ({
       version: "privacy-1",
       async scan() {
@@ -479,6 +480,7 @@ test("daemon uses the signed OPA policy to redact a non-email Privacy finding be
     paths,
     readPolicyBundle: async () => signedCompiledPolicyBundle(),
     readAssetsProvision: async () => assetsProvision(),
+    readImageProvision: async () => null,
     createPrivacy: async () => ({
       version: "privacy-1",
       async scan() {
@@ -631,6 +633,7 @@ test("daemon blocks every privacy worker failure before a real upstream fetch", 
       paths,
       readPolicyBundle: async () => ({ bundle: {}, publicKey: "pinned-ed25519-public-key" }),
       readAssetsProvision: async () => assetsProvision(),
+      readImageProvision: async () => null,
       createPrivacy: async ({ provision }) => createPrivacyFilter({
         provision,
         spawnWorker: () => fakePrivacyWorker(failure.handle),
@@ -836,6 +839,7 @@ function signedCompiledPolicyBundle() {
 function startDaemon(options) {
   return startShieldDaemon({
     readAssetsProvision: async () => assetsProvision(),
+    readImageProvision: async () => null,
     createPrivacy: async () => ({ version: "privacy-1", async scan() { return { status: "ok", findings: [], redactions: [] }; }, close() {} }),
     createDecisionRecorder: async () => ({ recordShieldDecision: async () => ({ durable: "ack" }) }),
     ...options,

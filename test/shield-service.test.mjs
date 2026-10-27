@@ -634,6 +634,24 @@ test("readiness rejects an incomplete detector binding before probing", async ()
   assert.equal(probes, 0);
 });
 
+test("readiness accepts a three-key detector binding with an image version", async () => {
+  const { paths } = fixture();
+  const detectorVersions = { gitleaks: "8.24.0", image: "image-0123456789ab", privacy: "privacy-1" };
+  const identity = {
+    origin: "http://127.0.0.1:8811", capability, version: 1, pid: 42,
+    lane: "subscription", generation, targetClass: "subscription",
+    policyVersion: policyState.version, detectorVersions,
+  };
+  const ready = await ensureShieldReady({
+    lane: "subscription", paths,
+    io: shieldStateIo(paths, { identity, config: { capability, targetOrigin: "https://api.anthropic.com", lane: "subscription", generation }, state: { version: policyState.version, detectorVersions } }),
+    inspectService: async () => ({ loaded: true, active: true, pid: 42 }),
+    isProcessAlive: async () => true,
+    probeShield: async () => true,
+  });
+  assert.deepEqual(ready.detectorVersions, detectorVersions);
+});
+
 test("start refuses launchd plist path drift before mutating the job", async () => {
   const { options } = fixture();
   const calls = [];

@@ -129,6 +129,7 @@ test("diagnostics separate real daemon scan, policy and redaction failures while
       return { action: mode === "redaction" ? "redact" : "allow" };
     } }),
     readAssetsProvision: async () => ({ gitleaks: { path: gitleaks.executable, sha256: gitleaks.sha256, rules: gitleaks.ruleBundle }, privacy: { state: "verified", version: "privacy-1", worker: { command: "/private/fixture/worker", args: [], sha256: "c".repeat(64) } } }),
+    readImageProvision: async () => null,
     createScanner: async () => ({ version: "8", async scan() { if (mode === "secret") throw new Error("scanner-secret"); return { findings: [] }; } }),
     createPrivacy: async (options) => {
       const privacy = await createPrivacyFilter({ ...options, spawnWorker: () => worker, validateWorker: async () => {} });
@@ -193,6 +194,7 @@ test("a client disconnect aborts the daemon's privacy scan and frees its queued 
     readPolicyBundle: async () => ({ bundle: {}, publicKey: "fixture" }),
     loadPolicy: async () => ({ version: "policy-1", detectorVersions: { gitleaks: "8", privacy: "privacy-1" }, async evaluate() { return { action: "allow" }; } }),
     readAssetsProvision: async () => ({ gitleaks: { path: gitleaks.executable, sha256: gitleaks.sha256, rules: gitleaks.ruleBundle }, privacy: { state: "verified", version: "privacy-1", worker: { command: "/private/fixture/worker", args: [], sha256: "c".repeat(64) } } }),
+    readImageProvision: async () => null,
     createScanner: async () => ({ version: "8", async scan() { return { findings: [] }; } }),
     createPrivacy: async (options) => {
       filter = await createPrivacyFilter({ ...options, spawnWorker: () => worker, validateWorker: async () => {} });
@@ -269,6 +271,7 @@ test("the daemon keeps the privacy Retry-After estimate on its shield failure", 
     readPolicyBundle: async () => ({ bundle: {}, publicKey: "fixture" }),
     loadPolicy: async () => ({ version: "policy-1", detectorVersions: { gitleaks: "8", privacy: "privacy-1" }, async evaluate() { return { action: "allow" }; } }),
     readAssetsProvision: async () => ({ gitleaks: { path: gitleaks.executable, sha256: gitleaks.sha256, rules: gitleaks.ruleBundle }, privacy: { state: "verified", version: "privacy-1", worker: { command: "/private/fixture/worker", args: [], sha256: "c".repeat(64) } } }),
+    readImageProvision: async () => null,
     createScanner: async () => ({ version: "8", async scan() { return { findings: [] }; } }),
     createPrivacy: async () => ({
       version: "privacy-1", async isReady() { return true; }, recentScans: () => [], close() {},

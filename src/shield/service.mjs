@@ -594,7 +594,8 @@ function sameDetectorVersions(actual, expected) {
 }
 
 function assertCompleteDetectorVersions(value) {
-  if (!value || typeof value !== "object" || Object.keys(value).length !== 2
+  const size = value && typeof value === "object" ? Object.keys(value).length : 0;
+  if ((size !== 2 && !(size === 3 && typeof value.image === "string"))
     || typeof value.gitleaks !== "string" || typeof value.privacy !== "string") {
     throw new Error("shield detector binding must include Gitleaks and Privacy");
   }

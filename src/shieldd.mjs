@@ -5,7 +5,7 @@ import "./quiet-sqlite.mjs";
 import { stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
-import { readShieldAssetsProvision, shieldPathsForConfigPath, writeShieldIdentity, writeShieldPolicyState } from "./shield/paths.mjs";
+import { readShieldAssetsProvision, readShieldImageProvision, shieldPathsForConfigPath, writeShieldIdentity, writeShieldPolicyState } from "./shield/paths.mjs";
 import { classifyShieldRequest } from "./shield/classify.mjs";
 import { createGitleaksScanner } from "./shield/gitleaks.mjs";
 import { readShieldPolicyProvision } from "./shield/policy-bundle.mjs";
@@ -41,6 +41,7 @@ export async function startShieldDaemon({
   pid = process.pid,
   readPolicyBundle = readShieldPolicyProvision,
   readAssetsProvision = readShieldAssetsProvision,
+  readImageProvision = readShieldImageProvision,
   loadPolicy = loadShieldPolicy,
   createScanner = createGitleaksScanner,
   createPrivacy = createPrivacyFilter,
@@ -54,6 +55,10 @@ export async function startShieldDaemon({
   const destinationClass = resolveDestinationClass(config);
   const provision = await readPolicyBundle({ paths });
   const policy = await loadPolicy({ bundle: provision.bundle, publicKey: provision.publicKey });
+  // Once an image worker is pinned, only a bundle that names that exact image
+  // version may boot, so a 2-key bundle cannot silently drop image scanning.
+  const image = await readImageProvision({ paths });
+  if (image && policy.detectorVersions.image !== image.version) throw new Error("shield image detector version does not match the provisioned worker");
   const assets = await readAssetsProvision({ paths });
   if (!assets) throw new Error("shield asset provision is missing");
   if (!config.gitleaks) throw new Error("shield gitleaks provision is missing");

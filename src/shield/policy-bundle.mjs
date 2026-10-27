@@ -127,8 +127,9 @@ function assertSelfTest(value) {
 function assertDetectorVersions(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("shield policy detector versions are required");
   const names = Object.keys(value).sort();
-  if (names.length !== 2 || names[0] !== "gitleaks" || names[1] !== "privacy") {
-    throw new Error("shield policy detector versions must include Gitleaks and Privacy");
+  const key = names.join();
+  if (key !== "gitleaks,privacy" && key !== "gitleaks,image,privacy") {
+    throw new Error("shield policy detector versions must be Gitleaks and Privacy, optionally with Image");
   }
   for (const [name, version] of Object.entries(value)) {
     assertSafeIdentifier(name, "shield policy detector name");
