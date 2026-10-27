@@ -1460,7 +1460,7 @@ class OPF:
         assert type(cache).__name__ == "ExactWindowLogitsCache"
         assert f"cpu:threads{expected_threads()}:" in cache._namespace and "ctx4096" in cache._namespace
         assert "adb9dd7d6f47e482ccb0925e621a1375461b997833dfa5be6dfc67b9d58b6f0e" in cache._namespace
-        assert "e5c38fa18d71767b939c659ededbc063ea40a1d6fa235ec920a8d718bc832f9b" in cache._namespace
+        assert "c889077d58c1e5da6a59ba54e281fa926f58b8e367ba9a42c99ceabf0fbde53b" in cache._namespace
         self.calls += 1
         scan_number[0] = self.calls
         if self.calls == 1:

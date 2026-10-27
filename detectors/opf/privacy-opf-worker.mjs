@@ -18,7 +18,7 @@ const MAX_BODY_BYTES = 1_048_576;
 const MAX_SCANS = 4;
 const HELPERS = {
   "opf-cpu-grouped.py": "adb9dd7d6f47e482ccb0925e621a1375461b997833dfa5be6dfc67b9d58b6f0e",
-  "opf-window-cache.py": "e5c38fa18d71767b939c659ededbc063ea40a1d6fa235ec920a8d718bc832f9b",
+  "opf-window-cache.py": "c889077d58c1e5da6a59ba54e281fa926f58b8e367ba9a42c99ceabf0fbde53b",
   "opf-mmap-weights.py": "8be0f49097d7317937ebe7572b09619925b0c10044f0376d6438f31400485bbc",
   "opf-viterbi-deadline.py": "6fbfb16aae67c6eecacc292f8d41dda13cbe7d6792d8c2be97b8d629cc590117",
 };

@@ -1,5 +1,5 @@
 """Offline exact-window logits cache; never caches privacy decisions."""
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from hashlib import sha256
 import errno
 import json
@@ -11,6 +11,9 @@ import torch
 
 
 class CooperativeScanTimeout(TimeoutError):
+    # remaining_ms: projected compute for the unscanned windows, or None when unknown.
+    remaining_ms = None
+
     """The current scan exhausted its budget without invalidating complete windows."""
 
 
@@ -289,28 +292,45 @@ class ExactWindowLogitsCache:
         self._entries = OrderedDict()
         self._bytes = self._hits = self._misses = self._evictions = 0
         self._clock, self._deadline, self._interrupt = clock, None, None
+        self._started = self._total = None
+        self._done = 0
+        # Recent cold-forward seconds; hits are excluded so they cannot mask slow windows.
+        self._miss_seconds, self._miss_median = deque(maxlen=32), None
         if disk is not None and not isinstance(disk, DiskTier):
             raise TypeError("disk must be a DiskTier or None")
         self._disk, self._disk_errors = disk, 0
         self.set_namespace(namespace)
 
-    def begin_scan(self, budget_seconds, interrupt=None):
+    def begin_scan(self, budget_seconds, interrupt=None, total_windows=None):
         if not isinstance(budget_seconds, (int, float)) or isinstance(budget_seconds, bool) \
                 or not isfinite(budget_seconds) or budget_seconds <= 0:
             raise ValueError("scan budget must be finite and positive")
         if interrupt is not None and not callable(interrupt):
             raise TypeError("scan interrupt must be callable")
+        if total_windows is not None and (not isinstance(total_windows, int)
+                                          or isinstance(total_windows, bool) or total_windows <= 0):
+            raise ValueError("scan window total must be a positive integer")
         if self._deadline is not None:
             raise RuntimeError("scan budget is already active")
-        self._deadline = self._clock() + budget_seconds
-        self._interrupt = interrupt
+        self._started = self._clock()
+        self._deadline = self._started + budget_seconds
+        self._interrupt, self._total, self._done = interrupt, total_windows, 0
 
     def end_scan(self):
-        self._deadline = self._interrupt = None
+        self._deadline = self._interrupt = self._started = self._total = None
+
+    def _remaining_ms(self):
+        if self._total is None or self._miss_median is None:
+            return None
+        return int(max(0, self._total - self._done) * self._miss_median * 1000)
 
     def check_deadline(self):
-        if self._deadline is not None and self._clock() >= self._deadline:
-            raise CooperativeScanTimeout("scan budget exhausted")
+        if self._deadline is not None:
+            now, remaining = self._clock(), self._remaining_ms()
+            if now >= self._deadline or (remaining is not None and now + remaining / 1000 > self._deadline):
+                timeout = CooperativeScanTimeout("scan budget exhausted")
+                timeout.remaining_ms = remaining
+                raise timeout
         if self._interrupt is not None and self._interrupt():
             raise ScanInterrupted("scan interrupted")
 
@@ -343,6 +363,7 @@ class ExactWindowLogitsCache:
         self.check_deadline()
         if key in self._entries:
             self._hits += 1
+            self._done += 1
             self._entries.move_to_end(key)
             result = self._entries[key][0].clone()
             self.check_deadline()
@@ -353,7 +374,10 @@ class ExactWindowLogitsCache:
             disk_key = self._disk.key(self._namespace, tokens, attention_mask)
             stored = self._disk_call(self._disk.get, disk_key, tokens.shape[-1])
         if stored is None:
+            started = self._clock()
             logits = self.original_forward(tokens, attention_mask=attention_mask)
+            self._miss_seconds.append(self._clock() - started)
+            self._miss_median = sorted(self._miss_seconds)[len(self._miss_seconds) // 2]
             if not isinstance(logits, torch.Tensor) or logits.device.type != "cpu":
                 raise RuntimeError("model must return CPU logits")
             stored = logits.detach().clone()
@@ -362,6 +386,7 @@ class ExactWindowLogitsCache:
         size = stored.numel()*stored.element_size() + len(token_key[2]) + len(self._namespace.encode())
         if mask_key is not None:
             size += len(mask_key[2])
+        self._done += 1
         if size <= self.max_bytes:
             while self._entries and (len(self._entries) >= self.max_entries or self._bytes+size > self.max_bytes):
                 _, (_, removed_size) = self._entries.popitem(last=False)
@@ -488,6 +513,74 @@ def self_test():
             self.assertEqual(self.cache.snapshot()["hits"], 1)
             with self.assertRaises(TypeError):
                 self.cache.begin_scan(1, interrupt=3)
+
+        def projected(self, window_seconds):
+            now = [0.0]
+            model = Model().eval()
+            original = model.forward
+            def timed(tokens, attention_mask=None):
+                now[0] += window_seconds
+                return original(tokens, attention_mask)
+            model.forward = timed
+            return ExactWindowLogitsCache(model, namespace="ns", clock=lambda: now[0]), now
+
+        def test_projection_stops_as_soon_as_the_budget_cannot_cover_the_rest(self):
+            cache, now = self.projected(10.0)
+            windows = [torch.tensor([[n]], dtype=torch.int32) for n in range(5)]
+            with torch.inference_mode():
+                cache.begin_scan(35, total_windows=5)
+                with self.assertRaises(CooperativeScanTimeout) as raised:
+                    cache.forward(windows[0])
+                cache.end_scan()
+                # 10 s spent plus four more at 10 s is 50 s > 35 s; the finished window stays cached.
+                self.assertEqual(now[0], 10.0)
+                self.assertEqual(raised.exception.remaining_ms, 40_000)
+                self.assertNotIsInstance(raised.exception, ScanInterrupted)
+                cache.begin_scan(55, total_windows=5)
+                for window in windows:
+                    cache.forward(window)
+                cache.end_scan()
+            self.assertEqual(now[0], 50.0)
+
+        def test_without_a_window_total_only_the_hard_deadline_applies(self):
+            cache, now = self.projected(10.0)
+            with torch.inference_mode():
+                cache.forward(torch.tensor([[1]], dtype=torch.int32))
+                cache.begin_scan(15)
+                cache.forward(torch.tensor([[2]], dtype=torch.int32))
+                cache.end_scan()
+                cache.begin_scan(15, total_windows=100)
+                with self.assertRaises(CooperativeScanTimeout):
+                    cache.forward(torch.tensor([[3]], dtype=torch.int32))
+                cache.end_scan()
+
+        def test_cache_hits_do_not_enter_the_miss_median(self):
+            cache, now = self.projected(10.0)
+            hot = torch.tensor([[1]], dtype=torch.int32)
+            with torch.inference_mode():
+                cache.forward(hot)
+                cache.begin_scan(1000, total_windows=3)
+                for _ in range(3):
+                    cache.forward(hot)
+                cache.end_scan()
+                # Zero-cost hits must not drag the 10 s median down and hide five slow windows.
+                cache.begin_scan(25, total_windows=5)
+                with self.assertRaises(CooperativeScanTimeout) as raised:
+                    cache.forward(torch.tensor([[2]], dtype=torch.int32))
+                cache.end_scan()
+            self.assertEqual(now[0], 10.0)
+            self.assertEqual(raised.exception.remaining_ms, 50_000)
+
+        def test_an_exhausted_budget_reports_its_unscanned_windows(self):
+            cache, now = self.projected(10.0)
+            with torch.inference_mode():
+                cache.begin_scan(5, total_windows=3)
+                with self.assertRaises(CooperativeScanTimeout) as raised:
+                    cache.forward(torch.tensor([[1]], dtype=torch.int32))
+                cache.end_scan()
+            self.assertEqual(raised.exception.remaining_ms, 20_000)
+            with self.assertRaises(ValueError):
+                cache.begin_scan(5, total_windows=0)
 
         def test_failed_compute_is_not_cached(self):
             self.model.fail = True
