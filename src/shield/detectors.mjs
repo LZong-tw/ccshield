@@ -7,6 +7,7 @@ import { provisionOpfPrivacy } from "./opf-privacy.mjs";
 import { buildOpfVenv } from "./opf-venv.mjs";
 import { doctorGitleaksWarnings, gitleaksOverride, installGitleaks, pinnedGitleaksSha256 } from "./gitleaks-install.mjs";
 import { detectPlatform } from "./platform.mjs";
+import { adoptAsset, storedGitleaksPath } from "./asset-adopt.mjs";
 import { readShieldAssetsProvision, shieldAssetStore, updateShieldAssetsProvision } from "./paths.mjs";
 
 const UNSUPPORTED_NOTICE = "OPF is unsupported on this platform; Shield stays on regex + Gitleaks";
@@ -22,6 +23,7 @@ function defaults(io = {}) {
     buildOpfVenv: io.buildOpfVenv ?? buildOpfVenv,
     installGitleaks: io.installGitleaks ?? installGitleaks,
     gitleaksOverride: io.gitleaksOverride ?? gitleaksOverride,
+    adoptAsset: io.adoptAsset ?? adoptAsset,
     doctorGitleaksWarnings: io.doctorGitleaksWarnings ?? doctorGitleaksWarnings,
     pinnedGitleaksSha256: io.pinnedGitleaksSha256 ?? pinnedGitleaksSha256,
     exists: io.exists ?? (async (path) => access(path).then(() => true, () => false)),
@@ -54,7 +56,7 @@ export async function fetchDetectorAssets({ paths, gitleaksPath, write = false, 
   }
 
   const gitleaks = gitleaksPath
-    ? await deps.gitleaksOverride({ path: gitleaksPath })
+    ? await adoptOverride(await deps.gitleaksOverride({ path: gitleaksPath }), paths, deps)
     : await deps.installGitleaks({ pins, store: shieldAssetStore(paths), platform });
   const gitleaksSummary = { origin: gitleaks.origin, version: gitleaks.version, sha256: gitleaks.sha256 };
   if (background && platform.supported) {
@@ -150,7 +152,7 @@ async function recordDetectorInstall({ paths, gitleaks, opf, deps }) {
       outcome = "written";
       return {
         ...rest,
-        ...(gitleaks ? { gitleaks: { origin: gitleaks.origin, version: gitleaks.version, path: gitleaks.path, sha256: gitleaks.sha256, rules: current.gitleaks.rules } } : {}),
+        ...(gitleaks ? { gitleaks: { origin: gitleaks.origin, version: gitleaks.version, path: gitleaks.path, ...(gitleaks.source ? { source: gitleaks.source } : {}), sha256: gitleaks.sha256, rules: current.gitleaks.rules } } : {}),
         ...(nextOpf ? { opf: nextOpf } : {}),
       };
     },
@@ -231,4 +233,12 @@ async function opfWarnings({ paths, opf, pins, platform, deps }) {
 
 function platformSummary(platform) {
   return { supported: platform.supported, key: platform.key ?? "none", ...(platform.reason ? { reason: platform.reason } : {}) };
+}
+
+// An override is copied into the asset store so a Homebrew upgrade or cleanup
+// of the original path cannot take the daemon's binary away.
+async function adoptOverride(gitleaks, paths, deps) {
+  const target = storedGitleaksPath(shieldAssetStore(paths).root, gitleaks.sha256);
+  await deps.adoptAsset({ source: gitleaks.path, sha256: gitleaks.sha256, target, executable: true });
+  return Object.freeze({ ...gitleaks, path: target, source: gitleaks.path });
 }

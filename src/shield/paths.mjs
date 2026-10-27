@@ -345,15 +345,20 @@ export function shieldAssetStore(paths) {
 export function assertShieldAssetsProvision(state, { storeRoot } = {}) {
   const v3 = state?.version === ASSETS_FORMAT_VERSION;
   const keys = state?.version === 1 ? ["bundle", "gitleaks", "privacy", "version"] : ["bundle", "gitleaks", "privacy", "regex", "version"];
-  const gitleaksKeys = v3 && isPlainObject(state.gitleaks) && "origin" in state.gitleaks
+  // `source` is optional: where a store copy was adopted from, so doctor can
+  // tell when an upgrade replaced the original and the copy went stale.
+  const withSource = (base, value) => (isPlainObject(value) && "source" in value ? [...base, "source"].sort() : base);
+  const gitleaksKeys = withSource(v3 && isPlainObject(state.gitleaks) && "origin" in state.gitleaks
     ? ["origin", "path", "rules", "sha256", "version"]
-    : ["path", "rules", "sha256"];
+    : ["path", "rules", "sha256"], state?.gitleaks);
   if (!isPlainObject(state) || !exactKeys(state, v3 && "opf" in state ? [...keys, "opf"].sort() : keys)
     || (state.version !== 1 && state.version !== 2 && !v3)
     || !isPlainObject(state.bundle) || !exactKeys(state.bundle, ["path", "sha256", "version"])
     || !isPlainObject(state.gitleaks) || !exactKeys(state.gitleaks, gitleaksKeys)
     || (state.gitleaks.origin !== undefined && !GITLEAKS_ORIGINS.has(state.gitleaks.origin))
-    || !isPlainObject(state.gitleaks.rules) || !exactKeys(state.gitleaks.rules, ["path", "sha256", "version"])) {
+    || !isPlainObject(state.gitleaks.rules) || !exactKeys(state.gitleaks.rules, withSource(["path", "sha256", "version"], state.gitleaks.rules))
+    || (state.gitleaks.source !== undefined && !safePath(state.gitleaks.source))
+    || (state.gitleaks.rules.source !== undefined && !safePath(state.gitleaks.rules.source))) {
     throw new Error("shield asset provision is invalid");
   }
   assertAssetReference(state.bundle, "shield policy bundle");
@@ -366,7 +371,11 @@ export function assertShieldAssetsProvision(state, { storeRoot } = {}) {
       ...(state.gitleaks.origin ? { origin: state.gitleaks.origin, version: state.gitleaks.version } : {}),
       sha256: state.gitleaks.sha256,
       path: state.gitleaks.path,
-      rules: Object.freeze({ path: state.gitleaks.rules.path, sha256: state.gitleaks.rules.sha256, version: state.gitleaks.rules.version }),
+      ...(state.gitleaks.source ? { source: state.gitleaks.source } : {}),
+      rules: Object.freeze({
+        path: state.gitleaks.rules.path, sha256: state.gitleaks.rules.sha256, version: state.gitleaks.rules.version,
+        ...(state.gitleaks.rules.source ? { source: state.gitleaks.rules.source } : {}),
+      }),
     }),
     privacy: state.version === 1 ? legacyPrivacyAssets(state.privacy) : privacyAssets(state.privacy, storeRoot),
     regex: state.version === 1 ? null : regexAssets(state.regex, storeRoot),

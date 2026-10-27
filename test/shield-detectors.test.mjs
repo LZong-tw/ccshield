@@ -22,6 +22,7 @@ function fakes(calls, overrides = {}) {
     detectPlatform: async () => supported,
     installGitleaks: async ({ platform }) => { calls.push(["gitleaks", platform.key]); return { origin: "downloaded", version: "8.30.1", path: "/store/gitleaks", sha256: "a".repeat(64) }; },
     gitleaksOverride: async ({ path }) => { calls.push(["override", path]); return { origin: "override", version: "8.29.0", path, sha256: "b".repeat(64) }; },
+    adoptAsset: async ({ source, target }) => { calls.push(["adopt", source, target]); return target; },
     fetchOpfBundle: async () => { calls.push(["opf"]); },
     buildOpfVenv: async ({ venvDir }) => { calls.push(["venv", venvDir.endsWith("/venv")]); return { state: "verified" }; },
     provisionOpfPrivacy: async () => { calls.push(["privacy"]); },
@@ -64,6 +65,8 @@ test("--gitleaks-path override records version and sha256 and skips the download
   const result = await fetchDetectorAssets({ paths, write: true, gitleaksPath: "/usr/local/bin/gitleaks", io: fakes(calls) });
   assert.deepEqual(result.gitleaks, { origin: "override", version: "8.29.0", sha256: "b".repeat(64) });
   assert.deepEqual(calls[0], ["override", "/usr/local/bin/gitleaks"]);
+  // The override is copied into the asset store so an upgrade of the original cannot remove it.
+  assert.deepEqual(calls[1], ["adopt", "/usr/local/bin/gitleaks", join(shieldAssetStore(paths).root, "gitleaks-override", "b".repeat(64), "gitleaks")]);
   assert.ok(!calls.some(([name]) => name === "gitleaks"));
 }));
 
@@ -177,7 +180,7 @@ test("install --write records the downloaded Gitleaks and the verified OPF bundl
 test("install --write records an override and a failed or unsupported OPF with its reason", () => withHome(async (paths) => {
   const failed = memoryAssets(provisioned);
   await fetchDetectorAssets({ paths, write: true, gitleaksPath: "/usr/local/bin/gitleaks", io: { ...fakes([], { buildOpfVenv: async () => ({ state: "failed", reason: "Python 3.10 or newer was not found" }) }), ...failed.io } });
-  assert.deepEqual(failed.box.record.gitleaks, { origin: "override", version: "8.29.0", path: "/usr/local/bin/gitleaks", sha256: "b".repeat(64), rules: provisioned.gitleaks.rules });
+  assert.deepEqual(failed.box.record.gitleaks, { origin: "override", version: "8.29.0", path: join(shieldAssetStore(paths).root, "gitleaks-override", "b".repeat(64), "gitleaks"), source: "/usr/local/bin/gitleaks", sha256: "b".repeat(64), rules: provisioned.gitleaks.rules });
   assert.deepEqual(failed.box.record.opf, { state: "failed", platform: "darwin-arm64", reason: "Python 3.10 or newer was not found" });
 
   const none = memoryAssets(provisioned);

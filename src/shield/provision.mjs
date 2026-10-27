@@ -8,6 +8,7 @@ import { ASSETS_FORMAT_VERSION, readShieldAssetsProvision, shieldAssetStore, upd
 import { installRegexWorker, prepareRegexWorker } from "./regex-detector.mjs";
 import { isValidOpfWorkerArgs } from "./opf-args.mjs";
 import { PRIVACY_PROTOCOL } from "./protocol.mjs";
+import { adoptAsset, storedGitleaksPath, storedRulesPath } from "./asset-adopt.mjs";
 
 export const MANIFEST_FORMAT_VERSION = 1;
 const O200K_CACHE_KEY = "fb374d419588a4632f3f557e76b4b70aebbca790";
@@ -16,7 +17,7 @@ const defaultIo = { lstat, readFile, realpath };
 export async function provisionShieldAssets({
   bundlePath, gitleaksPath, gitleaksRulesPath, privacyBundlePath, write = false, paths, io = defaultIo, writeState,
   runPrivacySelfTest: selfTest = runPrivacyWorkerSelfTest,
-  storeRoot = paths ? shieldAssetStore(paths).root : undefined, regexWorkerSource, nodePath, installRegex = installRegexWorker,
+  storeRoot = paths ? shieldAssetStore(paths).root : undefined, regexWorkerSource, nodePath, installRegex = installRegexWorker, adopt = adoptAsset,
 } = {}) {
   const bundle = await validateAsset({ path: bundlePath, executable: false, label: "policy bundle", io });
   const gitleaks = await validateAsset({ path: gitleaksPath, executable: true, label: "gitleaks", io });
@@ -25,15 +26,22 @@ export async function provisionShieldAssets({
   // runs on the regex worker until the pinned download verifies one.
   const privacy = privacyBundlePath == null ? null : await provisionPrivacy(privacyBundlePath, io);
   const regex = await prepareRegexWorker({ storeRoot, sourcePath: regexWorkerSource, nodePath });
+  // Record store copies, not the caller's paths: a path inside a versioned
+  // package or a Homebrew Cellar disappears on upgrade and the daemon then
+  // fails its boot check. Without a store root the caller's paths are kept.
+  const gitleaksTarget = typeof storeRoot === "string" ? storedGitleaksPath(storeRoot, gitleaks.sha256) : gitleaks.path;
+  const rulesTarget = typeof storeRoot === "string" ? storedRulesPath(storeRoot, gitleaksRules.sha256) : gitleaksRules.path;
   const state = Object.freeze({
     version: ASSETS_FORMAT_VERSION,
     bundle: Object.freeze({ version: policyVersion(bundle.bytes), sha256: bundle.sha256, path: bundle.path }),
     gitleaks: Object.freeze({
       sha256: gitleaks.sha256,
-      path: gitleaks.path,
+      path: gitleaksTarget,
+      ...(gitleaksTarget !== gitleaks.path ? { source: gitleaks.path } : {}),
       // Derived, not declared: nothing cross-checks this version, so a
       // hand-typed one could only ever go stale against the file it names.
-      rules: Object.freeze({ path: gitleaksRules.path, sha256: gitleaksRules.sha256, version: `rules-${gitleaksRules.sha256.slice(0, 12)}` }),
+      rules: Object.freeze({ path: rulesTarget, sha256: gitleaksRules.sha256, version: `rules-${gitleaksRules.sha256.slice(0, 12)}`,
+        ...(rulesTarget !== gitleaksRules.path ? { source: gitleaksRules.path } : {}) }),
     }),
     privacy: privacy ?? Object.freeze({ state: "absent" }),
     regex: Object.freeze({ version: regex.version, worker: regex.worker }),
@@ -45,6 +53,8 @@ export async function provisionShieldAssets({
     // The file lands before the record that names it, so a reader never sees
     // a regex reference without its worker.
     await installRegex(regex);
+    if (gitleaksTarget !== gitleaks.path) await adopt({ bytes: gitleaks.bytes, sha256: gitleaks.sha256, target: gitleaksTarget, executable: true });
+    if (rulesTarget !== gitleaksRules.path) await adopt({ bytes: gitleaksRules.bytes, sha256: gitleaksRules.sha256, target: rulesTarget });
     await writer(state);
   }
   return state;
