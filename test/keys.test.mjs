@@ -5,7 +5,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { getMasterKey, inspectMasterKey, KEYFILE_WARNING, keyfilePath } from "../src/keys.mjs";
+import { getMasterKey, inspectMasterKey, KEYFILE_WARNING, KEYRING_UNAVAILABLE, keyfilePath } from "../src/keys.mjs";
 
 // A stand-in for macOS `security` backed by a JSON file. It logs argv so the
 // test can prove the key never travels on the command line.
@@ -236,4 +236,54 @@ test("a malformed Keychain value is rejected rather than used", async (t) => {
   const { env } = await sandbox(t, { withSecurity: true });
   await writeFile(env.FAKE_KEYCHAIN_FILE, JSON.stringify({ "ccshield/audit-master-key": "not-hex" }));
   await assert.rejects(getMasterKey({ env, platform: "darwin" }), /keychain master key is malformed/);
+});
+
+test("linux refuses to mint a key file once the Secret Service holds the key and lookup fails", async (t) => {
+  const { env } = await sandbox(t, { withSecurity: false });
+  let down = false;
+  const tool = fakeSecretTool({ lookup: (stored) => (down ? DBUS_ERROR : stored ? { status: 0, stdout: stored, stderr: "" } : { status: 1, stdout: "", stderr: "" }) });
+  const first = await getMasterKey({ env, platform: "linux", runSecretTool: tool.run });
+  assert.equal(first.source, "secret-tool");
+
+  down = true;
+  await assert.rejects(getMasterKey({ env, platform: "linux", runSecretTool: tool.run }), new RegExp(KEYRING_UNAVAILABLE));
+  assert.equal(existsSync(keyfilePath({ env })), false, "no key file may appear behind an unreachable keyring");
+  assert.deepEqual(await inspectMasterKey({ env, platform: "linux", runSecretTool: tool.run }), { source: "secret-tool", present: true, warning: KEYRING_UNAVAILABLE });
+
+  down = false;
+  const again = await getMasterKey({ env, platform: "linux", runSecretTool: tool.run });
+  assert.equal(again.key.equals(first.key), true);
+});
+
+test("linux never overwrites a keyring key when a later lookup looks like a miss", async (t) => {
+  const { env } = await sandbox(t, { withSecurity: false });
+  let silent = false;
+  const tool = fakeSecretTool({ lookup: (stored) => (silent || !stored ? { status: 1, stdout: "", stderr: "" } : { status: 0, stdout: stored, stderr: "" }) });
+  const first = await getMasterKey({ env, platform: "linux", runSecretTool: tool.run });
+  silent = true;
+  await assert.rejects(getMasterKey({ env, platform: "linux", runSecretTool: tool.run }), new RegExp(KEYRING_UNAVAILABLE));
+  assert.equal(tool.stored, first.key.toString("hex"), "the existing item must not be replaced");
+  assert.equal(tool.calls.filter((call) => call.args[0] === "store").length, 1);
+});
+
+test("linux adopts the key a concurrent first run stored instead of splitting to a key file", async (t) => {
+  const { env } = await sandbox(t, { withSecurity: false });
+  const winner = "ef".repeat(32);
+  let stores = 0;
+  const run = async (args) => {
+    if (args[0] === "store") return (stores += 1, { status: 0, stdout: "", stderr: "" });
+    return stores ? { status: 0, stdout: winner, stderr: "" } : { status: 1, stdout: "", stderr: "" };
+  };
+  const result = await getMasterKey({ env, platform: "linux", runSecretTool: run });
+  assert.equal(result.source, "secret-tool");
+  assert.equal(result.key.toString("hex"), winner);
+  assert.equal(existsSync(keyfilePath({ env })), false);
+});
+
+test("linux inspect warns when lookup fails and no key is known", async (t) => {
+  const { env } = await sandbox(t, { withSecurity: false });
+  const tool = fakeSecretTool({ lookup: () => DBUS_ERROR });
+  const result = await inspectMasterKey({ env, platform: "linux", runSecretTool: tool.run });
+  assert.equal(result.present, false);
+  assert.match(result.warning, /unreachable Secret Service/);
 });

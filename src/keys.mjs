@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { accessSync, constants } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, isAbsolute, join } from "node:path";
 
@@ -11,6 +11,7 @@ export const KEYFILE_WARNING = "master key is stored in a 0600 key file, not the
 const KEY_HEX = /^[0-9a-f]{64}$/;
 const SECURITY_ITEM_NOT_FOUND = 44;
 const SECRET_TOOL_LABEL = "ccshield audit master key";
+export const KEYRING_UNAVAILABLE = "master key is held by the Secret Service but secret-tool lookup failed; refusing to create another key";
 
 export function keyfilePath({ env = process.env } = {}) {
   const home = typeof env.HOME === "string" && env.HOME.length > 0 ? env.HOME : homedir();
@@ -54,18 +55,25 @@ async function keychainMasterKey(path, runSecurity) {
 }
 
 async function secretToolMasterKey(path, provider) {
+  const marker = keyringMarkerPath(path);
   const found = await provider.lookup();
-  if (found.key) return { key: found.key, source: "secret-tool", warning: null };
+  if (found.key) return await keyringResult(found.key, marker);
 
   // Same rule as the Keychain: an existing key file keeps earlier evidence readable.
   const existing = await readKeyfile(path);
   if (existing) return keyfileResult(existing);
 
+  // The Secret Service already holds the key, so a miss or a failed lookup
+  // (no DBus session bus, locked collection) must not mint a second key.
+  if (await exists(marker)) throw new Error(KEYRING_UNAVAILABLE);
+
   if (found.miss) {
     const key = randomBytes(32);
     if (await provider.store(key)) {
+      // A concurrent first run (the other lane) may have replaced our item;
+      // whatever reads back is the key both lanes now share.
       const check = await provider.lookup();
-      if (check.key?.equals(key)) return { key, source: "secret-tool", warning: null };
+      if (check.key) return await keyringResult(check.key, marker);
     }
   }
   return keyfileResult(await readOrCreateKeyfile(path));
@@ -84,10 +92,16 @@ export async function inspectMasterKey({
     if (found.status === 0) return { source: "keychain", present: true, warning: null };
   }
   if (platform === "linux") {
+    let found;
     try {
-      if ((await secretToolProvider({ runSecretTool }).lookup()).key) return { source: "secret-tool", present: true, warning: null };
+      found = await secretToolProvider({ runSecretTool }).lookup();
     } catch (error) {
       return { source: "secret-tool", present: true, warning: error.message };
+    }
+    if (found.key) return { source: "secret-tool", present: true, warning: null };
+    if (!(await exists(path))) {
+      if (await exists(keyringMarkerPath(path))) return { source: "secret-tool", present: true, warning: KEYRING_UNAVAILABLE };
+      if (!found.miss) return { source: "none", present: false, warning: "secret-tool lookup failed; a master key may exist behind an unreachable Secret Service" };
     }
   }
   try {
@@ -100,8 +114,9 @@ export async function inspectMasterKey({
 
 // Linux Secret Service through libsecret's `secret-tool`. `lookup` exits 1
 // with no output when the item is absent; any other failure (missing binary,
-// no Secret Service on DBus, locked collection) is not a miss, so the caller
-// never creates a second key behind an unreachable keyring.
+// no Secret Service on DBus, locked collection) is not a miss. Whether a locked
+// item really writes to stderr is unverified, so once a key has come from the
+// keyring the caller relies on its marker file, not on this classification.
 export function secretToolProvider({ runSecretTool }) {
   const attributes = ["service", KEYCHAIN_SERVICE, "account", KEYCHAIN_ACCOUNT];
   return {
@@ -117,6 +132,29 @@ export function secretToolProvider({ runSecretTool }) {
       return stored.status === 0;
     },
   };
+}
+
+// Non-secret marker recording that the key lives in the Secret Service.
+function keyringMarkerPath(path) {
+  return `${path}.secret-tool`;
+}
+
+async function keyringResult(key, marker) {
+  if (!(await exists(marker))) {
+    await mkdir(join(marker, ".."), { recursive: true, mode: 0o700 });
+    await writeFile(marker, "secret-tool\n", { mode: 0o600 });
+  }
+  return { key, source: "secret-tool", warning: null };
+}
+
+async function exists(path) {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 function keyfileResult(key) {
