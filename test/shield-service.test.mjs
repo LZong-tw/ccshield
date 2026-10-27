@@ -1502,7 +1502,7 @@ test("policy transition threads the systemd runner through inspect, stop and sta
   const runSystemctl = async () => ({ ok: true, stdout: "" });
   await transitionShieldPolicy({
     paths,
-    io: { async readFile() { throw Object.assign(new Error("gone"), { code: "ENOENT" }); } },
+    io: privateFileIo(async () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }); }),
     runSystemctl,
     inspectService: async (options) => { seen.push(options.runSystemctl); return { active: false }; },
     installPolicy: async () => ({ version: "2026.10.27.1", detectorVersions: { gitleaks: "8.24.0", privacy: "privacy-1" } }),
