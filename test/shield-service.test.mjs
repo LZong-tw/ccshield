@@ -29,7 +29,7 @@ const generation = "generation-1";
 const policyState = { version: "2026.09.02.1", detectorVersions: { gitleaks: "8.24.0", privacy: "privacy-1" } };
 
 function fixture(homeDir = "/tmp/ccshield-service-home") {
-  const paths = shieldPaths({ homeDir, uid: 501 });
+  const paths = shieldPaths({ homeDir, uid: 501, platform: "darwin" });
   return {
     paths,
     options: {
@@ -407,7 +407,7 @@ test("readiness rejects a daemon identity bound to a stale policy transition bef
 test("policy install quiesces a live old daemon binding until a fresh policy identity is published", async (t) => {
   const homeDir = await mkdtemp(join(tmpdir(), "ccshield-policy-transition-"));
   t.after(() => rm(homeDir, { recursive: true, force: true }));
-  const paths = shieldPaths({ homeDir, uid: process.getuid?.() ?? 501 });
+  const paths = shieldPaths({ homeDir, uid: process.getuid?.() ?? 501, platform: "darwin" });
   const oldIdentity = {
     origin: "http://127.0.0.1:8811", capability, version: 1, pid: 42,
     lane: "subscription", generation, targetClass: "subscription",
@@ -454,7 +454,7 @@ test("policy install quiesces a live old daemon binding until a fresh policy ide
 test("policy lifecycle transaction stops a live proxy before activating and binding a replacement", async (t) => {
   const homeDir = await mkdtemp(join(tmpdir(), "ccshield-policy-proxy-transition-"));
   t.after(() => rm(homeDir, { recursive: true, force: true }));
-  const paths = shieldPaths({ homeDir, uid: process.getuid?.() ?? 501 });
+  const paths = shieldPaths({ homeDir, uid: process.getuid?.() ?? 501, platform: "darwin" });
   const controlCapability = "d".repeat(32);
   const oldPolicy = { version: "policy-old", detectorVersions: policyState.detectorVersions };
   const newPolicy = { version: "policy-new", detectorVersions: policyState.detectorVersions };
@@ -1298,3 +1298,214 @@ async function startServer(handler) {
   const address = server.address();
   return { origin: `http://127.0.0.1:${address.port}`, close: () => new Promise((resolvePromise) => server.close(resolvePromise)) };
 }
+
+function linuxFixture(homeDir = "/tmp/ccshield-linux-home", env = {}) {
+  const paths = shieldPaths({ homeDir, env, uid: 1000, platform: "linux" });
+  return { paths, options: { paths, nodePath: "/usr/bin/node", daemonPath: "/opt/ccshield/src/shieldd.mjs" } };
+}
+
+function systemctlRecorder(responses = {}) {
+  const calls = [];
+  const runSystemctl = async (args) => { calls.push(args); return responses[args[1]] ?? { ok: true, stdout: "" }; };
+  return { calls, runSystemctl };
+}
+
+const forbiddenLaunchctl = async () => { throw new Error("launchctl must not run on Linux"); };
+
+test("Linux paths follow XDG and keep launchd fields off the object", () => {
+  const { paths } = linuxFixture("/home/u");
+  assert.equal(paths.platform, "linux");
+  assert.equal(paths.rootDir, "/home/u/.local/share/ccshield/subscription");
+  assert.equal(paths.serviceUnitPath, "/home/u/.config/systemd/user/ccshield-subscription.service");
+  assert.equal(paths.launchAgentPath, undefined);
+  assert.equal(paths.launchdTarget, undefined);
+
+  const xdg = shieldPaths({ homeDir: "/home/u", env: { XDG_DATA_HOME: "/data", XDG_CONFIG_HOME: "/conf" }, platform: "linux", lane: "managed" });
+  assert.equal(xdg.rootDir, "/data/ccshield/managed");
+  assert.equal(xdg.serviceUnitPath, "/conf/systemd/user/ccshield-managed.service");
+  const relative = shieldPaths({ homeDir: "/home/u", env: { XDG_DATA_HOME: "data", XDG_CONFIG_HOME: "conf" }, platform: "linux" });
+  assert.equal(relative.rootDir, "/home/u/.local/share/ccshield/subscription", "relative XDG values are ignored");
+  assert.throws(() => shieldPaths({ homeDir: "/home/u", env: { CCSHIELD_ROOT_DIR: "/elsewhere" }, platform: "linux" }), /canonical/);
+  assert.throws(() => shieldPaths({ homeDir: "/home/u", platform: "linux", serviceUnitPath: "/etc/systemd/system/ccshield-subscription.service" }), /systemd user unit directory/);
+});
+
+test("macOS paths are unchanged by the Linux backend", () => {
+  const paths = shieldPaths({ homeDir: "/Users/u", env: { XDG_DATA_HOME: "/data" }, uid: 501, platform: "darwin" });
+  assert.equal(paths.rootDir, "/Users/u/.local/share/ccshield/subscription");
+  assert.equal(paths.launchAgentPath, "/Users/u/Library/LaunchAgents/com.ccshield.subscription.plist");
+  assert.equal(paths.launchdTarget, "gui/501/com.ccshield.subscription");
+  assert.equal(paths.serviceUnitPath, undefined);
+});
+
+test("systemd install previews without mutation and writes a private unit with --write", async () => {
+  const homeDir = await mkdtemp(join(tmpdir(), "ccshield-systemd-"));
+  const { options, paths } = linuxFixture(homeDir);
+  const { calls, runSystemctl } = systemctlRecorder();
+  try {
+    const plan = await installShieldService({ ...options, runSystemctl, runLaunchctl: forbiddenLaunchctl });
+    assert.equal(plan.label, "com.ccshield.subscription");
+    assert.equal(plan.unitPath, paths.serviceUnitPath);
+    assert.deepEqual(plan.operations.map((entry) => entry.op), ["mkdir", "writeFileAtomic", "daemon-reload", "enable", "restart"]);
+    assert.deepEqual(calls, []);
+    assert.equal(await stat(paths.serviceUnitPath).then(() => true, () => false), false);
+
+    await installShieldService({ ...options, write: true, runSystemctl, runLaunchctl: forbiddenLaunchctl });
+    assert.equal((await stat(paths.serviceUnitPath)).mode & 0o777, 0o600);
+    assert.equal((await stat(paths.configPath)).mode & 0o777, 0o600);
+    const unit = await readFile(paths.serviceUnitPath, "utf8");
+    assert.match(unit, /^ExecStart="\/usr\/bin\/node" "\/opt\/ccshield\/src\/shieldd\.mjs" "--config" /m);
+    assert.doesNotMatch(unit, /capability/i);
+    assert.equal(unit.match(/^Environment=.*$/gm).join("\n"), `Environment="XDG_DATA_HOME=${homeDir}/.local/share"`);
+    assert.deepEqual(calls, [
+      ["--user", "daemon-reload"],
+      ["--user", "enable", "ccshield-subscription.service"],
+      ["--user", "restart", "ccshield-subscription.service"],
+    ]);
+  } finally {
+    await rm(homeDir, { recursive: true, force: true });
+  }
+});
+
+test("systemd unit pins the CLI's XDG_DATA_HOME for a manager that never saw it", () => {
+  const { options } = linuxFixture("/home/u", { XDG_DATA_HOME: "/data" });
+  assert.equal(options.paths.configPath, "/data/ccshield/subscription/config.json");
+  assert.match(planShieldService(options).unit, /^Environment="XDG_DATA_HOME=\/data"$/m);
+  const daemonPaths = shieldPaths({ homeDir: "/home/u", env: { XDG_DATA_HOME: "/data" }, platform: "linux" });
+  assert.equal(daemonPaths.configPath, options.paths.configPath);
+});
+
+test("systemd install explains a unit directory the user manager does not search", async () => {
+  const homeDir = await mkdtemp(join(tmpdir(), "ccshield-systemd-"));
+  const { options } = linuxFixture(homeDir);
+  const { runSystemctl } = systemctlRecorder({ enable: { ok: false, stderr: "Failed to enable unit: Unit file ccshield-subscription.service does not exist." } });
+  try {
+    await assert.rejects(installShieldService({ ...options, write: true, runSystemctl }), /does not search .*systemd\/user .*XDG_CONFIG_HOME/);
+  } finally {
+    await rm(homeDir, { recursive: true, force: true });
+  }
+});
+
+test("systemd install restarts a daemon still running the previous config", async () => {
+  const homeDir = await mkdtemp(join(tmpdir(), "ccshield-systemd-"));
+  const { options } = linuxFixture(homeDir);
+  const { calls, runSystemctl } = systemctlRecorder();
+  try {
+    await installShieldService({ ...options, write: true, runSystemctl });
+    await installShieldService({ ...options, write: true, runSystemctl });
+    assert.equal(calls.filter((call) => call[1] === "restart").length, 2);
+    assert.equal(calls.some((call) => call[1] === "start"), false);
+  } finally {
+    await rm(homeDir, { recursive: true, force: true });
+  }
+});
+
+test("systemd start refuses a missing or drifted unit, then reloads and restarts", async () => {
+  const { options, paths } = linuxFixture();
+  const { calls, runSystemctl } = systemctlRecorder();
+  const missing = { async readFile() { throw Object.assign(new Error("gone"), { code: "ENOENT" }); } };
+  await assert.rejects(startShieldService({ ...options, io: missing, runSystemctl }), /not installed/);
+
+  const plan = planShieldService(options);
+  const drifted = { async readFile() { return plan.unit.replace("/opt/ccshield/src/shieldd.mjs", "/old/shieldd.mjs"); } };
+  await assert.rejects(startShieldService({ ...options, io: drifted, runSystemctl }), /unit path drift detected: .*installed unit runs "\/old\/shieldd\.mjs"/);
+  assert.deepEqual(calls, []);
+
+  const current = { async readFile(path) { assert.equal(path, paths.serviceUnitPath); return plan.unit; } };
+  const started = await startShieldService({ ...options, io: current, runSystemctl, runLaunchctl: forbiddenLaunchctl });
+  assert.equal(started.started, true);
+  assert.deepEqual(calls, [["--user", "daemon-reload"], ["--user", "restart", "ccshield-subscription.service"]]);
+});
+
+test("systemd start surfaces a failed start", async () => {
+  const { options } = linuxFixture();
+  const plan = planShieldService(options);
+  const { runSystemctl } = systemctlRecorder({ restart: { ok: false, stderr: "Job failed" } });
+  await assert.rejects(startShieldService({ ...options, io: { async readFile() { return plan.unit; } }, runSystemctl }), /systemctl --user restart failed: Job failed/);
+});
+
+test("systemd stop stops only the lane unit", async () => {
+  const { paths } = linuxFixture();
+  const { calls, runSystemctl } = systemctlRecorder();
+  const result = await stopShieldService({ paths, runSystemctl, runLaunchctl: forbiddenLaunchctl });
+  assert.equal(result.stopped, true);
+  assert.deepEqual(calls, [["--user", "stop", "ccshield-subscription.service"]]);
+
+  const unloaded = systemctlRecorder({ stop: { ok: false, stderr: "Failed to stop ccshield-subscription.service: Unit ccshield-subscription.service not loaded." } });
+  assert.equal((await stopShieldService({ paths, runSystemctl: unloaded.runSystemctl })).stopped, true);
+  const denied = systemctlRecorder({ stop: { ok: false, stderr: "Access denied" } });
+  await assert.rejects(stopShieldService({ paths, runSystemctl: denied.runSystemctl }), /systemctl --user stop failed: Access denied/);
+});
+
+test("systemd inspect reads ActiveState, MainPID and LoadState", async () => {
+  const { paths } = linuxFixture();
+  const io = { async readFile() { return "unit"; } };
+  const running = systemctlRecorder({ show: { ok: true, stdout: "ActiveState=active\nMainPID=4242\nLoadState=loaded\n" } });
+  assert.deepEqual(await inspectShieldService({ paths, io, runSystemctl: running.runSystemctl, runLaunchctl: forbiddenLaunchctl }), {
+    label: "com.ccshield.subscription", installed: true, loaded: true, active: true, pid: 4242, state: "active", stale: false,
+  });
+  assert.deepEqual(running.calls, [["--user", "show", "-p", "ActiveState,MainPID,LoadState", "ccshield-subscription.service"]]);
+
+  const unknown = systemctlRecorder({ show: { ok: true, stdout: "ActiveState=inactive\nMainPID=0\nLoadState=not-found\n" } });
+  const absent = { async readFile() { throw Object.assign(new Error("gone"), { code: "ENOENT" }); } };
+  assert.deepEqual(await inspectShieldService({ paths, io: absent, runSystemctl: unknown.runSystemctl }), {
+    label: "com.ccshield.subscription", installed: false, loaded: false, active: false, pid: null, state: "inactive", stale: false,
+  });
+
+  const failed = systemctlRecorder({ show: { ok: false, stderr: "Failed to connect to bus" } });
+  const result = await inspectShieldService({ paths, io, runSystemctl: failed.runSystemctl });
+  assert.deepEqual({ loaded: result.loaded, active: result.active, pid: result.pid, stale: result.stale }, { loaded: false, active: false, pid: null, stale: true });
+});
+
+test("systemd uninstall previews, then disables and removes only its own unit", async () => {
+  const { options, paths } = linuxFixture();
+  const unit = planShieldService(options).unit;
+  const unlinked = [];
+  const io = {
+    async lstat(path) { assert.equal(path, paths.serviceUnitPath); return { isFile: () => true, uid: 1000 }; },
+    async readFile() { return unit; },
+    async unlink(path) { unlinked.push(path); },
+  };
+  const { calls, runSystemctl } = systemctlRecorder();
+  const preview = await uninstallShieldService({ paths, io, runSystemctl, uid: 1000 });
+  assert.deepEqual(preview.operations.map((entry) => entry.op), ["disable", "unlink", "daemon-reload"]);
+  assert.deepEqual([calls, unlinked], [[], []]);
+
+  const result = await uninstallShieldService({ paths, io, runSystemctl, runLaunchctl: forbiddenLaunchctl, uid: 1000, write: true });
+  assert.equal(result.removed, true);
+  assert.deepEqual(calls, [["--user", "disable", "--now", "ccshield-subscription.service"], ["--user", "daemon-reload"]]);
+  assert.deepEqual(unlinked, [paths.serviceUnitPath]);
+});
+
+test("systemd uninstall refuses foreign units and tolerates an already-unknown unit when absent", async () => {
+  const { paths } = linuxFixture();
+  const { calls, runSystemctl } = systemctlRecorder();
+  const foreign = { async lstat() { return { isFile: () => true, uid: 1000 }; }, async readFile() { return "[Unit]\nDescription=something else\n"; } };
+  await assert.rejects(uninstallShieldService({ paths, io: foreign, runSystemctl, uid: 1000, write: true }), /does not belong to com\.ccshield\.subscription/);
+  const otherOwner = { async lstat() { return { isFile: () => true, uid: 0 }; } };
+  await assert.rejects(uninstallShieldService({ paths, io: otherOwner, runSystemctl, uid: 1000, write: true }), /not a regular file owned by this user/);
+  assert.deepEqual(calls, []);
+
+  const missing = { async lstat() { throw Object.assign(new Error("gone"), { code: "ENOENT" }); } };
+  assert.equal((await uninstallShieldService({ paths, io: missing, runSystemctl, uid: 1000 })).installed, false);
+  assert.deepEqual(calls, []);
+  const unknown = systemctlRecorder({ stop: { ok: false, stderr: "Failed to stop ccshield-subscription.service: Unit ccshield-subscription.service not loaded." } });
+  const absent = await uninstallShieldService({ paths, io: missing, runSystemctl: unknown.runSystemctl, uid: 1000, write: true });
+  assert.equal(absent.removed, false);
+  assert.deepEqual(unknown.calls, [["--user", "stop", "ccshield-subscription.service"]]);
+  const denied = systemctlRecorder({ stop: { ok: false, stderr: "Access denied" } });
+  await assert.rejects(uninstallShieldService({ paths, io: missing, runSystemctl: denied.runSystemctl, uid: 1000, write: true }), /systemctl --user stop failed: Access denied/);
+});
+
+test("policy transition threads the systemd runner through inspect, stop and start", async () => {
+  const { paths } = linuxFixture();
+  const seen = [];
+  const runSystemctl = async () => ({ ok: true, stdout: "" });
+  await transitionShieldPolicy({
+    paths,
+    io: { async readFile() { throw Object.assign(new Error("gone"), { code: "ENOENT" }); } },
+    runSystemctl,
+    inspectService: async (options) => { seen.push(options.runSystemctl); return { active: false }; },
+    installPolicy: async () => ({ version: "2026.10.27.1", detectorVersions: { gitleaks: "8.24.0", privacy: "privacy-1" } }),
+  });
+  assert.deepEqual(seen, [runSystemctl]);
+});
