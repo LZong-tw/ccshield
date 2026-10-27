@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, open as fsOpen, readFile, rename, rm, stat, symlink, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open as fsOpen, readFile, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -53,7 +55,7 @@ test("shield paths reject relative and escaping overrides", () => {
 
 test("identity rejects missing capability", async () => {
   const paths = shieldPaths({ homeDir: "/tmp/home", uid: 501 });
-  const io = { async readFile() { return '{"origin":"http://127.0.0.1:8811"}'; } };
+  const io = privateFileIo(async () => '{"origin":"http://127.0.0.1:8811"}');
   await assert.rejects(readShieldIdentity({ paths, io }), /capability/);
 });
 
@@ -81,8 +83,63 @@ test("identity carries optional media coverage and rejects unknown values", () =
 
 test("missing identity is reported as null", async () => {
   const paths = shieldPaths({ homeDir: "/tmp/home", uid: 501 });
-  const io = { async readFile() { const error = new Error("missing"); error.code = "ENOENT"; throw error; } };
+  const io = privateFileIo(async () => { const error = new Error("missing"); error.code = "ENOENT"; throw error; });
   assert.equal(await readShieldIdentity({ paths, io }), null);
+});
+
+// Adapts a readFile-style mock to the descriptor-based private-file reader in paths.mjs.
+function privateFileIo(readFile, { uid = process.getuid?.(), mode = 0o100600 } = {}) {
+  const entry = { dev: 1, ino: 1, uid, mode, isFile: () => true, isSymbolicLink: () => false };
+  return {
+    constants,
+    async lstat() { return entry; },
+    async open(path) {
+      const contents = await readFile(path, "utf8");
+      return { stat: async () => entry, readFile: async () => contents, close: async () => {} };
+    },
+  };
+}
+
+async function identityHome(t) {
+  const homeDir = await mkdtemp(join(tmpdir(), "ccshield-read-"));
+  t.after(() => rm(homeDir, { recursive: true, force: true }));
+  const paths = shieldPaths({ homeDir, uid: process.getuid() });
+  await mkdir(join(paths.identityPath, ".."), { recursive: true, mode: 0o700 });
+  return paths;
+}
+
+test("identity reads check the opened descriptor, not the path", async (t) => {
+  const paths = await identityHome(t);
+  const body = `${JSON.stringify(identity)}\n`;
+  const decoy = `${paths.identityPath}.decoy`;
+  await writeFile(decoy, body, { mode: 0o600 });
+
+  await symlink(decoy, paths.identityPath);
+  await assert.rejects(readShieldIdentity({ paths }), /shield identity must not be a symlink/);
+  await unlink(paths.identityPath);
+
+  await writeFile(paths.identityPath, body, { mode: 0o644 });
+  await chmod(paths.identityPath, 0o644);
+  await assert.rejects(readShieldIdentity({ paths }), /shield identity must be private/);
+  await unlink(paths.identityPath);
+
+  execFileSync("mkfifo", ["-m", "600", paths.identityPath]);
+  await assert.rejects(readShieldIdentity({ paths }), /shield identity must be a regular file/, "a FIFO must not block the open");
+  await unlink(paths.identityPath);
+
+  await writeFile(paths.identityPath, body, { mode: 0o600 });
+  assert.deepEqual(await readShieldIdentity({ paths }), assertShieldIdentity(identity));
+});
+
+test("identity reads reject a file swapped in after the descriptor was opened", async (t) => {
+  const paths = await identityHome(t);
+  await writeFile(paths.identityPath, `${JSON.stringify(identity)}\n`, { mode: 0o600 });
+  const io = {
+    constants,
+    open: fsOpen,
+    async lstat(path) { return { ...(await lstat(path)), ino: -1 }; },
+  };
+  await assert.rejects(readShieldIdentity({ paths, io }), /shield identity was replaced while being read/);
 });
 
 test("identity writes use a private directory and atomic 0600 replacement", async () => {
