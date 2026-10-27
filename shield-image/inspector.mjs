@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 import { createHash } from "node:crypto";
 
-import { imageLimits } from "./limits.mjs";
+import { ImageLimitError, assertImageWithinLimits, imageLimits } from "./limits.mjs";
 import { mapFindingsToRects } from "./regions.mjs";
 import { buildSyntheticBody, findingsFromPrivacy } from "./synthetic.mjs";
 import { verifyImage } from "./verify.mjs";
@@ -14,6 +14,10 @@ export class ImageInspectError extends Error {
 }
 
 const SECRET = Object.freeze({ status: "secret", confirmedSecret: true });
+
+// Worker answers that are a property of the input, not of the worker: the same
+// bytes fail the same way every time, so the request blocks instead of retrying.
+const REJECTED_INPUT = new Set(["unsupported_type", "multi_frame", "too_many_pixels", "decode_failed", "output_too_large"]);
 
 // Scanners are injected so this module needs nothing from the MIT side:
 // scanSecrets(body) -> { findings }, scanPrivacy(body) -> privacy scan result,
@@ -49,6 +53,7 @@ export function createImageInspector({ worker, scanSecrets, scanPrivacy, context
   };
 
   async function protect(bytes, expected) {
+    assertImageWithinLimits(bytes, limits);
     const { regions } = await worker.ocr(bytes);
     const synthetic = buildSyntheticBody(regions);
     let findings = [];
@@ -112,7 +117,9 @@ export function createImageInspector({ worker, scanSecrets, scanPrivacy, context
     try {
       return await Promise.race([work, deadline]);
     } catch (error) {
-      throw error instanceof ImageInspectError ? error : new ImageInspectError("image_scan_unavailable", error);
+      if (error instanceof ImageInspectError) throw error;
+      if (error instanceof ImageLimitError || REJECTED_INPUT.has(error?.code)) throw new ImageInspectError("image_rejected", error);
+      throw new ImageInspectError("image_scan_unavailable", error);
     } finally {
       clearTimeout(timer);
       pending -= 1;

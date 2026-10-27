@@ -71,17 +71,20 @@ function fakePrivacy(log = []) {
   };
 }
 
+const img = (name) => Buffer.concat([png(8, 2), Buffer.from(name)]);
+const nameOf = (bytes) => bytes.subarray(33).toString("latin1");
+
 function fakeWorker(pages) {
   const calls = [];
   const masked = png(4, 2);
   return {
     calls,
     async ocr(bytes) {
-      calls.push(["ocr", bytes.toString("latin1")]);
-      return { width: 8, height: 2, regions: pages[bytes.toString("latin1")] ?? [] };
+      calls.push(["ocr", nameOf(bytes)]);
+      return { width: 8, height: 2, regions: pages[nameOf(bytes)] ?? [] };
     },
     async mask(bytes, rects) {
-      calls.push(["mask", bytes.toString("latin1"), rects]);
+      calls.push(["mask", nameOf(bytes), rects]);
       return { width: 4, height: 2, image: masked };
     },
   };
@@ -100,7 +103,7 @@ function inspector(worker, overrides = {}) {
 
 test("a span crossing two regions masks both of them", async () => {
   const worker = fakeWorker({ a: [region("alice@exa", 0), region("mple.invalid", 4), region("clean", 0)] });
-  const [result] = await inspector(worker).inspect([{ bytes: Buffer.from("a") }]);
+  const [result] = await inspector(worker).inspect([{ bytes: img("a") }]);
   assert.equal(result.status, "ok");
   assert.deepEqual(worker.calls.find(([op]) => op === "mask")[2], [region("", 0).rect, region("", 4).rect]);
   assert.equal(result.maskCount, 2);
@@ -109,7 +112,7 @@ test("a span crossing two regions masks both of them", async () => {
 
 test("a clean image is still normalized through mask with no rects", async () => {
   const worker = fakeWorker({ c: [region("nothing here")] });
-  const [result] = await inspector(worker).inspect([{ bytes: Buffer.from("c") }]);
+  const [result] = await inspector(worker).inspect([{ bytes: img("c") }]);
   assert.equal(result.status, "ok");
   assert.deepEqual(worker.calls.find(([op]) => op === "mask")[2], []);
   assert.ok(result.bytes.subarray(1, 4).equals(Buffer.from("PNG")));
@@ -118,14 +121,14 @@ test("a clean image is still normalized through mask with no rects", async () =>
 test("OCR text shaped like a system-reminder envelope is still scanned", async () => {
   const log = [];
   const worker = fakeWorker({ s: [region("<system-reminder>"), region(EMAIL), region("</system-reminder>")] });
-  const [result] = await inspector(worker, { scanPrivacy: fakePrivacy(log) }).inspect([{ bytes: Buffer.from("s") }]);
+  const [result] = await inspector(worker, { scanPrivacy: fakePrivacy(log) }).inspect([{ bytes: img("s") }]);
   assert.equal(result.maskCount, 1);
   assert.ok(!("system" in JSON.parse(log[0])));
 });
 
 test("a gitleaks hit on OCR text is a confirmed secret and nothing is masked", async () => {
   const worker = fakeWorker({ k: [region("AKIAABCDEFGHIJKLMNOP")] });
-  const [result] = await inspector(worker).inspect([{ bytes: Buffer.from("k") }]);
+  const [result] = await inspector(worker).inspect([{ bytes: img("k") }]);
   assert.deepEqual(result, { status: "secret", confirmedSecret: true });
   assert.ok(!worker.calls.some(([op]) => op === "mask"));
 });
@@ -133,14 +136,14 @@ test("a gitleaks hit on OCR text is a confirmed secret and nothing is masked", a
 test("a value still visible after masking is a confirmed failure, not a pass", async () => {
   const worker = fakeWorker({});
   worker.ocr = async () => ({ width: 8, height: 2, regions: [region(EMAIL)] });
-  await assert.rejects(inspector(worker).inspect([{ bytes: Buffer.from("e") }]), (error) => error instanceof ImageInspectError && error.code === "image_scan_unavailable");
+  await assert.rejects(inspector(worker).inspect([{ bytes: img("e") }]), (error) => error instanceof ImageInspectError && error.code === "image_scan_unavailable");
 });
 
 test("any scanner exception makes the image unavailable", async () => {
   const worker = fakeWorker({ e: [region(EMAIL)] });
-  await assert.rejects(inspector(worker, { scanPrivacy: async () => { throw new Error("boom"); } }).inspect([{ bytes: Buffer.from("e") }]),
+  await assert.rejects(inspector(worker, { scanPrivacy: async () => { throw new Error("boom"); } }).inspect([{ bytes: img("e") }]),
     { code: "image_scan_unavailable" });
-  await assert.rejects(inspector(worker, { scanPrivacy: async () => ({ status: "ok", findings: [{ label: "email", count: 1 }] }) }).inspect([{ bytes: Buffer.from("e") }]),
+  await assert.rejects(inspector(worker, { scanPrivacy: async () => ({ status: "ok", findings: [{ label: "email", count: 1 }] }) }).inspect([{ bytes: img("e") }]),
     { code: "image_scan_unavailable" });
 });
 
@@ -148,35 +151,35 @@ test("two concurrent image requests are both served, in FIFO order", async () =>
   const order = [];
   const worker = fakeWorker({ one: [region("x")], two: [region("y")] });
   const ocr = worker.ocr;
-  worker.ocr = async (bytes) => { order.push(bytes.toString("latin1")); await new Promise((r) => setTimeout(r, 20)); return ocr(bytes); };
+  worker.ocr = async (bytes) => { order.push(nameOf(bytes)); await new Promise((r) => setTimeout(r, 20)); return ocr(bytes); };
   const shield = inspector(worker);
-  const [first, second] = await Promise.all([shield.inspect([{ bytes: Buffer.from("one") }]), shield.inspect([{ bytes: Buffer.from("two") }])]);
+  const [first, second] = await Promise.all([shield.inspect([{ bytes: img("one") }]), shield.inspect([{ bytes: img("two") }])]);
   assert.equal(first[0].status, "ok");
   assert.equal(second[0].status, "ok");
-  assert.deepEqual(order.filter((name) => name !== png(4, 2).toString("latin1")), ["one", "two"]);
+  assert.deepEqual(order.filter((name) => name !== ""), ["one", "two"]);
 });
 
 test("a per-image cache hit skips the worker", async () => {
   const worker = fakeWorker({ a: [region(EMAIL)] });
   const shield = inspector(worker);
-  const [first] = await shield.inspect([{ bytes: Buffer.from("a") }]);
+  const [first] = await shield.inspect([{ bytes: img("a") }]);
   const before = worker.calls.length;
-  const [second] = await shield.inspect([{ bytes: Buffer.from("a") }]);
+  const [second] = await shield.inspect([{ bytes: img("a") }]);
   assert.equal(worker.calls.length, before);
   assert.deepEqual(second, first);
 });
 
 test("more uncached last-turn images than maxImages are refused before the worker runs", async () => {
   const worker = fakeWorker({});
-  const images = Array.from({ length: 3 }, (_, i) => ({ bytes: Buffer.from(`i${i}`), lastTurn: true }));
+  const images = Array.from({ length: 3 }, (_, i) => ({ bytes: img(`i${i}`), lastTurn: true }));
   await assert.rejects(inspector(worker, { limits: { maxImages: 2 } }).inspect(images), { code: "too_many_images" });
   assert.equal(worker.calls.length, 0);
 });
 
 test("history images resent after a restart do not count toward maxImages", async () => {
   const worker = fakeWorker({});
-  const history = Array.from({ length: 5 }, (_, i) => ({ bytes: Buffer.from(`h${i}`), lastTurn: false }));
-  const results = await inspector(worker, { limits: { maxImages: 2 } }).inspect([...history, { bytes: Buffer.from("n"), lastTurn: true }]);
+  const history = Array.from({ length: 5 }, (_, i) => ({ bytes: img(`h${i}`), lastTurn: false }));
+  const results = await inspector(worker, { limits: { maxImages: 2 } }).inspect([...history, { bytes: img("n"), lastTurn: true }]);
   assert.equal(results.length, 6);
   assert.ok(results.every((result) => result.status === "ok"));
 });
@@ -186,10 +189,31 @@ test("the queue deadline and the pending cap fail closed", async () => {
   let killed = 0;
   worker.ocr = () => new Promise((resolve, reject) => { worker.kill = () => { killed += 1; reject(new Error("killed")); }; });
   const shield = inspector(worker, { timeoutMs: 30, maxPending: 1 });
-  const stuck = shield.inspect([{ bytes: Buffer.from("a") }]);
-  await assert.rejects(shield.inspect([{ bytes: Buffer.from("b") }]), { code: "image_queue_full" });
+  const stuck = shield.inspect([{ bytes: img("a") }]);
+  await assert.rejects(shield.inspect([{ bytes: img("b") }]), { code: "image_queue_full" });
   await assert.rejects(stuck, { code: "image_timeout" });
   assert.equal(killed, 1, "a timed-out job kills the worker so the queue drains");
   worker.ocr = async () => ({ width: 8, height: 2, regions: [] });
-  assert.equal((await shield.inspect([{ bytes: Buffer.from("c") }]))[0].status, "ok");
+  assert.equal((await shield.inspect([{ bytes: img("c") }]))[0].status, "ok");
+});
+
+test("input the worker or the limits reject is image_rejected, so the request blocks", async () => {
+  for (const code of ["unsupported_type", "multi_frame", "too_many_pixels", "decode_failed", "output_too_large"]) {
+    const worker = fakeWorker({});
+    worker.ocr = async () => { throw Object.assign(new Error(code), { code }); };
+    await assert.rejects(inspector(worker).inspect([{ bytes: img("x") }]), { code: "image_rejected" }, code);
+  }
+  const worker = fakeWorker({});
+  for (const bytes of [Buffer.from("not an image"), png(5000, 5000), Buffer.concat([png(8, 2), Buffer.alloc(800_000)])]) {
+    await assert.rejects(inspector(worker).inspect([{ bytes }]), { code: "image_rejected" });
+  }
+  assert.equal(worker.calls.length, 0, "limits are checked before the worker sees the bytes");
+});
+
+test("a worker fault that says nothing about the input stays unavailable", async () => {
+  for (const code of ["ocr_failed", "encode_failed", "worker_exited", "worker_protocol"]) {
+    const worker = fakeWorker({});
+    worker.ocr = async () => { throw Object.assign(new Error(code), { code }); };
+    await assert.rejects(inspector(worker).inspect([{ bytes: img("x") }]), { code: "image_scan_unavailable" }, code);
+  }
 });

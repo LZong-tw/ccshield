@@ -925,6 +925,12 @@ test("too many new images in the last turn is an audited block; other inspector 
   const blocked = await limit.decide(mediaBody(pngBlock));
   assert.equal(blocked.action, "block");
   assert.deepEqual(blocked.reasonCodes, ["media_image_limit_blocked"]);
+  assert.equal(blocked.mediaOutcome, "blocked_source");
+  const rejected = await imageDecide({ inspect: async () => { throw Object.assign(new Error("x"), { code: "image_rejected" }); } });
+  const refused = await rejected.decide(mediaBody(pngBlock));
+  assert.equal(refused.action, "block");
+  assert.deepEqual(refused.reasonCodes, ["media_image_rejected_blocked"]);
+  assert.equal(refused.mediaOutcome, "blocked_source");
   for (const code of ["image_timeout", "image_queue_full", "image_scan_unavailable"]) {
     const { decide } = await imageDecide({ inspect: async () => { throw Object.assign(new Error("x"), { code }); } });
     await assert.rejects(decide(mediaBody(pngBlock)), (error) => error.shieldFailure?.stage === "image_scan" && error.shieldFailure?.reason === code);
