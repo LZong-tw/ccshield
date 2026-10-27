@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { ImageLimitError, SHIELD_IMAGE_LIMITS, assertImageWithinLimits, imageLimits, readImageDimensions } from "../src/shield/images/limits.mjs";
-import { buildSyntheticText, mapFindingsToRects } from "../src/shield/images/regions.mjs";
-import { assertContext, verifyImage } from "../src/shield/images/verify.mjs";
+import { ImageLimitError, SHIELD_IMAGE_LIMITS, assertImageWithinLimits, imageLimits, readImageDimensions } from "../shield-image/limits.mjs";
+import { buildSyntheticText, mapFindingsToRects } from "../shield-image/regions.mjs";
+import { assertContext, verifyImage } from "../shield-image/verify.mjs";
 
 function png(width, height, extra = 0) {
   const b = Buffer.alloc(33 + extra);

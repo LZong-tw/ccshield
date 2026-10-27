@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 import { SHIELD_IMAGE_LIMITS } from "./limits.mjs";
 
 const codePoints = (text) => [...text].length;

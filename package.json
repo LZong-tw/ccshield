@@ -13,6 +13,7 @@
   "files": [
     "src/",
     "detectors/",
+    "shield-image/",
     "policy/",
     "licenses/",
     "README.md",

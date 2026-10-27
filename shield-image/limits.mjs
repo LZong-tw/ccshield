@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 const MiB = 1024 * 1024;
 
 export const SHIELD_IMAGE_LIMITS = Object.freeze({
