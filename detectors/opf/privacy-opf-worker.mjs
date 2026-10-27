@@ -202,9 +202,12 @@ while True:
         cache.end_scan()
 `;
 
+// The daemon appends --window-cache-dir for its lane; the self-test omits it and
+// runs on the memory cache alone.
 function options(args) {
-  if (args.length !== 22) throw new Error("invalid worker arguments");
-  const names = ["--python", "--checkpoint", "--checkpoint-sha256", "--checkpoint-version", "--opf-source", "--opf-source-sha256", "--adapter-sha256", "--tokenizer", "--tokenizer-sha256", "--startup-timeout-ms", "--scan-timeout-ms"];
+  if (args.length !== 24 && args.length !== 26) throw new Error("invalid worker arguments");
+  const names = ["--python", "--checkpoint", "--checkpoint-sha256", "--checkpoint-version", "--opf-source", "--opf-source-sha256", "--adapter-sha256", "--tokenizer", "--tokenizer-sha256", "--startup-timeout-ms", "--scan-timeout-ms", "--window-cache-max-mib"];
+  if (args.length === 26) names.push("--window-cache-dir");
   const value = {};
   for (let i = 0; i < names.length; i += 1) {
     if (args[i * 2] !== names[i]) throw new Error("invalid worker arguments");
@@ -220,9 +223,14 @@ function options(args) {
   if (value["--tokenizer"].split("/").at(-1) !== "fb374d419588a4632f3f557e76b4b70aebbca790") throw new Error("invalid tokenizer name");
   for (const name of ["--startup-timeout-ms", "--scan-timeout-ms"]) {
     const timeout = Number(value[name]);
-    if (!Number.isInteger(timeout) || timeout < 1 || timeout > (name === "--scan-timeout-ms" ? 60_000 : 30_000)) throw new Error("invalid worker timeout");
+    if (!Number.isInteger(timeout) || timeout < 1 || timeout > (name === "--scan-timeout-ms" ? 240_000 : 30_000)) throw new Error("invalid worker timeout");
     value[name] = timeout;
   }
+  const maxMib = Number(value["--window-cache-max-mib"]);
+  if (!Number.isInteger(maxMib) || String(maxMib) !== value["--window-cache-max-mib"] || (maxMib !== 0 && (maxMib < 16 || maxMib > 4096))) throw new Error("invalid window cache size");
+  value["--window-cache-max-mib"] = maxMib;
+  const dir = value["--window-cache-dir"];
+  if (dir !== undefined && (!isAbsolute(dir) || resolve(dir) !== dir)) throw new Error("invalid window cache directory");
   return value;
 }
 

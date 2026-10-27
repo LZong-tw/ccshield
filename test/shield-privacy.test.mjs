@@ -364,7 +364,7 @@ test("OPF filter accepts the pinned ten-second scan budget", async (t) => {
   });
   const extended = { privacy: {
     ...opfProvision.privacy,
-    worker: { ...opfProvision.privacy.worker, args: [...opfProvision.privacy.worker.args.slice(0, 21), "10000"] },
+    worker: { ...opfProvision.privacy.worker, args: opfProvision.privacy.worker.args.with(21, "10000") },
   } };
   const filter = await createPrivacyFilter({
     provision: extended, spawnWorker: () => worker, validateWorker, validateFile,
@@ -381,7 +381,7 @@ test("OPF filter accepts a pinned twenty-five-second scan budget", async (t) => 
   });
   const extended = { privacy: {
     ...opfProvision.privacy,
-    worker: { ...opfProvision.privacy.worker, args: [...opfProvision.privacy.worker.args.slice(0, 21), "25000"] },
+    worker: { ...opfProvision.privacy.worker, args: opfProvision.privacy.worker.args.with(21, "25000") },
   } };
   const filter = await createPrivacyFilter({
     provision: extended, spawnWorker: () => worker, validateWorker, validateFile,
@@ -397,7 +397,7 @@ test("OPF sixty-second scans retain their full budget and the parent's one-secon
   });
   const extended = { privacy: {
     ...opfProvision.privacy,
-    worker: { ...opfProvision.privacy.worker, args: [...opfProvision.privacy.worker.args.slice(0, 21), "60000"] },
+    worker: { ...opfProvision.privacy.worker, args: opfProvision.privacy.worker.args.with(21, "60000") },
   } };
   const filter = await createPrivacyFilter({
     provision: extended, spawnWorker: () => worker, validateWorker, validateFile,
@@ -1110,7 +1110,7 @@ test("OPF scan waits beyond the generic two-second deadline when provisioned for
   });
   const extended = { privacy: {
     ...opfProvision.privacy,
-    worker: { ...opfProvision.privacy.worker, args: [...opfProvision.privacy.worker.args.slice(0, 21), "10000"] },
+    worker: { ...opfProvision.privacy.worker, args: opfProvision.privacy.worker.args.with(21, "10000") },
   } };
   const filter = await createPrivacyFilter({
     provision: extended, spawnWorker: () => worker, validateWorker, validateFile,

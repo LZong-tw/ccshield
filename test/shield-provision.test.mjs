@@ -203,16 +203,16 @@ test("OPF provision pins its model, source, helper, tokenizer and worker argumen
     assert.deepEqual(assertShieldAssetsProvision(preview).privacy.adapter, adapter);
     assert.deepEqual(assertShieldAssetsProvision(preview).privacy.tokenizer, tokenizer);
 
-    for (const scanTimeout of ["10000", "25000", "60000"]) {
+    for (const scanTimeout of ["10000", "25000", "60000", "240000"]) {
       const extendedScanManifest = {
         ...privacyManifest,
-        worker: { ...privacyManifest.worker, args: [...privacyManifest.worker.args.slice(0, 21), scanTimeout] },
+        worker: { ...privacyManifest.worker, args: privacyManifest.worker.args.with(21, scanTimeout) },
       };
       const extended = await provisionShieldAssets({ ...options, io: fixtureIo({
         privacyManifest: extendedScanManifest,
         extraBytes: { [adapterPath]: adapterBytes, [tokenizerPath]: tokenizerBytes },
       }) });
-      assert.equal(extended.privacy.worker.args.at(-1), scanTimeout);
+      assert.equal(extended.privacy.worker.args[21], scanTimeout);
     }
 
     await assert.rejects(provisionShieldAssets({ ...options, io: fixtureIo({
@@ -223,6 +223,14 @@ test("OPF provision pins its model, source, helper, tokenizer and worker argumen
       privacyManifest: { ...privacyManifest, worker: { ...privacyManifest.worker, args: [...privacyManifest.worker.args.slice(0, 19), "2000", ...privacyManifest.worker.args.slice(20)] } },
       extraBytes: { [adapterPath]: adapterBytes, [tokenizerPath]: tokenizerBytes },
     }) }), /privacy bundle manifest|worker arguments/i);
+    // The lane cache directory is appended by the daemon, never pinned in the shared manifest.
+    for (const args of [privacyManifest.worker.args.with(21, "300000"), privacyManifest.worker.args.with(23, "8"),
+      [...privacyManifest.worker.args, "--window-cache-dir", "/tmp/elsewhere"]]) {
+      await assert.rejects(provisionShieldAssets({ ...options, io: fixtureIo({
+        privacyManifest: { ...privacyManifest, worker: { ...privacyManifest.worker, args } },
+        extraBytes: { [adapterPath]: adapterBytes, [tokenizerPath]: tokenizerBytes },
+      }) }), /privacy bundle manifest|worker arguments/i, JSON.stringify(args.slice(20)));
+    }
     await assert.rejects(provisionShieldAssets({ ...options, io: fixtureIo({
       privacyManifest: { ...privacyManifest, adapter: undefined }, extraBytes: { [adapterPath]: adapterBytes, [tokenizerPath]: tokenizerBytes },
     }) }), /privacy bundle manifest/i);

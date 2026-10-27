@@ -1674,11 +1674,24 @@ syncBuiltinESMExports();
       assert.equal(reply.type, request.type);
       assert.equal(reply.status, "unknown");
     });
-    const longBudget = spawnSync(process.execPath, workerArgs({ startup: 30_000, scan: 60_000 }), { input, encoding: "utf8", timeout: runTimeout });
-    assert.equal(parseReplies(longBudget).length, 2, "worker must accept the finite 60-second cold scan budget");
-    const overBudget = spawnSync(process.execPath, workerArgs({ startup: 30_000, scan: 60_001 }), { input, encoding: "utf8", timeout: runTimeout });
-    assert.equal(overBudget.error, undefined);
-    assert.notEqual(overBudget.status, 0, "worker must reject an unbounded scan budget");
+    const longBudget = spawnSync(process.execPath, workerArgs({ startup: 30_000, scan: 240_000 }), { input, encoding: "utf8", timeout: runTimeout });
+    assert.equal(parseReplies(longBudget).length, 2, "worker must accept the finite 240-second request budget");
+    const withCacheDir = spawnSync(process.execPath, [...workerArgs({ startup: 30_000, scan: 2_000 }), "--window-cache-dir", join(temp, "window-cache")],
+      { input, encoding: "utf8", timeout: runTimeout });
+    assert.equal(parseReplies(withCacheDir).length, 2, "worker must accept the lane window cache directory");
+    const base = workerArgs({ startup: 30_000, scan: 2_000 });
+    for (const [label, bad] of [
+      ["unbounded scan budget", workerArgs({ startup: 30_000, scan: 240_001 })],
+      ["relative cache directory", [...base, "--window-cache-dir", "window-cache"]],
+      ["unnormalised cache directory", [...base, "--window-cache-dir", `${temp}//window-cache`]],
+      ["cache directory without a value", [...base, "--window-cache-dir"]],
+      ["disk tier under 16 MiB", base.map((value, at) => at === base.length - 1 ? "8" : value)],
+      ["missing disk tier size", base.slice(0, -2)],
+    ]) {
+      const rejected = spawnSync(process.execPath, bad, { input, encoding: "utf8", timeout: runTimeout });
+      assert.equal(rejected.error, undefined);
+      assert.notEqual(rejected.status, 0, `worker must reject ${label}`);
+    }
     const malformed = spawnSync(process.execPath, args, { input: `${JSON.stringify({
       protocol: "airkit-privacy-ndjson-v1", id: "malformed", type: "scan", body: "bad!base64",
     })}\n`, encoding: "utf8", timeout: runTimeout });
