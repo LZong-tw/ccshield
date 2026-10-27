@@ -1,0 +1,5 @@
+{
+  "name": "ccshield",
+  "description": "Shows ccshield protection status and warns when a session is not behind ccshield.",
+  "license": "MIT"
+}

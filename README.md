@@ -14,6 +14,32 @@ On the subscription lane, ccshield rewrites the body of Claude Pro/Max OAuth
 requests. Doing so **may** conflict with Anthropic's Consumer Terms. You decide
 whether to use it there.
 
+## Claude Code plugin
+
+The repository root is a Claude Code plugin. It does not route traffic: plugins
+cannot set `env`, so a session is protected only when started with
+`ccshield launch`. The plugin adds two things:
+
+- a SessionStart hook that shows one warning when the session's base URL is
+  not a loopback ccshield origin carrying the shield header;
+- a subagent statusline with the per-lane protection state.
+
+The statusline command needs absolute paths, so it is generated:
+
+```bash
+ccshield plugin install           # preview the settings.json it would write
+ccshield plugin install --write   # write settings.json in the plugin root
+```
+
+Only one plugin's `subagentStatusLine` is shown. If AirKit's `airkit-context`
+plugin is enabled, disable one of the two.
+
+### Moving from AirKit Shield
+
+`ccshield migrate` lists what an AirKit install left behind (state directory,
+`com.airkit.shield.*` launch agents, the `airkit-context` statusline) with a
+hint for each. It changes nothing.
+
 ## Library API
 
 The package entry point (`import … from "@untionglim/shield"`) exports only
