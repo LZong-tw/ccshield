@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { buildOpfWorkerArgs } from "../src/shield/opf-args.mjs";
 import { attestShieldCheckpoint } from "../src/shield/checkpoint.mjs";
 import { createPrivacyFilter, isVerifiedRedaction, privacyWorkerEnv, runPrivacyWorkerSelfTest } from "../src/shield/privacy.mjs";
 
@@ -25,14 +26,8 @@ const opfProvision = {
     tokenizer: { path: "/opt/ccshield/tiktoken-cache/fb374d419588a4632f3f557e76b4b70aebbca790", sha256: "e".repeat(64), version: "o200k_base" },
   },
 };
-opfProvision.privacy.worker = { ...opfProvision.privacy.worker, args: [
-  "--python", "/opt/ccshield/python", "--checkpoint", opfProvision.privacy.checkpoint.path,
-  "--checkpoint-sha256", opfProvision.privacy.checkpoint.sha256, "--checkpoint-version", opfProvision.privacy.checkpoint.version,
-  "--opf-source", opfProvision.privacy.source.path, "--opf-source-sha256", opfProvision.privacy.source.sha256,
-  "--adapter-sha256", opfProvision.privacy.adapter.sha256,
-  "--tokenizer", opfProvision.privacy.tokenizer.path, "--tokenizer-sha256", opfProvision.privacy.tokenizer.sha256,
-  "--startup-timeout-ms", "30000", "--scan-timeout-ms", "2000",
-] };
+opfProvision.privacy.worker = { ...opfProvision.privacy.worker,
+  args: buildOpfWorkerArgs({ ...opfProvision.privacy, python: "/opt/ccshield/python", scanTimeoutMs: 2_000 }) };
 const validateWorker = async () => {};
 const validateFile = async () => {};
 

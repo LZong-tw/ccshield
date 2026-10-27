@@ -11,6 +11,7 @@ import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 
 import { prepareOpfScan, adaptOpfPrediction, UNKNOWN_REASONS } from "../detectors/opf/opf-adapter.mjs";
+import { buildOpfWorkerArgs } from "../src/shield/opf-args.mjs";
 import { createPrivacyFilter, isVerifiedRedaction } from "../src/shield/privacy.mjs";
 
 const sourceOf = (name) => resolve(import.meta.dirname, name.endsWith(".py") ? "../detectors/opf/python" : "../detectors/opf", name);
@@ -1595,11 +1596,13 @@ syncBuiltinESMExports();
       { protocol: "airkit-privacy-ndjson-v1", id: "s", type: "scan", body: body.toString("base64") },
     ].map((entry) => JSON.stringify(entry)).join("\n") + "\n";
     // Budget classes keyed by what must expire; spawnSync bounds stay above budget plus restart and shutdown.
-    const workerArgs = ({ startup, scan }) => [worker, "--python", pythonPath, "--checkpoint", checkpoint,
-      "--checkpoint-sha256", digest, "--checkpoint-version", "test-1", "--opf-source", source,
-      "--opf-source-sha256", sourceDigest, "--adapter-sha256", adapterDigest,
-      "--tokenizer", tokenizer, "--tokenizer-sha256", tokenizerDigest,
-      "--startup-timeout-ms", String(startup), "--scan-timeout-ms", String(scan)];
+    const workerArgs = ({ startup, scan }) => {
+      const args = buildOpfWorkerArgs({ python: pythonPath, checkpoint: { path: checkpoint, sha256: digest, version: "test-1" },
+        source: { path: source, sha256: sourceDigest }, adapter: { sha256: adapterDigest },
+        tokenizer: { path: tokenizer, sha256: tokenizerDigest }, scanTimeoutMs: scan });
+      args[args.indexOf("--startup-timeout-ms") + 1] = String(startup);
+      return [worker, ...args];
+    };
     const args = workerArgs({ startup: 30_000, scan: 30_000 });
     const scanExpiryArgs = workerArgs({ startup: 30_000, scan: 2_000 });
     const startupExpiryArgs = workerArgs({ startup: 1_000, scan: 2_000 });

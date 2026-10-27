@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { buildOpfWorkerArgs } from "../src/shield/opf-args.mjs";
 import { keepInstallRecord, provisionShieldAssets } from "../src/shield/provision.mjs";
 import { prepareRegexWorker } from "../src/shield/regex-detector.mjs";
 import { ASSETS_FORMAT_VERSION, assertShieldAssetsProvision, readShieldAssetsProvision, shieldPaths } from "../src/shield/paths.mjs";
@@ -174,14 +175,8 @@ test("OPF provision pins its model, source, helper, tokenizer and worker argumen
   const tokenizer = { path: tokenizerPath, sha256: sha256(tokenizerBytes), version: "o200k_base" };
   const privacyManifest = {
     ...JSON.parse(bytes[privacyPath]), checkpoint, source, adapter, tokenizer,
-    worker: { ...JSON.parse(bytes[privacyPath]).worker, args: [
-      "--python", "/opt/ccshield/python", "--checkpoint", checkpoint.path,
-      "--checkpoint-sha256", checkpoint.sha256, "--checkpoint-version", checkpoint.version,
-      "--opf-source", source.path, "--opf-source-sha256", source.sha256,
-      "--adapter-sha256", adapter.sha256,
-      "--tokenizer", tokenizer.path, "--tokenizer-sha256", tokenizer.sha256,
-      "--startup-timeout-ms", "30000", "--scan-timeout-ms", "2000",
-    ] },
+    worker: { ...JSON.parse(bytes[privacyPath]).worker,
+      args: buildOpfWorkerArgs({ python: "/opt/ccshield/python", checkpoint, source, adapter, tokenizer, scanTimeoutMs: 2_000 }) },
   };
   const options = {
     bundlePath: policyPath,
