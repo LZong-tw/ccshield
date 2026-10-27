@@ -45,12 +45,13 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
   // Without lane paths (the self-test) the OPF worker keeps its cache in memory.
   const windowCacheArgs = privacy.checkpoint && paths !== undefined ? ["--window-cache-dir", laneWindowCachePath(paths)] : [];
   const startupBudgetMs = startupTimeoutMs ?? (privacy.checkpoint ? 60_000 : DEFAULT_STARTUP_TIMEOUT_MS);
-  const scanTimeoutMs = timeoutMs ?? (privacy.checkpoint ? Number(privacy.worker.args[21]) + 1_000 : DEFAULT_TIMEOUT_MS);
+  // One budget per request, from admission to reply: queueing, startup and the scan all spend it.
+  const scanTimeoutMs = timeoutMs ?? (privacy.checkpoint ? Number(privacy.worker.args[21]) : DEFAULT_TIMEOUT_MS);
   if (typeof spawnWorker !== "function") throw new TypeError("shield privacy worker launcher is required");
   if (typeof validateWorker !== "function") throw new TypeError("shield privacy worker validator is required");
   if (typeof validateCheckpoint !== "function") throw new TypeError("shield privacy checkpoint validator is required");
   if (typeof validateFile !== "function") throw new TypeError("shield privacy file validator is required");
-  if (!Number.isInteger(scanTimeoutMs) || scanTimeoutMs < 1 || scanTimeoutMs > (privacy.checkpoint ? 241_000 : 30_000)) throw new TypeError("shield privacy worker timeout is invalid");
+  if (!Number.isInteger(scanTimeoutMs) || scanTimeoutMs < 1 || scanTimeoutMs > (privacy.checkpoint ? 240_000 : 30_000)) throw new TypeError("shield privacy worker timeout is invalid");
   if (!Number.isInteger(startupBudgetMs) || startupBudgetMs < 1 || startupBudgetMs > 60_000) throw new TypeError("shield privacy startup timeout is invalid");
 
   let assertCheckpointUnchanged;
@@ -254,7 +255,16 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
         } catch { close("assets_invalid"); return; }
       }
       if (entry.settled || closed || current !== session) return;
-      const reply = await request(session, { type: "scan", body: entry.body.toString("base64") }, scanTimeoutMs);
+      let reply;
+      if (privacy.checkpoint) {
+        // OPF spends one budget from admission: queueing and model startup count. The worker enforces it and
+        // kills Python at budget + 5 s; this deadline only backs that up.
+        const budgetMs = entry.admittedAt + scanTimeoutMs - Date.now();
+        if (budgetMs <= 0) { result = retryLater("queue_timeout"); return; }
+        reply = await request(session, { type: "scan", body: entry.body.toString("base64"), budgetMs }, budgetMs + 6_000);
+      } else {
+        reply = await request(session, { type: "scan", body: entry.body.toString("base64") }, scanTimeoutMs);
+      }
       result = normalizeScanReply(reply);
       cache = windowCounts(reply);
       segments = segmentCounts(reply);
@@ -334,7 +344,7 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
       };
       if (!inflight.has(digest)) inflight.set(digest, entry);
       addWaiter(entry, resolve, signal);
-      // Waiting has its own bounded deadline; scan time begins only at dispatch.
+      // Waiting has its own bounded deadline; for OPF it is the same budget the scan later runs on.
       entry.timer = setTimeout(() => {
         const index = queue.indexOf(entry);
         if (index !== -1) queue.splice(index, 1);
@@ -428,7 +438,11 @@ function recordScan(recent, { status, reason, cache, segments, detail, attached,
 function normalizeScanReply(reply) {
   if (reply?.[REQUEST_FAILURE] === true) return unavailable(reply.reason);
   if (!isPlainObject(reply) || reply.type !== "scan" || typeof reply.status !== "string") return unavailable("reply_invalid");
-  if (reply.status === "unknown") return Object.freeze({ status: "unknown", findings: Object.freeze([]), reason: ADAPTER_UNKNOWN_REASONS.has(reply.reason) ? reply.reason : "privacy_unavailable" });
+  if (reply.status === "unknown") {
+    const reason = ADAPTER_UNKNOWN_REASONS.has(reply.reason) ? reply.reason : "privacy_unavailable";
+    const retry = reason === "model_timeout" && Number.isInteger(reply.retryAfterSeconds) && reply.retryAfterSeconds >= 1 && reply.retryAfterSeconds <= 60;
+    return Object.freeze({ status: "unknown", findings: Object.freeze([]), reason, ...(retry ? { retryAfterSeconds: reply.retryAfterSeconds } : {}) });
+  }
   if (reply.status !== "ok" || !Array.isArray(reply.findings) || reply.findings.length > 128) return unavailable("reply_invalid");
   const findings = [];
   for (const finding of reply.findings) {
