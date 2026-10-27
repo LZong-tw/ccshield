@@ -376,8 +376,10 @@ class ExactWindowLogitsCache:
         if stored is None:
             started = self._clock()
             logits = self.original_forward(tokens, attention_mask=attention_mask)
-            self._miss_seconds.append(self._clock() - started)
-            self._miss_median = sorted(self._miss_seconds)[len(self._miss_seconds) // 2]
+            # Only budgeted work is sampled: the startup warm-up is a short, cold forward that would skew projections.
+            if self._deadline is not None:
+                self._miss_seconds.append(self._clock() - started)
+                self._miss_median = sorted(self._miss_seconds)[len(self._miss_seconds) // 2]
             if not isinstance(logits, torch.Tensor) or logits.device.type != "cpu":
                 raise RuntimeError("model must return CPU logits")
             stored = logits.detach().clone()
@@ -558,7 +560,9 @@ def self_test():
             cache, now = self.projected(10.0)
             hot = torch.tensor([[1]], dtype=torch.int32)
             with torch.inference_mode():
+                cache.begin_scan(1000)
                 cache.forward(hot)
+                cache.end_scan()
                 cache.begin_scan(1000, total_windows=3)
                 for _ in range(3):
                     cache.forward(hot)
@@ -570,6 +574,16 @@ def self_test():
                 cache.end_scan()
             self.assertEqual(now[0], 10.0)
             self.assertEqual(raised.exception.remaining_ms, 50_000)
+
+        def test_unbudgeted_forwards_do_not_enter_the_miss_median(self):
+            cache, now = self.projected(10.0)
+            with torch.inference_mode():
+                cache.forward(torch.tensor([[1]], dtype=torch.int32))
+                cache.begin_scan(25, total_windows=2)
+                cache.forward(torch.tensor([[2]], dtype=torch.int32))
+                cache.forward(torch.tensor([[3]], dtype=torch.int32))
+                cache.end_scan()
+            self.assertEqual(now[0], 30.0)
 
         def test_an_exhausted_budget_reports_its_unscanned_windows(self):
             cache, now = self.projected(10.0)

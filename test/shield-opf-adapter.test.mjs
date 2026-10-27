@@ -1278,7 +1278,7 @@ import time
 import types
 cooperative_mode = os.getenv("CCSHIELD_TEST_COOPERATIVE_MODE")
 scan_ms = int(sys.argv[6])
-budget = (scan_ms - min(5000, scan_ms / 5)) / 1000
+budget = scan_ms / 1000
 clock = [0.0]
 if cooperative_mode:
     time.monotonic = lambda: clock[0]
@@ -1448,7 +1448,10 @@ class OPF:
         assert served._get_tensor("weight") == ("mapped", "bfloat16", bytes([1, 2, 3, 4]), (2,))
         assert Checkpoint({"weight": os.path.join(model, "..", "elsewhere.safetensors")})._get_tensor("weight") == "private copy"
         self.calls = 0
-        self.runtime = types.SimpleNamespace(model=Transformer(), n_ctx=4096)
+        def encode(text, allowed_special=None):
+            assert allowed_special == "all"
+            return [0] * int(os.getenv("CCSHIELD_TEST_TOKENS", len(text)))
+        self.runtime = types.SimpleNamespace(model=Transformer(), n_ctx=4096, encoding=types.SimpleNamespace(encode=encode))
         self.decoder = ViterbiCRFDecoder()
     def get_runtime(self):
         return self.runtime
@@ -1460,7 +1463,7 @@ class OPF:
         assert type(cache).__name__ == "ExactWindowLogitsCache"
         assert f"cpu:threads{expected_threads()}:" in cache._namespace and "ctx4096" in cache._namespace
         assert "adb9dd7d6f47e482ccb0925e621a1375461b997833dfa5be6dfc67b9d58b6f0e" in cache._namespace
-        assert "c889077d58c1e5da6a59ba54e281fa926f58b8e367ba9a42c99ceabf0fbde53b" in cache._namespace
+        assert "6cab80adb4f510613e446bb6cffa43a2c9f304fb57957b45dd5f873cd894a149" in cache._namespace
         self.calls += 1
         scan_number[0] = self.calls
         if self.calls == 1:
@@ -1734,9 +1737,13 @@ syncBuiltinESMExports();
         const scans = parseReplies(result).filter(({ type }) => type === "scan");
         // Per-scan window cache counts show the retry reusing what the timed-out scan already computed.
         const counts = { windows: [[0, 2], [2, 0]], blocks: [[0, 2], [1, 1]], preprocess: [[0, 0], [0, 2]], postprocess: [[0, 2], [2, 0]] }[mode];
-        assert.deepEqual(scans[0], { type: "scan", id: "first", status: "unknown", reason: "model_timeout", cache: { hits: counts[0][0], misses: counts[0][1] } });
+        // The text is one window, so once a miss is sampled nothing remains and Retry-After floors at 1 s;
+        // preprocess stops before any budgeted miss, leaving nothing to project from.
+        const retry = mode === "preprocess" ? undefined : 1;
+        assert.deepEqual(scans[0], { type: "scan", id: "first", status: "unknown", reason: "model_timeout",
+          ...(retry ? { retryAfterSeconds: retry } : {}), cache: { hits: counts[0][0], misses: counts[0][1], windows: 1 } });
         assert.equal(scans[1].id, "second");
-        assert.deepEqual(scans[1].cache, { hits: counts[1][0], misses: counts[1][1] });
+        assert.deepEqual(scans[1].cache, { hits: counts[1][0], misses: counts[1][1], windows: 1 });
         assert.deepEqual(verifiedResult(body, scans[1]), { content: "[redacted:private_email]" });
         const progress = (await readFile(marker, "utf8")).trim().split("\n").map((line) => line.split(":").map(Number));
         assert.equal(progress.length, 2);
@@ -1749,6 +1756,34 @@ syncBuiltinESMExports();
         assert.doesNotMatch(result.stdout, /person@example\.org|prediction/);
       });
     }
+    for (const scan of [30_000, 240_000]) await t.test(`a ${scan}ms scan that cannot fit its remaining windows stops early with a bounded Retry-After`, () => {
+      const marker = join(temp, `projected-${scan}`);
+      const frame = JSON.stringify({ protocol: "airkit-privacy-ndjson-v1", id: "projected", type: "scan", body: body.toString("base64"), budgetMs: scan }) + "\n";
+      const result = spawnSync(process.execPath, workerArgs({ startup: 30_000, scan }), { input: frame, encoding: "utf8", timeout: runTimeout,
+        env: { ...process.env, CCSHIELD_TEST_COOPERATIVE_MODE: "windows", CCSHIELD_TEST_COOPERATIVE_MARKER: marker,
+          CCSHIELD_OPF_WARM_SECONDS: "0", CCSHIELD_TEST_TOKENS: "8192" } });
+      // Two windows of 0.75 budget each: after the first miss the second cannot fit, so it never runs.
+      assert.deepEqual(parseReplies(result), [{ type: "scan", id: "projected", status: "unknown", reason: "model_timeout",
+        retryAfterSeconds: Math.min(60, Math.ceil(0.75 * scan / 1000)), cache: { hits: 0, misses: 1, windows: 2 } }]);
+    });
+    await t.test("a frame budget above the worker's scan budget is refused before Python sees it", () => {
+      const frames = [() => ({ budgetMs: 30_001 }), () => ({ budgetMs: 0 }), () => ({ budgetMs: 1.5 }), () => ({ budgetMs: "100" })]
+        .map((extra, at) => JSON.stringify({ protocol: "airkit-privacy-ndjson-v1", id: `bad-${at}`, type: "scan", body: body.toString("base64"), ...extra() }))
+        .join("\n") + "\n";
+      const result = spawnSync(process.execPath, args, { input: frames, encoding: "utf8", timeout: runTimeout });
+      assert.deepEqual(parseReplies(result).map(({ id, status, reason }) => [id, status, reason]),
+        [0, 1, 2, 3].map((at) => [`bad-${at}`, "unknown", undefined]));
+    });
+    await t.test("an unresponsive Python is killed exactly at the frame budget plus the five-second backstop", () => {
+      const frame = JSON.stringify({ protocol: "airkit-privacy-ndjson-v1", id: "backstop", type: "scan", body: body.toString("base64"), budgetMs: 300 }) + "\n";
+      const started = Date.now();
+      const result = spawnSync(process.execPath, args, { input: frame, encoding: "utf8", timeout: runTimeout,
+        env: { ...process.env, CCSHIELD_TEST_SCAN_STALL: "1" } });
+      const elapsedMs = Date.now() - started;
+      assert.deepEqual(parseReplies(result), [{ type: "scan", id: "backstop", status: "unknown", reason: "model_killed" }]);
+      // The argv scan budget is 30 s; only the frame budget (300 ms) plus 5 s fits this window, startup included.
+      assert.ok(elapsedMs >= 5_300 && elapsedMs < 9_000, `killed after ${elapsedMs}ms`);
+    });
     const recovered = spawnSync(process.execPath, scanExpiryArgs,
       { input: retryInput, encoding: "utf8", env: { ...process.env, CCSHIELD_TEST_SCAN_STALL_ONCE_MARKER: join(temp, "stalled-once") }, timeout: runTimeout });
     const recoveredReplies = parseReplies(recovered)
@@ -1815,13 +1850,13 @@ syncBuiltinESMExports();
       try {
         send(child, "first");
         // Scan one stops inside window 2 and caches only window 1 (see the blocks case above).
-        assert.deepEqual(await reply("first"), { type: "scan", id: "first", status: "unknown", reason: "model_timeout", cache: { hits: 0, misses: 2 } });
+        assert.deepEqual(await reply("first"), { type: "scan", id: "first", status: "unknown", reason: "model_timeout", retryAfterSeconds: 1, cache: { hits: 0, misses: 2, windows: 1 } });
         const lines = async () => existsSync(marker) ? (await readFile(marker, "utf8")).trim().split("\n").length : 0;
         // The idle worker re-runs the timed-out text once in the background; wait until that pass is recorded.
         await waitFor(async () => await lines() >= 2);
         send(child, "second");
         const second = await reply("second");
-        assert.deepEqual(second.cache, { hits: 2, misses: 0 }, "warming must have cached every window of the timed-out text");
+        assert.deepEqual(second.cache, { hits: 2, misses: 0, windows: 1 }, "warming must have cached every window of the timed-out text");
         assert.deepEqual(verifiedResult(body, second), { content: "[redacted:private_email]" });
         const progress = (await readFile(marker, "utf8")).trim().split("\n").map((line) => line.split(":").map(Number));
         assert.deepEqual(progress.map(([, call]) => call), [2, 3, 4]);
