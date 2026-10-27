@@ -6,6 +6,7 @@ import { dirname, isAbsolute, resolve } from "node:path";
 import { envNamesFor, readEnv } from "../compat-env.mjs";
 import { attestShieldCheckpoint } from "./checkpoint.mjs";
 import { isValidOpfWorkerArgs } from "./opf-args.mjs";
+import { laneWindowCachePath } from "./paths.mjs";
 import { PRIVACY_PROTOCOL as PROTOCOL } from "./protocol.mjs";
 const MAX_BODY_BYTES = 1_048_576;
 const MAX_FRAME_BYTES = 4 * 1_048_576; // base64 redacted body (≤1 MiB → ~1.4 MiB) plus findings must fit
@@ -39,15 +40,17 @@ const KNOWN_LABELS = new Set([
   "private_phone", "private_url", "private_date", "secret",
 ]);
 
-export async function createPrivacyFilter({ provision, spawnWorker = defaultSpawnWorker, validateWorker = validatePrivacyWorkerAsset, validateCheckpoint = attestShieldCheckpoint, validateFile = validatePrivacyPinnedFile, timeoutMs, startupTimeoutMs } = {}) {
+export async function createPrivacyFilter({ provision, paths, spawnWorker = defaultSpawnWorker, validateWorker = validatePrivacyWorkerAsset, validateCheckpoint = attestShieldCheckpoint, validateFile = validatePrivacyPinnedFile, timeoutMs, startupTimeoutMs } = {}) {
   const privacy = assertPrivacyProvision(provision);
+  // Without lane paths (the self-test) the OPF worker keeps its cache in memory.
+  const windowCacheArgs = privacy.checkpoint && paths !== undefined ? ["--window-cache-dir", laneWindowCachePath(paths)] : [];
   const startupBudgetMs = startupTimeoutMs ?? (privacy.checkpoint ? 60_000 : DEFAULT_STARTUP_TIMEOUT_MS);
   const scanTimeoutMs = timeoutMs ?? (privacy.checkpoint ? Number(privacy.worker.args[21]) + 1_000 : DEFAULT_TIMEOUT_MS);
   if (typeof spawnWorker !== "function") throw new TypeError("shield privacy worker launcher is required");
   if (typeof validateWorker !== "function") throw new TypeError("shield privacy worker validator is required");
   if (typeof validateCheckpoint !== "function") throw new TypeError("shield privacy checkpoint validator is required");
   if (typeof validateFile !== "function") throw new TypeError("shield privacy file validator is required");
-  if (!Number.isInteger(scanTimeoutMs) || scanTimeoutMs < 1 || scanTimeoutMs > (privacy.checkpoint ? 61_000 : 30_000)) throw new TypeError("shield privacy worker timeout is invalid");
+  if (!Number.isInteger(scanTimeoutMs) || scanTimeoutMs < 1 || scanTimeoutMs > (privacy.checkpoint ? 241_000 : 30_000)) throw new TypeError("shield privacy worker timeout is invalid");
   if (!Number.isInteger(startupBudgetMs) || startupBudgetMs < 1 || startupBudgetMs > 60_000) throw new TypeError("shield privacy startup timeout is invalid");
 
   let assertCheckpointUnchanged;
@@ -168,7 +171,7 @@ export async function createPrivacyFilter({ provision, spawnWorker = defaultSpaw
     try {
       worker = spawnWorker({
         command: privacy.checkpoint ? process.execPath : privacy.worker.command,
-        args: privacy.checkpoint ? [privacy.worker.command, ...privacy.worker.args] : privacy.worker.args,
+        args: privacy.checkpoint ? [privacy.worker.command, ...privacy.worker.args, ...windowCacheArgs] : privacy.worker.args,
         shell: false,
         stdio: ["pipe", "pipe", "pipe"],
       });

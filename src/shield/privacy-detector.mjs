@@ -55,7 +55,7 @@ export async function openPrivacyDetector({
   const current = () => opf ?? regex;
 
   async function openOpf(privacy) {
-    const filter = await createPrivacy({ provision: { privacy } });
+    const filter = await createPrivacy({ provision: { privacy }, paths });
     if (filter?.version !== expected) {
       filter?.close?.();
       throw new Error("shield privacy version does not match policy metadata");

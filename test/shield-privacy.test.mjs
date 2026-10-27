@@ -7,6 +7,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { buildOpfWorkerArgs } from "../src/shield/opf-args.mjs";
+import { shieldPaths } from "../src/shield/paths.mjs";
 import { attestShieldCheckpoint } from "../src/shield/checkpoint.mjs";
 import { createPrivacyFilter, isVerifiedRedaction, privacyWorkerEnv, runPrivacyWorkerSelfTest } from "../src/shield/privacy.mjs";
 
@@ -414,6 +415,47 @@ test("OPF sixty-second scans retain their full budget and the parent's one-secon
   const message = worker.messages.find((entry) => entry.type === "scan");
   emit(worker, { type: "scan", id: message.id, status: "ok", findings: [] });
   assert.equal((await scan).status, "ok");
+});
+
+test("the OPF worker is spawned with its lane's window cache directory", async (t) => {
+  const paths = shieldPaths({ homeDir: "/tmp/home", uid: 501, lane: "managed" });
+  let spawned;
+  const worker = fakeWorker((message, emit) => { if (message.type === "health") emit(health(message)); });
+  const filter = await createPrivacyFilter({
+    provision: opfProvision, paths, validateWorker, validateFile, validateCheckpoint: async () => async () => {},
+    spawnWorker: ({ args }) => { spawned = args; return worker; },
+  });
+  t.after(() => filter.close());
+  assert.deepEqual(spawned, [opfProvision.privacy.worker.command, ...opfProvision.privacy.worker.args, "--window-cache-dir", paths.windowCachePath]);
+});
+
+test("OPF filter rejects lane paths that did not come from shieldPaths", async () => {
+  const real = shieldPaths({ homeDir: "/tmp/home", uid: 501 });
+  for (const paths of [{ ...real }, { ...real, windowCachePath: "/tmp/elsewhere" }]) {
+    await assert.rejects(createPrivacyFilter({
+      provision: opfProvision, paths, validateWorker, validateFile, validateCheckpoint: async () => async () => {},
+      spawnWorker: () => assert.fail("no worker may start"),
+    }), /canonical/);
+  }
+});
+
+test("the regex worker never receives a window cache directory", async (t) => {
+  let spawned;
+  const worker = fakeWorker((message, emit) => { if (message.type === "health") emit(health(message)); });
+  const filter = await createPrivacyFilter({ provision, paths: shieldPaths({ homeDir: "/tmp/home", uid: 501 }), validateWorker,
+    spawnWorker: ({ args }) => { spawned = args; return worker; } });
+  t.after(() => filter.close());
+  assert.deepEqual(spawned, provision.privacy.worker.args);
+});
+
+test("OPF filter accepts the 240-second request budget", async (t) => {
+  const worker = fakeWorker((message, emit) => { if (message.type === "health") emit(health(message)); });
+  const extended = { privacy: { ...opfProvision.privacy,
+    worker: { ...opfProvision.privacy.worker, args: opfProvision.privacy.worker.args.with(21, "240000") } } };
+  const filter = await createPrivacyFilter({ provision: extended, spawnWorker: () => worker, validateWorker, validateFile,
+    validateCheckpoint: async () => async () => {} });
+  t.after(() => filter.close());
+  assert.equal(filter.version, "privacy-1");
 });
 
 test("privacy scans serialize four admitted requests while health bypasses the scan queue", async (t) => {
@@ -1316,10 +1358,12 @@ test("OPF provision self-test uses a valid synthetic mailbox and requires privat
       });
     }
   });
+  let selfTestArgs;
   assert.deepEqual(await runPrivacyWorkerSelfTest(opfProvision, {
-    spawnWorker: () => worker, validateWorker, validateFile, validateCheckpoint: async () => async () => {},
+    spawnWorker: ({ args }) => { selfTestArgs = args; return worker; }, validateWorker, validateFile, validateCheckpoint: async () => async () => {},
   }), { version: "privacy-1" });
   assert.equal(scannedBody, '{"content":"alice@example.com"}');
+  assert.equal(selfTestArgs.includes("--window-cache-dir"), false, "the self-test must stay on the memory cache");
 
   const wrongLabel = fakeWorker((message, emit) => {
     if (message.type === "health") emit(health(message));

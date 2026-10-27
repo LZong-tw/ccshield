@@ -52,6 +52,11 @@ so a restarted worker does not rescan the same conversation prefix. The cache
 stores logits only, never a privacy decision; every scan still runs the full
 detector over them.
 
+- Each lane has its own cache, `<lane state>/opf-window-cache`; subscription
+  and managed never share entries. The daemon appends that directory when it
+  spawns the worker, and only a canonical `shieldPaths()` object can name it.
+  The provisioned worker manifest is shared by both lanes and carries no cache
+  directory; the provisioning self-test runs on the memory cache alone.
 - Entries are plaintext logits in files of mode 0600 inside a 0700 directory
   owned by the current user. Anyone running as that user can read or replace
   them.
