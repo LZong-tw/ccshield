@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { GITLEAKS_COMMAND_PROFILE } from "./gitleaks.mjs";
 import { doctorDetectorAssets, ensureOpfJob, fetchDetectorAssets, runOpfJobForLane } from "./detectors.mjs";
 import { readShieldAssetsProvision, readShieldIdentity, readShieldPolicyState, shieldPaths } from "./paths.mjs";
+import { provisionImageWorker } from "./image-provision.mjs";
 import { provisionShieldAssets } from "./provision.mjs";
 import { installShieldPolicyProvision, readShieldPolicyProvision } from "./policy-bundle.mjs";
 import { readShieldOperationalStatus } from "./operational-status.mjs";
@@ -58,6 +59,7 @@ const SHIELD_COMMANDS = Object.freeze({
   doctor: (argv, shield) => shield.doctor(parseLaneCommand(argv, "ccshield doctor")),
   policy: (argv, shield) => argv[0] === "status" ? shield.policyStatus(parseLaneCommand(argv.slice(1), "ccshield policy status")) : shield.policyInstall(parsePolicyInstall(argv)),
   privacy: (argv, shield) => shield.privacyProvision(parsePrivacyProvision(argv)),
+  image: (argv, shield) => shield.imageProvision(parseImageProvision(argv)),
   launch: (argv, shield) => {
     const launch = parseLaunch(argv);
     if (launch.lane === "managed") throw new Error("managed Shield launch requires AirKit lease lifecycle");
@@ -76,6 +78,7 @@ async function createDefaultShieldDependencies(dependencies) {
   const readPolicyProvision = dependencies.readShieldPolicyProvision ?? readShieldPolicyProvision;
   const installService = dependencies.installShieldService ?? installShieldService;
   const provisionAssets = dependencies.provisionShieldAssets ?? provisionShieldAssets;
+  const provisionImage = dependencies.provisionImageWorker ?? provisionImageWorker;
   const installPolicy = dependencies.installShieldPolicyProvision ?? installShieldPolicyProvision;
   const ensureReady = dependencies.ensureShieldReady ?? ensureShieldReady;
   const readOperational = dependencies.readShieldOperationalStatus ?? readShieldOperationalStatus;
@@ -161,6 +164,10 @@ async function createDefaultShieldDependencies(dependencies) {
         nodePath,
       });
       return { state: write ? "degraded" : "preview", write, provisioned: write };
+    },
+    async imageProvision({ sourcePath, lane, write }) {
+      const result = await provisionImage({ paths: shieldPaths({ env, lane }), write, ...(sourcePath ? { sourcePath } : {}) });
+      return { ...result, state: write ? "degraded" : "preview", write };
     },
     async policyInstall({ bundlePath, publicKeyPath, lane = "subscription", write }) {
       const lanePaths = shieldPaths({ env, lane });
@@ -317,6 +324,25 @@ function parsePrivacyProvision(argv) {
   return { ...(values["--bundle"] === null ? {} : { bundlePath: values["--bundle"] }), gitleaksPath: values["--gitleaks"], gitleaksRulesPath: values["--gitleaks-rules"], ...(values["--policy-bundle"] === null ? {} : { policyBundlePath: values["--policy-bundle"] }), lane: values["--lane"] ?? "subscription", write };
 }
 
+const IMAGE_PROVISION_USAGE = "usage: ccshield image provision [--image-source /absolute/image-worker.swift] [--lane subscription|managed] [--write]";
+
+function parseImageProvision(argv) {
+  if (argv[0] !== "provision") throw new Error(IMAGE_PROVISION_USAGE);
+  const values = { "--image-source": null, "--lane": null };
+  let write = false;
+  for (let index = 1; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === "--write" && !write) { write = true; continue; }
+    const value = argv[index + 1];
+    if (!(token in values) || values[token] !== null || typeof value !== "string" || value.startsWith("--")) throw new Error(IMAGE_PROVISION_USAGE);
+    values[token] = value;
+    index += 1;
+  }
+  const source = values["--image-source"];
+  if ((source !== null && !isAbsolute(source)) || (values["--lane"] !== null && !["subscription", "managed"].includes(values["--lane"]))) throw new Error(IMAGE_PROVISION_USAGE);
+  return { ...(source === null ? {} : { sourcePath: source }), lane: values["--lane"] ?? "subscription", write };
+}
+
 function parsePolicyInstall(argv) {
   if (argv[0] !== "install") throw new Error("usage: ccshield policy install --bundle /absolute/policy-bundle --public-key /absolute/policy-public-key [--write]");
   const write = argv.includes("--write");
@@ -336,7 +362,7 @@ function parsePolicyInstall(argv) {
 }
 
 function renderShieldHelp() {
-  return `Commands:\n  ccshield install [--lane subscription|managed] [--gitleaks-path /absolute/gitleaks] [--write]\n  ccshield uninstall [--lane subscription|managed] [--write]\n  ccshield start [--lane subscription|managed]\n  ccshield stop [--lane subscription|managed]\n  ccshield status [--lane subscription|managed]\n  ccshield doctor [--lane subscription|managed]\n  ccshield policy <status [--lane subscription|managed]|install --bundle /absolute/policy-bundle --public-key /absolute/policy-public-key [--lane subscription|managed] [--write]>\n  ccshield privacy provision --gitleaks /absolute/gitleaks --gitleaks-rules /absolute/gitleaks-rules.toml [--bundle /absolute/privacy-manifest] [--policy-bundle /absolute/policy-bundle] [--lane subscription|managed] [--write]\n  ccshield launch --lane subscription|managed [--target http://127.0.0.1:port] -- command [args...]\n`;
+  return `Commands:\n  ccshield install [--lane subscription|managed] [--gitleaks-path /absolute/gitleaks] [--write]\n  ccshield uninstall [--lane subscription|managed] [--write]\n  ccshield start [--lane subscription|managed]\n  ccshield stop [--lane subscription|managed]\n  ccshield status [--lane subscription|managed]\n  ccshield doctor [--lane subscription|managed]\n  ccshield policy <status [--lane subscription|managed]|install --bundle /absolute/policy-bundle --public-key /absolute/policy-public-key [--lane subscription|managed] [--write]>\n  ccshield privacy provision --gitleaks /absolute/gitleaks --gitleaks-rules /absolute/gitleaks-rules.toml [--bundle /absolute/privacy-manifest] [--policy-bundle /absolute/policy-bundle] [--lane subscription|managed] [--write]\n  ccshield image provision [--image-source /absolute/image-worker.swift] [--lane subscription|managed] [--write]\n  ccshield launch --lane subscription|managed [--target http://127.0.0.1:port] -- command [args...]\n`;
 }
 
 function renderShieldResult(command, result = {}) {
