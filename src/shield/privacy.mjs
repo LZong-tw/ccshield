@@ -13,6 +13,7 @@ const MAX_FRAME_BYTES = 4 * 1_048_576; // base64 redacted body (≤1 MiB → ~1.
 const DEFAULT_TIMEOUT_MS = 2_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
 const MAX_ADMITTED_SCANS = 4;
+const DISK_COUNTS = ["diskHits", "diskMisses", "diskWrites", "diskErrors"];
 const MAX_ATTACHED_WAITERS = 8;
 const RECENT_SCANS = 32;
 const MAX_WINDOW_COUNT = 65_536;
@@ -65,6 +66,7 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
   const recent = [];
   const totals = {
     scans: 0, ok: 0, unknown: 0, unavailable: 0, coalesced: 0, aborted: 0,
+    diskHits: 0, diskMisses: 0, diskWrites: 0, diskErrors: 0,
     failuresByReason: Object.fromEntries([...TOTAL_FAILURE_REASONS, "other"].map((reason) => [reason, 0])),
   };
   const count = (counts, key) => { counts[key] = Math.min(MAX_TOTAL, counts[key] + 1); };
@@ -225,13 +227,29 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
       .finally(() => { clearTimeout(timer); starting = null; });
     return await starting;
   };
-  // Seconds until the backlog should clear: waiting plus active scans at the recent median scan time.
+  // Median time of recent cold scans: mostly misses, or no window counts at all (the regex worker). Hot scans
+  // finish from cache in a fraction of the time and would understate what a backlog costs.
+  const coldMs = () => {
+    const times = recent.filter((scan) => scan.hits === null || (scan.misses > 0 && scan.misses >= scan.hits))
+      .map((scan) => scan.elapsedMs).sort((left, right) => left - right);
+    return times.length === 0 ? null : times[Math.floor(times.length / 2)];
+  };
+  const retryAfter = (estimateMs) => Math.min(60, Math.max(1, Math.ceil(estimateMs / 1000)));
+  // Seconds until the backlog should clear: waiting plus active scans at the cold median.
   const retryLater = (reason) => {
-    const times = recent.map((scan) => scan.elapsedMs).sort((left, right) => left - right);
-    const estimateMs = times.length === 0
-      ? scanTimeoutMs
-      : (queue.length + Number(active !== null)) * times[Math.floor(times.length / 2)];
-    return Object.freeze({ ...unavailable(reason), retryAfterSeconds: Math.min(60, Math.max(1, Math.ceil(estimateMs / 1000))) });
+    const cold = coldMs();
+    const estimateMs = cold === null ? scanTimeoutMs : (queue.length + Number(active !== null)) * cold;
+    return Object.freeze({ ...unavailable(reason), retryAfterSeconds: retryAfter(estimateMs) });
+  };
+  // OPF scans can take minutes; refuse now, rather than at queue timeout, a scan that could not start within its
+  // budget behind the cold work ahead of it. Without a cold sample nothing is projected.
+  const projectedRefusal = () => {
+    const cold = privacy.checkpoint && active !== null ? coldMs() : null;
+    if (cold === null) return null;
+    const now = Date.now();
+    const activeEnd = Math.min(Math.max(now, (active.dispatchedAt ?? now) + cold), active.admittedAt + scanTimeoutMs);
+    const startMs = activeEnd + queue.length * cold - now;
+    return startMs > scanTimeoutMs ? Object.freeze({ ...unavailable("admission_limit"), retryAfterSeconds: retryAfter(startMs) }) : null;
   };
   const drain = async () => {
     if (closed || active || queue.length === 0) return;
@@ -243,6 +261,7 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
     let segments = null;
     let detail = null;
     const dispatchedAt = Date.now();
+    entry.dispatchedAt = dispatchedAt;
     try {
       if (!await ensureWorker() || entry.settled) return;
       const session = current;
@@ -275,6 +294,7 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
       entry.settle(result);
       // Record what the caller actually received; close() or a stopped worker may have settled it first.
       const own = entry.outcome === result;
+      if (own && cache) for (const name of DISK_COUNTS) if (cache[name] !== undefined) totals[name] = Math.min(MAX_TOTAL, totals[name] + cache[name]);
       recordScan(recent, {
         status: entry.outcome.status, reason: entry.outcome.reason ?? null, cache: own ? cache : null, segments: own ? segments : null,
         detail: own ? detail : null, attached: entry.attached, elapsedMs: Date.now() - dispatchedAt, queuedMs: dispatchedAt - entry.admittedAt,
@@ -328,6 +348,8 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
       return await new Promise((resolve) => addWaiter(shared, resolve, signal));
     }
     if (queue.length + Number(active !== null) >= MAX_ADMITTED_SCANS) return retryLater("admission_limit");
+    const refusal = projectedRefusal();
+    if (refusal) return refusal;
     return await new Promise((resolve) => {
       const entry = {
         body: Buffer.from(body), settled: false, attached: 0, waiters: new Set(), admittedAt: Date.now(),
@@ -406,7 +428,9 @@ function recoveringHealth(reply) {
 function windowCounts(reply) {
   const cache = reply?.cache;
   const count = (value) => Number.isSafeInteger(value) && value >= 0 && value <= MAX_WINDOW_COUNT;
-  return isPlainObject(cache) && count(cache.hits) && count(cache.misses) ? { hits: cache.hits, misses: cache.misses } : null;
+  if (!isPlainObject(cache) || !count(cache.hits) || !count(cache.misses)) return null;
+  const disk = Object.fromEntries(DISK_COUNTS.filter((name) => count(cache[name])).map((name) => [name, cache[name]]));
+  return { hits: cache.hits, misses: cache.misses, ...disk };
 }
 
 function segmentCounts(reply) {
@@ -428,7 +452,7 @@ function recordScan(recent, { status, reason, cache, segments, detail, attached,
   const boundedMs = (value) => Math.min(3_600_000, Math.max(0, Math.floor(value)));
   // elapsedMs is worker time from dispatch; queuedMs is the wait from admission to dispatch.
   recent.push({
-    status, reason, ...(detail ? { detail } : {}), hits: cache?.hits ?? null, misses: cache?.misses ?? null,
+    status, reason, ...(detail ? { detail } : {}), hits: cache?.hits ?? null, misses: cache?.misses ?? null, diskHits: cache?.diskHits ?? null,
     segmentHits: segments?.hits ?? null, segmentMisses: segments?.misses ?? null,
     attached: Math.min(MAX_ATTACHED_WAITERS, attached), elapsedMs: boundedMs(elapsedMs), queuedMs: boundedMs(queuedMs),
   });

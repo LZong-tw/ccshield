@@ -111,7 +111,7 @@ test("recent scans keep only bounded window cache counts, status and allowlisted
     assert.equal("segmentHits" in result || "segmentMisses" in result, false);
   }
   const scans = filter.recentScans();
-  const counts = { segmentHits: null, segmentMisses: null, attached: 0 };
+  const counts = { diskHits: null, segmentHits: null, segmentMisses: null, attached: 0 };
   assert.deepEqual(scans.map(({ elapsedMs, queuedMs, ...scan }) => scan), [
     { status: "ok", reason: null, hits: 3, misses: 1, ...counts },
     { status: "unknown", reason: "model_timeout", hits: 0, misses: 2, ...counts },
@@ -132,7 +132,7 @@ test("recent scans keep only bounded window cache counts, status and allowlisted
   assert.equal(filter.recentScans()[0].hits, 3);
   const totals = filter.scanTotals();
   assert.deepEqual({ ...totals, failuresByReason: { ...totals.failuresByReason } }, {
-    scans: 12, ok: 8, unknown: 4, unavailable: 0, coalesced: 0, aborted: 0,
+    scans: 12, ok: 8, unknown: 4, unavailable: 0, coalesced: 0, aborted: 0, diskHits: 0, diskMisses: 0, diskWrites: 0, diskErrors: 0,
     failuresByReason: { admission_limit: 0, queue_timeout: 0, scan_timeout: 0, model_timeout: 1, model_error: 0, model_killed: 0, worker_unavailable: 0, other: 3 },
   });
   assert.doesNotMatch(JSON.stringify(totals), new RegExp(sentinel));
@@ -168,7 +168,7 @@ test("scan totals count every caller outcome since start, including rejections t
   t.mock.timers.tick(30_000);
   assert.deepEqual((await Promise.all(timed)).map((result) => result.reason), ["scan_timeout", "queue_timeout", "queue_timeout", "queue_timeout"]);
   assert.deepEqual(filter.scanTotals(), {
-    scans: 11, ok: 5, unknown: 0, unavailable: 6, coalesced: 2, aborted: 1,
+    scans: 11, ok: 5, unknown: 0, unavailable: 6, coalesced: 2, aborted: 1, diskHits: 0, diskMisses: 0, diskWrites: 0, diskErrors: 0,
     failuresByReason: { admission_limit: 1, queue_timeout: 3, scan_timeout: 1, model_timeout: 0, model_error: 0, model_killed: 0, worker_unavailable: 0, other: 0 },
   });
   const copy = filter.scanTotals();
@@ -469,6 +469,64 @@ test("only a model_timeout keeps the worker's bounded Retry-After", async (t) =>
   }
 });
 
+test("OPF admission refuses at once, with Retry-After, a scan that cold scans ahead of it would push past its budget", async (t) => {
+  const { worker, filter } = await opfFilter(t, undefined, "25000");
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  let bodies = 0;
+  const sent = () => worker.messages.filter((entry) => entry.type === "scan");
+  const dispatched = async (count) => {
+    for (let spins = 0; spins < 50 && sent().length < count; spins += 1) await flushTasks();
+    assert.equal(sent().length, count);
+  };
+  const reply = (cache) => emit(worker, { type: "scan", id: sent().at(-1).id, status: "ok", findings: [], cache });
+  const extra = () => filter.scan(Buffer.from(JSON.stringify({ body: bodies++ })));
+  const run = async (elapsedMs, cache) => {
+    const scan = extra();
+    await dispatched(sent().length + 1);
+    t.mock.timers.tick(elapsedMs);
+    reply(cache);
+    return await scan;
+  };
+
+  // Hot samples alone project nothing: a scan behind active and queued work waits instead of being refused.
+  for (let index = 0; index < 3; index += 1) await run(500, { hits: 5, misses: 0 });
+  let settled = 0;
+  const hot = [extra(), extra(), extra()].map((scan) => scan.then((result) => { settled += 1; return result; }));
+  await dispatched(4);
+  await flushTasks();
+  assert.equal(settled, 0, "no cold sample means no early refusal");
+  for (let index = 5; index <= 7; index += 1) {
+    reply({ hits: 5, misses: 0 });
+    if (index < 7) await dispatched(index);
+  }
+  await Promise.all(hot);
+
+  await run(20_000, { hits: 0, misses: 3 });
+  for (let index = 0; index < 3; index += 1) await run(100, { hits: 4, misses: 0 });
+  const held = [extra(), extra()];
+  await dispatched(sent().length + 1);
+  // Active ends ~20 s in and the queued one ~40 s: a third would start past its 25 s budget.
+  const refused = await extra();
+  assert.equal(refused.reason, "admission_limit");
+  assert.equal(refused.retryAfterSeconds, 40, "only the cold 20 s median counts; short hot scans do not pull it down");
+  t.mock.timers.tick(40_000);
+  await Promise.allSettled(held);
+});
+
+test("OPF diagnostics carry disk hits per scan and cumulative disk counters", async (t) => {
+  const caches = [
+    { hits: 1, misses: 2, windows: 3, diskHits: 1, diskMisses: 2, diskWrites: 2, diskErrors: 0 },
+    { hits: 0, misses: 1, windows: 1, diskHits: 0, diskMisses: 1, diskWrites: 0, diskErrors: 1 },
+    { hits: 2, misses: 0 },
+  ];
+  let next = 0;
+  const { filter } = await opfFilter(t, (message, emit) => emit({ type: "scan", id: message.id, status: "ok", findings: [], cache: caches[next++] }));
+  for (let index = 0; index < caches.length; index += 1) await filter.scan(Buffer.from(`{"content":"disk-${index}"}`));
+  assert.deepEqual(filter.recentScans().map((scan) => scan.diskHits), [1, 0, null]);
+  const { diskHits, diskMisses, diskWrites, diskErrors } = filter.scanTotals();
+  assert.deepEqual({ diskHits, diskMisses, diskWrites, diskErrors }, { diskHits: 1, diskMisses: 3, diskWrites: 2, diskErrors: 1 });
+});
+
 test("OPF filter refuses a request budget beyond 240 seconds", async () => {
   await assert.rejects(createPrivacyFilter({ provision: opfProvision, timeoutMs: 240_001, spawnWorker: () => assert.fail("no worker may start"),
     validateWorker, validateFile, validateCheckpoint: async () => async () => {} }), /timeout is invalid/);
@@ -745,7 +803,7 @@ test("aborting an active scan releases the caller while the worker still finishe
   emit(worker, { type: "scan", id: worker.messages.at(-1).id, status: "ok", findings: [], cache: { hits: 1, misses: 2 } });
   await flushTasks();
   assert.deepEqual(filter.recentScans().map(({ elapsedMs, queuedMs, ...scan }) => scan), [
-    { status: "ok", reason: null, hits: 1, misses: 2, segmentHits: null, segmentMisses: null, attached: 0 },
+    { status: "ok", reason: null, hits: 1, misses: 2, diskHits: null, segmentHits: null, segmentMisses: null, attached: 0 },
   ]);
   assert.equal(worker.messages.filter((message) => message.type === "scan").length, 1);
 });
