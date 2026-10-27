@@ -1,6 +1,7 @@
 import { chmod, mkdtemp, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { crc32, deflateSync } from "node:zlib";
 
 // Header-only PNG: enough for limits/dimension checks, never decoded.
 export function png(width, height, extra = 0) {
@@ -11,6 +12,34 @@ export function png(width, height, extra = 0) {
   b.writeUInt32BE(width, 16);
   b.writeUInt32BE(height, 20);
   return b;
+}
+
+// A real, decodable 8-bit RGBA PNG. `pixel(x, y)` returns [r, g, b, a].
+export function rgbaPng(width, height, pixel) {
+  const rows = [];
+  for (let y = 0; y < height; y += 1) {
+    rows.push(0);
+    for (let x = 0; x < width; x += 1) rows.push(...pixel(x, y));
+  }
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header.set([8, 6, 0, 0, 0], 8);
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", header),
+    chunk("IDAT", deflateSync(Buffer.from(rows))),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+function chunk(type, data) {
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length);
+  const body = Buffer.concat([Buffer.from(type, "latin1"), data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(body));
+  return Buffer.concat([length, body, crc]);
 }
 
 // Body of a fake image worker. `reply(request)` returns the line(s) to write,

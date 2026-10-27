@@ -59,6 +59,11 @@ test("a silent worker times out", async (t) => {
   await rejectsWith(worker.probe(), "worker_timeout");
 });
 
+test("probe has its own deadline, separate from requests", async (t) => {
+  const { worker } = await setup(t, "silent", { timeoutMs: 60_000, probeTimeoutMs: 200 });
+  await rejectsWith(worker.probe(), "worker_timeout");
+});
+
 test("a response for another id is a protocol violation", async (t) => {
   const { worker } = await setup(t, "wrongId");
   await rejectsWith(worker.probe(), "worker_protocol");

@@ -29,6 +29,7 @@ export function shieldPaths({ env = process.env, homeDir = homeFromEnv(env), uid
     policyBundlePath: childPath(join(root, "policy-bundle.json"), root, "policyBundlePath"),
     policyPublicKeyPath: childPath(join(root, "policy-public.pem"), root, "policyPublicKeyPath"),
     assetsProvisionPath: childPath(join(root, "assets-provision.json"), root, "assetsProvisionPath"),
+    imageProvisionPath: childPath(join(root, "image-provision.json"), root, "imageProvisionPath"),
     socketPath: childPath(socketPath ?? join(root, "shield.sock"), root, "socketPath"),
     auditDatabasePath: childPath(join(root, "audit.sqlite"), root, "auditDatabasePath"),
     platform: linux ? "linux" : "darwin",
@@ -316,6 +317,49 @@ function assertCanonicalAssetsProvisionPath(paths) {
   }
 }
 
+// The image worker pin lives in its own file so a reader that predates images
+// never sees it: assets-provision.json keeps its shape.
+export async function readShieldImageProvision({ paths, io = defaultIo } = {}) {
+  assertCanonicalImageProvisionPath(paths);
+  let contents;
+  try {
+    contents = await readPrivateRegularFile(paths.imageProvisionPath, "shield image provision", io);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  let state;
+  try { state = JSON.parse(contents); } catch { throw new Error("shield image provision is invalid JSON"); }
+  return assertShieldImageProvision(state, { paths });
+}
+
+export async function writeShieldImageProvision({ paths, state, io = defaultIo } = {}) {
+  assertCanonicalImageProvisionPath(paths);
+  const validated = assertShieldImageProvision(state, { paths });
+  await writePrivateShieldState({ paths, path: paths.imageProvisionPath, value: validated, io });
+  return validated;
+}
+
+export function assertShieldImageProvision(state, { paths }) {
+  const digest = (value) => /^[a-f0-9]{64}$/.test(value ?? "");
+  const valid = isPlainRecord(state) && sameKeys(state, ["path", "sha256", "source", "version"])
+    && digest(state.sha256) && isPlainRecord(state.source) && sameKeys(state.source, ["path", "sha256"])
+    && digest(state.source.sha256) && typeof state.source.path === "string" && isAbsolute(state.source.path)
+    && state.version === `image-${state.source.sha256.slice(0, 12)}`
+    && state.path === shieldAssetStore(paths).imageWorker(state.source.sha256).binary;
+  if (!valid) throw new Error("shield image provision is invalid");
+  return Object.freeze({ path: state.path, sha256: state.sha256, source: Object.freeze({ ...state.source }), version: state.version });
+}
+
+function assertCanonicalImageProvisionPath(paths) {
+  if (!canonicalShieldPaths.has(paths) || paths.imageProvisionPath !== join(paths.rootDir, "image-provision.json")) {
+    throw new Error("shield image provision paths must use the canonical ccshield state layout");
+  }
+}
+
+const isPlainRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+const sameKeys = (value, keys) => Object.keys(value).sort().join() === keys.join();
+
 export const ASSETS_FORMAT_VERSION = 3;
 const PRIVACY_ORIGINS = new Set(["downloaded", "adopted"]);
 const GITLEAKS_ORIGINS = new Set(["downloaded", "override"]);
@@ -341,6 +385,11 @@ export function shieldAssetStore(paths) {
       if (!/^\d+\.\d+\.\d+$/.test(version ?? "")) throw new Error("shield Gitleaks version must be a plain semver");
       const dir = childPath(join(root, "gitleaks", version), root, "gitleaksDir");
       return Object.freeze({ dir, binary: join(dir, "gitleaks") });
+    },
+    imageWorker(sourceSha256) {
+      if (!/^[a-f0-9]{64}$/.test(sourceSha256 ?? "")) throw new Error("shield image worker source digest must be 64 lowercase hex");
+      const dir = childPath(join(root, "image-worker", sourceSha256.slice(0, 12)), root, "imageWorkerDir");
+      return Object.freeze({ dir, binary: join(dir, "image-worker") });
     },
   });
 }

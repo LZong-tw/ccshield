@@ -31,12 +31,12 @@ const isCount = (value) => Number.isSafeInteger(value) && value >= 0;
 // Same checks as the privacy worker: canonical absolute path, no symlink, our
 // uid, not group/world writable, executable, pinned digest. The gap between
 // this check and spawn is accepted; the binary lives in a 0700 directory.
-async function attest(path, expectedSha256) {
+export async function attestImageWorker(path, expectedSha256, io = { lstat, readFile, realpath }) {
   if (typeof path !== "string" || !isAbsolute(path) || resolve(path) !== path) fail("worker_attestation");
   let entry;
   let canonical;
   let bytes;
-  try { [entry, canonical, bytes] = await Promise.all([lstat(path), realpath(path), readFile(path)]); }
+  try { [entry, canonical, bytes] = await Promise.all([io.lstat(path), io.realpath(path), io.readFile(path)]); }
   catch { fail("worker_attestation"); }
   const ok = canonical === path && !entry.isSymbolicLink() && entry.isFile()
     && (typeof process.getuid !== "function" || entry.uid === process.getuid())
@@ -86,7 +86,7 @@ function parseResponse(message, op, id, limits) {
   return { width, height, image };
 }
 
-export function createImageWorker({ path, sha256, timeoutMs = 10_000, limits = SHIELD_IMAGE_LIMITS }) {
+export function createImageWorker({ path, sha256, timeoutMs = 10_000, probeTimeoutMs = 120_000, limits = SHIELD_IMAGE_LIMITS }) {
   let child = null;
   let pending = null;
   let nextId = 1;
@@ -117,7 +117,7 @@ export function createImageWorker({ path, sha256, timeoutMs = 10_000, limits = S
   }
 
   async function start() {
-    await attest(path, sha256);
+    await attestImageWorker(path, sha256);
     const proc = spawn(path, [], { stdio: ["pipe", "pipe", "pipe"] });
     let stdout = Buffer.alloc(0);
     let stderrBytes = 0;
@@ -168,7 +168,7 @@ export function createImageWorker({ path, sha256, timeoutMs = 10_000, limits = S
       const timer = setTimeout(() => {
         stop();
         settle(new ImageWorkerError("worker_timeout"));
-      }, timeoutMs);
+      }, op === "probe" ? probeTimeoutMs : timeoutMs);
       pending = { id, op, timer, resolve: resolvePromise, reject };
       child.stdin.write(line);
     });
