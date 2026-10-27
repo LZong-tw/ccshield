@@ -54,7 +54,7 @@ export async function readShieldIdentity({ paths, io = defaultIo } = {}) {
   if (!paths?.identityPath) throw new TypeError("shield identity paths are required");
   let contents;
   try {
-    contents = await io.readFile(paths.identityPath, "utf8");
+    contents = await readPrivateRegularFile(paths.identityPath, "shield identity", io);
   } catch (error) {
     if (error?.code === "ENOENT") return null;
     throw error;
@@ -73,8 +73,7 @@ export async function readShieldPolicyState({ paths, io = defaultIo } = {}) {
   assertCanonicalPolicyStatePath(paths);
   let contents;
   try {
-    await assertPrivateRegularFile(paths.policyStatePath, io);
-    contents = await io.readFile(paths.policyStatePath, "utf8");
+    contents = await readPrivateRegularFile(paths.policyStatePath, "shield policy state", io);
   } catch (error) {
     if (error?.code === "ENOENT") return null;
     throw error;
@@ -199,8 +198,7 @@ export async function readShieldAssetsProvision({ paths, io = defaultIo } = {}) 
   assertCanonicalAssetsProvisionPath(paths);
   let contents;
   try {
-    await assertPrivateRegularFile(paths.assetsProvisionPath, io);
-    contents = await io.readFile(paths.assetsProvisionPath, "utf8");
+    contents = await readPrivateRegularFile(paths.assetsProvisionPath, "shield asset provision", io);
   } catch (error) {
     if (error?.code === "ENOENT") return null;
     throw error;
@@ -509,13 +507,32 @@ function safePath(value) { return typeof value === "string" && isAbsolute(value)
 function isPlainObject(value) { return value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype; }
 function exactKeys(value, expected) { const keys = Object.keys(value).sort(); return keys.length === expected.length && keys.every((key, index) => key === expected[index]); }
 
-async function assertPrivateRegularFile(path, io) {
-  const entry = await io.lstat(path);
-  if (entry.isSymbolicLink()) throw new Error("shield policy state must not be a symlink");
-  if (!entry.isFile()) throw new Error("shield policy state must be a regular file");
-  if ((entry.mode & 0o077) !== 0) throw new Error("shield policy state must be private");
-  const ownerUid = process.getuid?.();
-  if (Number.isInteger(ownerUid) && entry.uid !== ownerUid) throw new Error("shield policy state has unexpected owner");
+// Checks run on the opened descriptor, not the path, so a swap between check and read
+// cannot hand us a different file. O_NOFOLLOW refuses a symlinked final component and
+// O_NONBLOCK keeps a planted FIFO from hanging the open; the trailing lstat confirms the
+// path still names the inode we read.
+async function readPrivateRegularFile(path, label, io) {
+  const flags = io.constants.O_RDONLY | io.constants.O_NOFOLLOW | io.constants.O_NONBLOCK;
+  let handle;
+  try {
+    handle = await io.open(path, flags);
+  } catch (error) {
+    if (error?.code === "ELOOP") throw new Error(`${label} must not be a symlink`);
+    throw error;
+  }
+  try {
+    const entry = await handle.stat();
+    if (!entry.isFile()) throw new Error(`${label} must be a regular file`);
+    if ((entry.mode & 0o077) !== 0) throw new Error(`${label} must be private`);
+    const ownerUid = process.getuid?.();
+    if (Number.isInteger(ownerUid) && entry.uid !== ownerUid) throw new Error(`${label} has unexpected owner`);
+    const contents = await handle.readFile({ encoding: "utf8" });
+    const current = await io.lstat(path);
+    if (current.dev !== entry.dev || current.ino !== entry.ino) throw new Error(`${label} was replaced while being read`);
+    return contents;
+  } finally {
+    await handle.close();
+  }
 }
 
 async function ensureDirectory(path, io, ownerUid, privateMode) {

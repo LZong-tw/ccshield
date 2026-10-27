@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { constants } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -545,7 +546,7 @@ test("offline policy transition durably records its replacement before returning
   const installed = { version: "2026.09.03.1", detectorVersions: policyState.detectorVersions };
   const result = await transitionShieldPolicy({
     paths,
-    io: { readFile: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); } },
+    io: privateFileIo(async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); }),
     installPolicy: async () => installed,
     inspectService: async () => ({ active: false }),
     isProcessAlive: async () => { throw new Error("offline transition must not probe a process"); },
@@ -568,7 +569,7 @@ test("offline policy transition fails closed when the durable recorder rejects",
   const { paths } = fixture();
   await assert.rejects(transitionShieldPolicy({
     paths,
-    io: { readFile: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); } },
+    io: privateFileIo(async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); }),
     installPolicy: async () => ({ version: "2026.09.03.1", detectorVersions: policyState.detectorVersions }),
     inspectService: async () => ({ active: false }),
     recordShieldPolicyTransition: async () => { throw new Error("audit spool is unavailable"); },
@@ -1262,31 +1263,32 @@ test("ccshield install preview fails closed when lane assets are absent", async 
     daemonPath: options.daemonPath,
     io,
     runLaunchctl: async (args) => calls.push(args),
-  }), /shield asset provision|isSymbolicLink/i);
+  }), /shield asset provision|isSymbolicLink|handle/i);
   assert.equal(calls.length, 1);
 });
 
-function shieldStateIo(paths, { identity, config, state = policyState }) {
-  const storedConfig = { ...config, controlCapability: config.controlCapability ?? "d".repeat(32) };
+// Adapts a readFile-style mock to the descriptor-based private-file reader in paths.mjs.
+function privateFileIo(readFile, { uid = process.getuid?.(), mode = 0o100600 } = {}) {
+  const entry = { dev: 1, ino: 1, uid, mode, isFile: () => true, isSymbolicLink: () => false };
   return {
-    async lstat(path) {
-      if (path === paths.policyStatePath) {
-        return {
-          uid: process.getuid?.(),
-          mode: 0o600,
-          isFile: () => true,
-          isSymbolicLink: () => false,
-        };
-      }
-      throw new Error(`unexpected fixture stat path: ${path}`);
-    },
-    async readFile(path) {
-      if (path === paths.identityPath) return `${JSON.stringify(identity)}\n`;
-      if (path === paths.configPath) return `${JSON.stringify(storedConfig)}\n`;
-      if (path === paths.policyStatePath) return `${JSON.stringify(state)}\n`;
-      throw new Error(`unexpected fixture path: ${path}`);
+    constants,
+    async lstat() { return entry; },
+    async open(path) {
+      const contents = await readFile(path, "utf8");
+      return { stat: async () => entry, readFile: async () => contents, close: async () => {} };
     },
   };
+}
+
+function shieldStateIo(paths, { identity, config, state = policyState }) {
+  const storedConfig = { ...config, controlCapability: config.controlCapability ?? "d".repeat(32) };
+  const readFile = async (path) => {
+    if (path === paths.identityPath) return `${JSON.stringify(identity)}\n`;
+    if (path === paths.configPath) return `${JSON.stringify(storedConfig)}\n`;
+    if (path === paths.policyStatePath) return `${JSON.stringify(state)}\n`;
+    throw new Error(`unexpected fixture path: ${path}`);
+  };
+  return { ...privateFileIo(readFile), readFile };
 }
 
 async function startServer(handler) {
