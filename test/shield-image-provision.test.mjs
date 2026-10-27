@@ -204,3 +204,10 @@ test("the Swift source ships next to the compiler", async () => {
   assert.equal(IMAGE_WORKER_SOURCE, join(dirname(fileURLToPath(import.meta.url)), "..", "shield-image", "image-worker.swift"));
   assert.match(await readFile(IMAGE_WORKER_SOURCE, "utf8"), /^\/\/ SPDX-License-Identifier: MPL-2\.0\n/);
 });
+
+test("each request iteration, including reading, parsing and encoding the reply, drains its own autoreleasepool", async () => {
+  const source = await readFile(IMAGE_WORKER_SOURCE, "utf8");
+  const loop = source.slice(source.indexOf("\nwhile true {"));
+  assert.match(loop, /^\nwhile true \{\n\s+let stop: Bool = autoreleasepool \{/, "the read loop body runs inside a pool");
+  assert.match(loop, /respond\(to: Data\(line\)\)/);
+});

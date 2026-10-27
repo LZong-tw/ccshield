@@ -210,15 +210,23 @@ func respond(to line: Data) {
 
 // Persistent loop: one request per line, answered in order. A line longer than
 // maxFrame is never buffered whole; the worker exits instead.
+//
+// The pool covers the whole iteration, not just handle(): the stdin chunk, the
+// parsed request and the base64 reply are each image-sized, and outside a pool
+// they stay alive for the worker's lifetime.
 var pending = Data()
 while true {
-    let chunk = FileHandle.standardInput.availableData
-    if chunk.isEmpty { exit(0) }
-    pending.append(chunk)
-    while let newline = pending.firstIndex(of: 10) {
-        let line = pending[pending.startIndex..<newline]
-        pending = Data(pending[(newline + 1)...])
-        respond(to: Data(line))
+    let stop: Bool = autoreleasepool {
+        let chunk = FileHandle.standardInput.availableData
+        if chunk.isEmpty { return true }
+        pending.append(chunk)
+        while let newline = pending.firstIndex(of: 10) {
+            let line = pending[pending.startIndex..<newline]
+            pending = Data(pending[(newline + 1)...])
+            respond(to: Data(line))
+        }
+        if pending.count > maxFrame { exit(1) }
+        return false
     }
-    if pending.count > maxFrame { exit(1) }
+    if stop { exit(0) }
 }
