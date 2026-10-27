@@ -28,7 +28,7 @@ const generation = "generation-1";
 const policyState = { version: "2026.09.02.1", detectorVersions: { gitleaks: "8.24.0", privacy: "privacy-1" } };
 
 function fixture(homeDir = "/tmp/ccshield-service-home") {
-  const paths = shieldPaths({ homeDir, uid: 501 });
+  const paths = shieldPaths({ homeDir, uid: 501, platform: "darwin" });
   return {
     paths,
     options: {
@@ -406,7 +406,7 @@ test("readiness rejects a daemon identity bound to a stale policy transition bef
 test("policy install quiesces a live old daemon binding until a fresh policy identity is published", async (t) => {
   const homeDir = await mkdtemp(join(tmpdir(), "ccshield-policy-transition-"));
   t.after(() => rm(homeDir, { recursive: true, force: true }));
-  const paths = shieldPaths({ homeDir, uid: process.getuid?.() ?? 501 });
+  const paths = shieldPaths({ homeDir, uid: process.getuid?.() ?? 501, platform: "darwin" });
   const oldIdentity = {
     origin: "http://127.0.0.1:8811", capability, version: 1, pid: 42,
     lane: "subscription", generation, targetClass: "subscription",
@@ -453,7 +453,7 @@ test("policy install quiesces a live old daemon binding until a fresh policy ide
 test("policy lifecycle transaction stops a live proxy before activating and binding a replacement", async (t) => {
   const homeDir = await mkdtemp(join(tmpdir(), "ccshield-policy-proxy-transition-"));
   t.after(() => rm(homeDir, { recursive: true, force: true }));
-  const paths = shieldPaths({ homeDir, uid: process.getuid?.() ?? 501 });
+  const paths = shieldPaths({ homeDir, uid: process.getuid?.() ?? 501, platform: "darwin" });
   const controlCapability = "d".repeat(32);
   const oldPolicy = { version: "policy-old", detectorVersions: policyState.detectorVersions };
   const newPolicy = { version: "policy-new", detectorVersions: policyState.detectorVersions };
@@ -1343,7 +1343,7 @@ test("systemd install previews without mutation and writes a private unit with -
     const plan = await installShieldService({ ...options, runSystemctl, runLaunchctl: forbiddenLaunchctl });
     assert.equal(plan.label, "com.ccshield.subscription");
     assert.equal(plan.unitPath, paths.serviceUnitPath);
-    assert.deepEqual(plan.operations.map((entry) => entry.op), ["mkdir", "writeFileAtomic", "daemon-reload", "enable"]);
+    assert.deepEqual(plan.operations.map((entry) => entry.op), ["mkdir", "writeFileAtomic", "daemon-reload", "enable", "restart"]);
     assert.deepEqual(calls, []);
     assert.equal(await stat(paths.serviceUnitPath).then(() => true, () => false), false);
 
@@ -1352,17 +1352,52 @@ test("systemd install previews without mutation and writes a private unit with -
     assert.equal((await stat(paths.configPath)).mode & 0o777, 0o600);
     const unit = await readFile(paths.serviceUnitPath, "utf8");
     assert.match(unit, /^ExecStart="\/usr\/bin\/node" "\/opt\/ccshield\/src\/shieldd\.mjs" "--config" /m);
-    assert.doesNotMatch(unit, /capability|Environment/i);
+    assert.doesNotMatch(unit, /capability/i);
+    assert.equal(unit.match(/^Environment=.*$/gm).join("\n"), `Environment="XDG_DATA_HOME=${homeDir}/.local/share"`);
     assert.deepEqual(calls, [
       ["--user", "daemon-reload"],
-      ["--user", "enable", "--now", "ccshield-subscription.service"],
+      ["--user", "enable", "ccshield-subscription.service"],
+      ["--user", "restart", "ccshield-subscription.service"],
     ]);
   } finally {
     await rm(homeDir, { recursive: true, force: true });
   }
 });
 
-test("systemd start refuses a missing or drifted unit, then reloads and starts", async () => {
+test("systemd unit pins the CLI's XDG_DATA_HOME for a manager that never saw it", () => {
+  const { options } = linuxFixture("/home/u", { XDG_DATA_HOME: "/data" });
+  assert.equal(options.paths.configPath, "/data/ccshield/subscription/config.json");
+  assert.match(planShieldService(options).unit, /^Environment="XDG_DATA_HOME=\/data"$/m);
+  const daemonPaths = shieldPaths({ homeDir: "/home/u", env: { XDG_DATA_HOME: "/data" }, platform: "linux" });
+  assert.equal(daemonPaths.configPath, options.paths.configPath);
+});
+
+test("systemd install explains a unit directory the user manager does not search", async () => {
+  const homeDir = await mkdtemp(join(tmpdir(), "ccshield-systemd-"));
+  const { options } = linuxFixture(homeDir);
+  const { runSystemctl } = systemctlRecorder({ enable: { ok: false, stderr: "Failed to enable unit: Unit file ccshield-subscription.service does not exist." } });
+  try {
+    await assert.rejects(installShieldService({ ...options, write: true, runSystemctl }), /does not search .*systemd\/user .*XDG_CONFIG_HOME/);
+  } finally {
+    await rm(homeDir, { recursive: true, force: true });
+  }
+});
+
+test("systemd install restarts a daemon still running the previous config", async () => {
+  const homeDir = await mkdtemp(join(tmpdir(), "ccshield-systemd-"));
+  const { options } = linuxFixture(homeDir);
+  const { calls, runSystemctl } = systemctlRecorder();
+  try {
+    await installShieldService({ ...options, write: true, runSystemctl });
+    await installShieldService({ ...options, write: true, runSystemctl });
+    assert.equal(calls.filter((call) => call[1] === "restart").length, 2);
+    assert.equal(calls.some((call) => call[1] === "start"), false);
+  } finally {
+    await rm(homeDir, { recursive: true, force: true });
+  }
+});
+
+test("systemd start refuses a missing or drifted unit, then reloads and restarts", async () => {
   const { options, paths } = linuxFixture();
   const { calls, runSystemctl } = systemctlRecorder();
   const missing = { async readFile() { throw Object.assign(new Error("gone"), { code: "ENOENT" }); } };
@@ -1376,14 +1411,14 @@ test("systemd start refuses a missing or drifted unit, then reloads and starts",
   const current = { async readFile(path) { assert.equal(path, paths.serviceUnitPath); return plan.unit; } };
   const started = await startShieldService({ ...options, io: current, runSystemctl, runLaunchctl: forbiddenLaunchctl });
   assert.equal(started.started, true);
-  assert.deepEqual(calls, [["--user", "daemon-reload"], ["--user", "start", "ccshield-subscription.service"]]);
+  assert.deepEqual(calls, [["--user", "daemon-reload"], ["--user", "restart", "ccshield-subscription.service"]]);
 });
 
 test("systemd start surfaces a failed start", async () => {
   const { options } = linuxFixture();
   const plan = planShieldService(options);
-  const { runSystemctl } = systemctlRecorder({ start: { ok: false, stderr: "Job failed" } });
-  await assert.rejects(startShieldService({ ...options, io: { async readFile() { return plan.unit; } }, runSystemctl }), /systemctl --user start failed: Job failed/);
+  const { runSystemctl } = systemctlRecorder({ restart: { ok: false, stderr: "Job failed" } });
+  await assert.rejects(startShieldService({ ...options, io: { async readFile() { return plan.unit; } }, runSystemctl }), /systemctl --user restart failed: Job failed/);
 });
 
 test("systemd stop stops only the lane unit", async () => {
@@ -1392,6 +1427,11 @@ test("systemd stop stops only the lane unit", async () => {
   const result = await stopShieldService({ paths, runSystemctl, runLaunchctl: forbiddenLaunchctl });
   assert.equal(result.stopped, true);
   assert.deepEqual(calls, [["--user", "stop", "ccshield-subscription.service"]]);
+
+  const unloaded = systemctlRecorder({ stop: { ok: false, stderr: "Failed to stop ccshield-subscription.service: Unit ccshield-subscription.service not loaded." } });
+  assert.equal((await stopShieldService({ paths, runSystemctl: unloaded.runSystemctl })).stopped, true);
+  const denied = systemctlRecorder({ stop: { ok: false, stderr: "Access denied" } });
+  await assert.rejects(stopShieldService({ paths, runSystemctl: denied.runSystemctl }), /systemctl --user stop failed: Access denied/);
 });
 
 test("systemd inspect reads ActiveState, MainPID and LoadState", async () => {

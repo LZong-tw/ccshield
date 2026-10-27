@@ -39,3 +39,10 @@ test("unit drift outside ExecStart says so", () => {
   assert.equal(describeUnitDrift(unit.replace("Restart=on-failure", "Restart=always"), unit), "installed unit differs from this runtime's unit outside ExecStart");
   assert.match(describeUnitDrift("garbage", unit), /installed unit runs \(nothing\)/);
 });
+
+test("unit pins XDG_DATA_HOME so the daemon recomputes the CLI's state root", () => {
+  const unit = renderUnit({ ...base, dataHome: "/data/100% $x" });
+  assert.match(unit, /^Environment="XDG_DATA_HOME=\/data\/100%% \$x"$/m);
+  assert.deepEqual(unitExecArgs(unit), [base.nodePath, base.daemonPath, "--config", base.configPath]);
+  assert.throws(() => renderUnit({ ...base, dataHome: "/data\nExecStartPre=/bin/sh" }), /control characters/);
+});

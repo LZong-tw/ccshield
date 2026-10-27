@@ -1,18 +1,21 @@
 // Renders the systemd user unit that runs shieldd on Linux, the counterpart of the launchd plist.
-// The unit carries no Environment= lines: shieldd reads everything it needs from its config file,
-// and anything placed here would be readable through `systemctl --user show`.
-export function renderUnit({ nodePath, daemonPath, configPath, label }) {
+// The only Environment= line is XDG_DATA_HOME: the user manager does not inherit it from the shell rc,
+// and shieldd recomputes its canonical state root from it. Anything placed here is readable through
+// `systemctl --user show`, so nothing secret ever goes in; shieldd reads the rest from its config file.
+export function renderUnit({ nodePath, daemonPath, configPath, label, dataHome }) {
   for (const [name, value] of Object.entries({ nodePath, daemonPath, configPath, label })) {
     if (typeof value !== "string" || value.length === 0) throw new TypeError(`${name} is required`);
   }
   if (/[\0-\x1f\x7f]/.test(label)) throw new Error("label must not contain control characters");
   const execStart = [nodePath, daemonPath, "--config", configPath].map(quoteArg).join(" ");
+  const environment = dataHome === undefined ? [] : [`Environment=${quoteEnvironment(`XDG_DATA_HOME=${dataHome}`)}`];
   return [
     "[Unit]",
     `Description=${label}`,
     "",
     "[Service]",
     "Type=simple",
+    ...environment,
     `ExecStart=${execStart}`,
     "Restart=on-failure",
     "",
@@ -52,6 +55,12 @@ function quoteArg(value) {
   if (/[\0-\x1f\x7f]/.test(value)) throw new Error("unit arguments must not contain control characters");
   const escaped = value.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"").replaceAll("%", "%%").replaceAll("$", "$$$$");
   return `"${escaped}"`;
+}
+
+// Environment= resolves % specifiers but never expands $, so only % is doubled here.
+function quoteEnvironment(value) {
+  if (/[\0-\x1f\x7f]/.test(value)) throw new Error("unit environment must not contain control characters");
+  return `"${value.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"").replaceAll("%", "%%")}"`;
 }
 
 function unquote(value) {

@@ -614,7 +614,8 @@ function planSystemdService({ paths, nodePath, daemonPath } = {}) {
   for (const [name, value] of Object.entries({ nodePath, daemonPath })) {
     if (typeof value !== "string" || !isAbsolute(value)) throw new Error(`${name} must be an absolute path`);
   }
-  const unit = renderUnit({ nodePath, daemonPath, configPath: paths.configPath, label: paths.serviceLabel });
+  // rootDir is <XDG_DATA_HOME>/ccshield/<lane>; pinning it keeps the daemon on the root the CLI chose.
+  const unit = renderUnit({ nodePath, daemonPath, configPath: paths.configPath, label: paths.serviceLabel, dataHome: dirname(dirname(paths.rootDir)) });
   const unitName = basename(paths.serviceUnitPath);
   return {
     label: paths.serviceLabel,
@@ -625,7 +626,8 @@ function planSystemdService({ paths, nodePath, daemonPath } = {}) {
       { op: "mkdir", path: dirname(paths.serviceUnitPath), mode: 0o700 },
       { op: "writeFileAtomic", path: paths.serviceUnitPath, mode: 0o600, content: unit },
       { op: "daemon-reload" },
-      { op: "enable", unit: unitName, now: true },
+      { op: "enable", unit: unitName },
+      { op: "restart", unit: unitName },
     ],
   };
 }
@@ -641,7 +643,14 @@ async function installSystemdService({ write = false, io = defaultIo, runSystemc
   await io.chmod(temporaryPath, 0o600);
   await io.rename(temporaryPath, plan.unitPath);
   await systemctl(runSystemctl, ["daemon-reload"]);
-  await systemctl(runSystemctl, ["enable", "--now", plan.unitName]);
+  try {
+    await systemctl(runSystemctl, ["enable", plan.unitName]);
+  } catch (error) {
+    if (!UNKNOWN_UNIT.test(error.message)) throw error;
+    throw new Error(`${error.message}; the systemd user manager does not search ${dirname(plan.unitPath)} (is XDG_CONFIG_HOME set in the shell but not in the manager's environment?)`);
+  }
+  // restart, not start: a running daemon keeps the old config's capability and generation, as kickstart -k avoids on macOS.
+  await systemctl(runSystemctl, ["restart", plan.unitName]);
   return { ...plan, written: true };
 }
 
@@ -656,13 +665,13 @@ async function startSystemdService({ io = defaultIo, runSystemctl = defaultSyste
   }
   if (existing !== plan.unit) throw new Error(`shield service unit path drift detected: ${plan.unitPath} (${describeUnitDrift(existing, plan.unit)}); run the install command from the checkout that should own this unit`);
   await systemctl(runSystemctl, ["daemon-reload"]);
-  await systemctl(runSystemctl, ["start", plan.unitName]);
+  await systemctl(runSystemctl, ["restart", plan.unitName]);
   return { ...plan, started: true };
 }
 
 async function stopSystemdService({ paths, runSystemctl = defaultSystemctl } = {}) {
   assertShieldPaths(paths);
-  await systemctl(runSystemctl, ["stop", basename(paths.serviceUnitPath)]);
+  await systemctl(runSystemctl, ["stop", basename(paths.serviceUnitPath)], UNKNOWN_UNIT);
   return { label: SHIELD_SERVICE_LABEL, stopped: true };
 }
 
