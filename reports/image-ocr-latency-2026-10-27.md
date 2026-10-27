@@ -142,18 +142,20 @@ version of this table counted only the adapter.
   key in `secret.png` passed. The separator is now `"\n "`.
   [INFERENCE] Text requests reach Gitleaks as the same JSON-escaped body, so
   a key that starts right after a newline in a pasted text message probably
-  has the same miss. This is outside the image path and unverified; I did not
-  change it.
+  has the same miss. Since confirmed with real Gitleaks and fixed for every
+  request on ccshield `fix/text-newline-boundary` (`ef9558a`).
 - **Truncated images were forwarded (fixed, `c9bbae1`).** ImageIO decoded half
   a PNG and reported it complete. The inspector now checks each container's
   end marker before the worker sees the bytes. Side effect: a JPEG with data
-  after its FFD9 marker (some cameras append some) is now refused.
+  after its FFD9 marker (some cameras append some) is now refused. The user
+  accepted this as fail-closed (2026-10-27).
 - **11 px UI text with the regex worker.** Vision reads `ann.wu@ example.net`
   with a space, so the regex email rule misses it and the email leaves
-  unmasked. OPF catches it. The native test keeps this case as a `todo`.
+  unmasked. OPF catches it. Known limitation of the regex worker, accepted by
+  the user (2026-10-27); the native test keeps this case as a `todo`.
 - **OPF false positives.** `Expires 08/29` on the card image is labelled
   `private_date` and masked. At 11 px, OPF also labels part of the email as a
-  person. Both cost readability, not privacy.
+  person. Both cost readability, not privacy. Accepted by the user (2026-10-27).
 - **The EXIF case was first rendered wrong.** That was a fixture error, not a
   worker error: the renderer used orientation 6 for a rotation that needs 8.
   The worker applies EXIF correctly.
