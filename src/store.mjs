@@ -36,28 +36,53 @@ const METADATA_COLUMNS = `
     elapsed_ms REAL NOT NULL CHECK (elapsed_ms >= 0),
     observed_at TEXT NOT NULL`;
 
-const INITIAL_STATEMENTS = Object.freeze([
-  `CREATE TABLE shield_decisions (${METADATA_COLUMNS},
+const RELEASED_MEDIA_OUTCOMES = "'none', 'blocked_document', 'blocked_source', 'blocked_scan', 'blocked_secret', 'scanned'";
+const MEDIA_OUTCOMES_002 = `${RELEASED_MEDIA_OUTCOMES}, 'unscanned_override'`;
+
+const decisionsTable = (name, mediaOutcomes) => `CREATE TABLE ${name} (${METADATA_COLUMNS},
     image_version TEXT CHECK (image_version IS NULL OR length(image_version) > 0),
     image_count INTEGER CHECK (image_count IS NULL OR image_count >= 0),
     image_transform_count INTEGER CHECK (image_transform_count IS NULL OR image_transform_count >= 0),
     document_count INTEGER CHECK (document_count IS NULL OR document_count >= 0),
-    media_outcome TEXT CHECK (media_outcome IS NULL OR media_outcome IN ('none', 'blocked_document', 'blocked_source', 'blocked_scan', 'blocked_secret', 'scanned')),
+    media_outcome TEXT CHECK (media_outcome IS NULL OR media_outcome IN (${mediaOutcomes})),
     original_text TEXT,
     redacted_text TEXT,
     evidence_purged_at TEXT
-  )`,
-  `CREATE TABLE shield_policy_transitions (${METADATA_COLUMNS}
-  )`,
+  )`;
+
+const DECISION_INDEXES = Object.freeze([
   "CREATE INDEX idx_shield_decisions_request ON shield_decisions(logical_request_id, observed_at)",
   "CREATE INDEX idx_shield_decisions_session ON shield_decisions(session_id, observed_at)",
   "CREATE INDEX idx_shield_decisions_action ON shield_decisions(action, observed_at)",
   "CREATE INDEX idx_shield_decisions_observed ON shield_decisions(observed_at)",
+]);
+
+// Migration texts are checksummed: never edit one that has shipped.
+const INITIAL_STATEMENTS = Object.freeze([
+  decisionsTable("shield_decisions", RELEASED_MEDIA_OUTCOMES),
+  `CREATE TABLE shield_policy_transitions (${METADATA_COLUMNS}
+  )`,
+  ...DECISION_INDEXES,
   "CREATE INDEX idx_shield_policy_transitions_request ON shield_policy_transitions(logical_request_id, observed_at)",
+]);
+
+// SQLite cannot alter a CHECK constraint, so the table is rebuilt with the same
+// column order and indexes. Dropping the old table drops its indexes too.
+const DECISION_COLUMN_LIST = `event_id, logical_request_id, session_id, lane, destination_class, policy_version,
+  gitleaks_version, privacy_version, action, reasons, transform_count, decision_source, override, elapsed_ms,
+  observed_at, ${MEDIA_COLUMNS.join(", ")}, ${EVIDENCE_COLUMNS.join(", ")}, evidence_purged_at`;
+
+const UNSCANNED_OVERRIDE_STATEMENTS = Object.freeze([
+  decisionsTable("shield_decisions_002", MEDIA_OUTCOMES_002),
+  `INSERT INTO shield_decisions_002 (${DECISION_COLUMN_LIST}) SELECT ${DECISION_COLUMN_LIST} FROM shield_decisions`,
+  "DROP TABLE shield_decisions",
+  "ALTER TABLE shield_decisions_002 RENAME TO shield_decisions",
+  ...DECISION_INDEXES,
 ]);
 
 export const SHIELD_MIGRATIONS = Object.freeze([
   Object.freeze({ id: "001_initial", statements: INITIAL_STATEMENTS }),
+  Object.freeze({ id: "002_media_unscanned_override", statements: UNSCANNED_OVERRIDE_STATEMENTS }),
 ]);
 
 const LEDGER_SQL = `CREATE TABLE IF NOT EXISTS shield_migrations (
