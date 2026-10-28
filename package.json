@@ -18,7 +18,9 @@
     "licenses/",
     "README.md",
     "LICENSE",
-    "NOTICE"
+    "NOTICE",
+    ".claude-plugin/",
+    "hooks/"
   ],
   "scripts": {
     "test": "node --test --import ./scripts/keychain-trap.mjs",

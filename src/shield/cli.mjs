@@ -1,5 +1,9 @@
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
+
+import { installPlugin } from "../plugin/install.mjs";
+import { detectAirkitInstall } from "../plugin/migrate.mjs";
 
 import { GITLEAKS_COMMAND_PROFILE } from "./gitleaks.mjs";
 import { doctorDetectorAssets, ensureOpfJob, fetchDetectorAssets, runOpfJobForLane } from "./detectors.mjs";
@@ -40,6 +44,11 @@ export async function runShieldCli(argv = [], dependencies = {}) {
   if (["help", "-h", "--help"].includes(command)) {
     stdout.write(renderShieldHelp());
     return 0;
+  }
+  if (command === "plugin" || command === "migrate") {
+    const result = command === "plugin" ? await runPluginCommand(rest) : await detectAirkitInstall({ home: (dependencies.env ?? process.env).HOME ?? homedir() });
+    stdout.write(renderShieldResult(command, result));
+    return result.exitCode;
   }
   const shield = dependencies.shield ?? await createDefaultShieldDependencies(dependencies);
   const handler = SHIELD_COMMANDS[command];
@@ -364,8 +373,20 @@ function parsePolicyInstall(argv) {
   return { bundlePath: values["--bundle"], publicKeyPath: values["--public-key"], lane: values["--lane"] ?? "subscription", write };
 }
 
+async function runPluginCommand(argv) {
+  const [sub, ...rest] = argv;
+  const options = { pluginRoot: repoRoot, write: false };
+  for (let index = 0; index < rest.length; index += 1) {
+    if (rest[index] === "--write") options.write = true;
+    else if (rest[index] === "--plugin-root" && rest[index + 1]) options.pluginRoot = rest[++index];
+    else throw new Error("usage: ccshield plugin install [--plugin-root /absolute/dir] [--write]");
+  }
+  if (sub !== "install") throw new Error("usage: ccshield plugin install [--plugin-root /absolute/dir] [--write]");
+  return installPlugin(options);
+}
+
 function renderShieldHelp() {
-  return `Commands:\n  ccshield install [--lane subscription|managed] [--gitleaks-path /absolute/gitleaks] [--write]\n  ccshield uninstall [--lane subscription|managed] [--write]\n  ccshield start [--lane subscription|managed]\n  ccshield stop [--lane subscription|managed]\n  ccshield status [--lane subscription|managed]\n  ccshield doctor [--lane subscription|managed]\n  ccshield policy <status [--lane subscription|managed]|install --bundle /absolute/policy-bundle --public-key /absolute/policy-public-key [--lane subscription|managed] [--write]>\n  ccshield privacy provision --gitleaks /absolute/gitleaks --gitleaks-rules /absolute/gitleaks-rules.toml [--bundle /absolute/privacy-manifest] [--policy-bundle /absolute/policy-bundle] [--lane subscription|managed] [--write]\n  ccshield image provision [--image-source /absolute/image-worker.swift] [--lane subscription|managed] [--write]\n  ccshield launch --lane subscription|managed [--target http://127.0.0.1:port] [--allow-unscanned-images] -- command [args...]\n`;
+  return `Commands:\n  ccshield install [--lane subscription|managed] [--gitleaks-path /absolute/gitleaks] [--write]\n  ccshield uninstall [--lane subscription|managed] [--write]\n  ccshield start [--lane subscription|managed]\n  ccshield stop [--lane subscription|managed]\n  ccshield status [--lane subscription|managed]\n  ccshield doctor [--lane subscription|managed]\n  ccshield policy <status [--lane subscription|managed]|install --bundle /absolute/policy-bundle --public-key /absolute/policy-public-key [--lane subscription|managed] [--write]>\n  ccshield privacy provision --gitleaks /absolute/gitleaks --gitleaks-rules /absolute/gitleaks-rules.toml [--bundle /absolute/privacy-manifest] [--policy-bundle /absolute/policy-bundle] [--lane subscription|managed] [--write]\n  ccshield image provision [--image-source /absolute/image-worker.swift] [--lane subscription|managed] [--write]\n  ccshield launch --lane subscription|managed [--target http://127.0.0.1:port] [--allow-unscanned-images] -- command [args...]\n  ccshield plugin install [--plugin-root /absolute/dir] [--write]\n  ccshield migrate\n`;
 }
 
 function renderShieldResult(command, result = {}) {
