@@ -18,7 +18,8 @@ const MEDIA_KEYS = Object.freeze({
   mediaOutcome: "media_outcome",
 });
 const MEDIA_COUNT_KEYS = ["imageCount", "imageTransformCount", "documentCount"];
-const MEDIA_OUTCOMES = new Set(["none", "blocked_document", "blocked_source", "blocked_scan", "blocked_secret", "scanned", "unscanned_override"]);
+// The store's media_outcome CHECK must accept every value here (test/store-media-outcome.test.mjs).
+export const MEDIA_OUTCOMES = Object.freeze(new Set(["none", "blocked_document", "blocked_source", "blocked_scan", "blocked_secret", "scanned", "unscanned_override"]));
 // Set by provisioning from the worker source digest; anything else could smuggle an id or secret into the row.
 const IMAGE_VERSION = /^image-[0-9a-f]{12}$/;
 

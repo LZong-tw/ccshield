@@ -36,19 +36,20 @@ async function withStore(t, options = {}) {
 
 const at = (iso) => ({ now: () => new Date(iso) });
 
-test("an empty database migrates to 001_initial with a recorded checksum", async (t) => {
+test("an empty database applies every migration with a recorded checksum", async (t) => {
   const { databasePath, open } = await withStore(t);
   const store = open();
-  assert.deepEqual(store.health(), { ok: true, migrations: ["001_initial"], decisions: 0 });
+  assert.deepEqual(store.health(), { ok: true, migrations: ["001_initial", "002_media_unscanned_override"], decisions: 0 });
   store.close();
 
   const db = new DatabaseSync(databasePath);
   try {
     const rows = db.prepare("SELECT id, checksum, applied_at FROM shield_migrations").all();
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0].id, "001_initial");
-    assert.equal(rows[0].checksum, checksumMigration(SHIELD_MIGRATIONS[0]));
-    assert.notEqual(rows[0].applied_at, null);
+    assert.deepEqual(rows.map((row) => row.id), SHIELD_MIGRATIONS.map((migration) => migration.id));
+    rows.forEach((row, index) => {
+      assert.equal(row.checksum, checksumMigration(SHIELD_MIGRATIONS[index]));
+      assert.notEqual(row.applied_at, null);
+    });
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all().map((row) => row.name);
     assert.deepEqual(tables, ["shield_decisions", "shield_migrations", "shield_policy_transitions"]);
   } finally {
