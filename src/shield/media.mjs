@@ -129,6 +129,8 @@ export function extractMedia(raw) {
     reasons.add("media_document_blocked");
   };
 
+  let lastUserMessage = -1;
+  let currentMessage = -1;
   const addImage = (block, path) => {
     result.imageCount += 1;
     const source = block.entries.get("source");
@@ -156,7 +158,10 @@ export function extractMedia(raw) {
       reasons.add("media_image_type_blocked");
       return;
     }
-    result.images.push({ path, mime, bytes, rawOffset: data.start, rawLength: data.end - data.start });
+    result.images.push({
+      path, mime, bytes, rawOffset: data.start, rawLength: data.end - data.start,
+      mediaTypeOffset: mediaType.start, mediaTypeLength: mediaType.end - mediaType.start, message: currentMessage,
+    });
   };
 
   // Anything outside the known image positions: media here is denied, not
@@ -205,19 +210,24 @@ export function extractMedia(raw) {
     const messages = root.entries.get("messages");
     if (messages?.kind === "array") {
       messages.items.forEach((message, index) => {
+        currentMessage = index;
+        if (message.kind === "object" && message.entries.get("role")?.value === "user") lastUserMessage = index;
         const content = message.kind === "object" ? message.entries.get("content") : undefined;
         if (content?.kind === "array") walkBlocks(content, `messages[${index}].content`, true);
       });
     }
   }
 
+  // Only the newest user turn counts toward maxImages; history images resent
+  // after a restart go through the normal queue and cache.
+  result.images = result.images.map(({ message, ...image }) => ({ ...image, lastTurn: message === lastUserMessage }));
   result.reasonCodes = [...reasons];
   return result;
 }
 
 // Published in the daemon identity so status reports what this build does,
 // not what a newer build on disk would do.
-export const MEDIA_COVERAGE = Object.freeze({ documents: "blocked", images: "unscanned" });
+export const DOCUMENT_COVERAGE = "blocked";
 
 export function mediaOutcomeFor(reasonCodes) {
   if (reasonCodes.length === 0) return null;
@@ -229,7 +239,7 @@ export function patchMedia(raw, replacements) {
   const parts = [];
   let cursor = 0;
   for (const { rawOffset, rawLength, text } of ordered) {
-    if (typeof text !== "string" || !/^[A-Za-z0-9+/=]*$/.test(text)) throw new TypeError("shield media replacement must be base64 text");
+    if (typeof text !== "string" || !/^[A-Za-z0-9+/=]*$/.test(text)) throw new TypeError("shield media replacement must be base64 or a media type");
     if (!Number.isInteger(rawOffset) || !Number.isInteger(rawLength) || rawOffset < cursor || rawLength < 0 || rawOffset + rawLength > raw.length) {
       throw new RangeError("shield media replacement is out of range or overlaps another");
     }
@@ -238,4 +248,26 @@ export function patchMedia(raw, replacements) {
   }
   parts.push(raw.subarray(cursor));
   return Buffer.concat(parts);
+}
+
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+// Replaces each image with its normalized PNG and rewrites media_type to match,
+// then re-extracts the patched body: the bytes a scanner verified must be
+// exactly the bytes that leave, at the same image positions.
+export function patchImages(raw, patches) {
+  const replacements = [];
+  for (const { image, bytes } of patches) {
+    if (!Buffer.isBuffer(bytes) || !bytes.subarray(0, 8).equals(PNG_MAGIC)) throw new TypeError("shield image replacement must be PNG");
+    replacements.push({ rawOffset: image.rawOffset, rawLength: image.rawLength, text: bytes.toString("base64") });
+    replacements.push({ rawOffset: image.mediaTypeOffset, rawLength: image.mediaTypeLength, text: "image/png" });
+  }
+  const patched = patchMedia(raw, replacements);
+  const after = extractMedia(patched);
+  const expected = new Map(patches.map(({ image, bytes }) => [image.path, bytes]));
+  const ok = after.reasonCodes.length === 0
+    && after.images.length === extractMedia(raw).images.length
+    && after.images.every((image) => !expected.has(image.path) || (image.mime === "image/png" && image.bytes.equals(expected.get(image.path))));
+  if (!ok) throw new Error("shield image splice did not verify");
+  return patched;
 }

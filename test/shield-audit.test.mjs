@@ -69,6 +69,9 @@ test("shield decisions carry media counters only when the decision sets them", (
 
   const blocked = buildShieldDecisionEvent({ ...decision, action: "block", reasonCodes: ["media_document_blocked"], documentCount: 1, mediaOutcome: "blocked_document" });
   assert.deepEqual([blocked.payload.document_count, blocked.payload.media_outcome, Object.hasOwn(blocked.payload, "image_count")], [1, "blocked_document", false]);
+
+  const overridden = buildShieldDecisionEvent({ ...decision, imageCount: 2, documentCount: 0, mediaOutcome: "unscanned_override" });
+  assert.deepEqual([overridden.payload.image_count, overridden.payload.media_outcome], [2, "unscanned_override"]);
 });
 
 test("shield media values are refused before they reach the audit transport", () => {

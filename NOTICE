@@ -14,3 +14,7 @@ and carry a header naming the upstream file and commit:
 
 The privacy-filter model weights and tokenizer are downloaded at setup,
 not bundled; they are also Apache-2.0. See licenses/README.md.
+
+The shield-image/ directory is licensed under the Mozilla Public License 2.0
+(see shield-image/LICENSE), not MIT. Each file there carries an
+SPDX-License-Identifier: MPL-2.0 header.

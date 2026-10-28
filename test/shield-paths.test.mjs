@@ -67,14 +67,16 @@ test("identity binds a launch lane and configuration generation", () => {
 
 test("identity carries optional media coverage and rejects unknown values", () => {
   assert.equal(Object.hasOwn(assertShieldIdentity(identity), "media"), false);
-  const media = { documents: "blocked", images: "unscanned" };
-  assert.deepEqual(assertShieldIdentity({ ...identity, media }).media, media);
+  for (const images of ["unscanned", "pending", "ocr-text", "unavailable", "unscanned-override"]) {
+    const media = { documents: "blocked", images };
+    assert.deepEqual(assertShieldIdentity({ ...identity, media }).media, media);
+  }
   for (const bad of [
     null,
     "blocked",
     { documents: "blocked" },
     { documents: "scanned", images: "unscanned" },
-    { documents: "blocked", images: "ocr-text" },
+    { documents: "blocked", images: "scanned" },
     { documents: "blocked", images: "unscanned", audio: "blocked" },
   ]) {
     assert.throws(() => assertShieldIdentity({ ...identity, media: bad }), /media/i, JSON.stringify(bad));

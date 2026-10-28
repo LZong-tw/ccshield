@@ -634,6 +634,24 @@ test("readiness rejects an incomplete detector binding before probing", async ()
   assert.equal(probes, 0);
 });
 
+test("readiness accepts a three-key detector binding with an image version", async () => {
+  const { paths } = fixture();
+  const detectorVersions = { gitleaks: "8.24.0", image: "image-0123456789ab", privacy: "privacy-1" };
+  const identity = {
+    origin: "http://127.0.0.1:8811", capability, version: 1, pid: 42,
+    lane: "subscription", generation, targetClass: "subscription",
+    policyVersion: policyState.version, detectorVersions,
+  };
+  const ready = await ensureShieldReady({
+    lane: "subscription", paths,
+    io: shieldStateIo(paths, { identity, config: { capability, targetOrigin: "https://api.anthropic.com", lane: "subscription", generation }, state: { version: policyState.version, detectorVersions } }),
+    inspectService: async () => ({ loaded: true, active: true, pid: 42 }),
+    isProcessAlive: async () => true,
+    probeShield: async () => true,
+  });
+  assert.deepEqual(ready.detectorVersions, detectorVersions);
+});
+
 test("start refuses launchd plist path drift before mutating the job", async () => {
   const { options } = fixture();
   const calls = [];
@@ -1508,4 +1526,64 @@ test("policy transition threads the systemd runner through inspect, stop and sta
     installPolicy: async () => ({ version: "2026.10.27.1", detectorVersions: { gitleaks: "8.24.0", privacy: "privacy-1" } }),
   });
   assert.deepEqual(seen, [runSystemctl]);
+});
+
+test("an image override launch registers its own launch id and removes it on exit", async () => {
+  const ready = { origin: "http://127.0.0.1:8811", capability: "c".repeat(32), lane: "subscription", targetClass: "subscription" };
+  const run = async (allowUnscannedImages) => {
+    const events = [];
+    let header;
+    await launchShieldChild({
+      command: "echo",
+      ready,
+      env: { PATH: "/usr/bin" },
+      allowUnscannedImages,
+      createApprovalChannel: async () => null,
+      registerImageOverride: async ({ launchId }) => events.push(`register:${launchId}`),
+      unregisterImageOverride: async ({ launchId }) => events.push(`unregister:${launchId}`),
+      spawnChild: (_command, _args, options) => {
+        header = /^x-airkit-shield-launch: (.*)$/m.exec(options.env.ANTHROPIC_CUSTOM_HEADERS)?.[1];
+        events.push("spawn");
+        const child = new EventEmitter();
+        queueMicrotask(() => child.emit("close", 0, null));
+        return child;
+      },
+    });
+    return { events, header };
+  };
+  const on = await run(true);
+  assert.deepEqual(on.events, [`register:${on.header}`, "spawn", `unregister:${on.header}`]);
+  assert.deepEqual((await run(false)).events, ["spawn"]);
+});
+
+test("an image override that cannot be registered stops the launch", async () => {
+  let spawned = false;
+  await assert.rejects(launchShieldChild({
+    command: "echo",
+    ready: { origin: "http://127.0.0.1:8811", capability: "c".repeat(32), lane: "subscription", targetClass: "subscription" },
+    env: { PATH: "/usr/bin" },
+    allowUnscannedImages: true,
+    createApprovalChannel: async () => null,
+    registerImageOverride: async () => { throw new Error("shield image override registration failed"); },
+    spawnChild: () => { spawned = true; },
+  }), /image override registration failed/);
+  assert.equal(spawned, false);
+});
+
+test("launch --allow-unscanned-images warns in zh-TW and passes the override to this launch only", async () => {
+  const seen = [];
+  let warning = "";
+  for (const argv of [["--allow-unscanned-images"], []]) {
+    await runShieldCli(["launch", "--lane", "subscription", ...argv, "--", "echo", "ok"], {
+      stdout: capture().stdout,
+      stderr: { write(chunk) { warning += String(chunk); } },
+      ensureShieldReady: async () => ({ origin: "http://127.0.0.1:8811", capability: "a".repeat(32), lane: "subscription", targetClass: "subscription" }),
+      ensureOpfJob: async () => ({ started: false }),
+      launchShieldChild: async (options) => { seen.push(options.allowUnscannedImages); return { code: 0 }; },
+    });
+  }
+  assert.deepEqual(seen, [true, false]);
+  assert.match(warning, /^ccshield: 圖片掃描已停用（僅本次啟動）；.*文字仍會掃描/);
+  assert.equal(warning.split("\n").filter(Boolean).length, 1, "only the override launch warns");
+  await assert.rejects(runShieldCli(["launch", "--lane", "subscription", "--allow-unscanned-images", "--allow-unscanned-images", "--", "echo", "no"], { shield: {} }), /usage: ccshield launch/);
 });

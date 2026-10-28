@@ -5,7 +5,7 @@ import "./quiet-sqlite.mjs";
 import { stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
-import { readShieldAssetsProvision, shieldPathsForConfigPath, writeShieldIdentity, writeShieldPolicyState } from "./shield/paths.mjs";
+import { readShieldAssetsProvision, readShieldImageProvision, shieldPathsForConfigPath, writeShieldIdentity, writeShieldPolicyState } from "./shield/paths.mjs";
 import { classifyShieldRequest } from "./shield/classify.mjs";
 import { createGitleaksScanner } from "./shield/gitleaks.mjs";
 import { readShieldPolicyProvision } from "./shield/policy-bundle.mjs";
@@ -13,7 +13,10 @@ import { loadShieldPolicy } from "./shield/policy.mjs";
 import { openPrivacyDetector } from "./shield/privacy-detector.mjs";
 import { createPrivacyFilter, isVerifiedRedaction } from "./shield/privacy.mjs";
 import { createShieldFailure as shieldFailure, startShieldProxy } from "./shield/proxy.mjs";
-import { extractMedia, MEDIA_COVERAGE, mediaOutcomeFor } from "./shield/media.mjs";
+import { DOCUMENT_COVERAGE, extractMedia, mediaOutcomeFor, patchImages } from "./shield/media.mjs";
+import { createImageInspector } from "../shield-image/inspector.mjs";
+import { checkImageReadiness } from "../shield-image/readiness.mjs";
+import { createImageWorker } from "../shield-image/worker.mjs";
 import { createDecisionCache } from "./shield/decision-cache.mjs";
 import { defaultShieldLauncherContext, readShieldConfig } from "./shield/service.mjs";
 import { createShieldDecisionRecorder } from "./shield/audit.mjs";
@@ -41,6 +44,7 @@ export async function startShieldDaemon({
   pid = process.pid,
   readPolicyBundle = readShieldPolicyProvision,
   readAssetsProvision = readShieldAssetsProvision,
+  readImageProvision = readShieldImageProvision,
   loadPolicy = loadShieldPolicy,
   createScanner = createGitleaksScanner,
   createPrivacy = createPrivacyFilter,
@@ -49,11 +53,16 @@ export async function startShieldDaemon({
   writePolicyState = writeShieldPolicyState,
   startProxy = startShieldProxy,
   writeIdentity = writeShieldIdentity,
+  createImageScanner = createDefaultImageScanner,
 } = {}) {
   if (!config || !paths) throw new TypeError("shield daemon configuration and paths are required");
   const destinationClass = resolveDestinationClass(config);
   const provision = await readPolicyBundle({ paths });
   const policy = await loadPolicy({ bundle: provision.bundle, publicKey: provision.publicKey });
+  // Once an image worker is pinned, only a bundle that names that exact image
+  // version may boot, so a 2-key bundle cannot silently drop image scanning.
+  const image = await readImageProvision({ paths });
+  if (image && policy.detectorVersions.image !== image.version) throw new Error("shield image detector version does not match the provisioned worker");
   const assets = await readAssetsProvision({ paths });
   if (!assets) throw new Error("shield asset provision is missing");
   if (!config.gitleaks) throw new Error("shield gitleaks provision is missing");
@@ -63,11 +72,24 @@ export async function startShieldDaemon({
   let privacy;
   let shield;
   let recorder;
+  let images = null;
+  // Image coverage starts as `pending` with a worker and changes once its
+  // background readiness check settles; the identity is republished then.
+  let imageCoverage = image ? "pending" : "unscanned";
+  // Launches started with --allow-unscanned-images; in memory only, so a
+  // restart returns every launch to fail-closed.
+  let imageOverrides = 0;
+  let publish = null;
+  let closed = false;
   const close = async () => {
+    closed = true;
     try { await shield?.close(); }
     finally {
       try { await privacy?.close?.(); }
-      finally { await recorder?.close?.(); }
+      finally {
+        try { await images?.close?.(); }
+        finally { await recorder?.close?.(); }
+      }
     }
   };
   try {
@@ -81,7 +103,23 @@ export async function startShieldDaemon({
     });
     recorder = await createDecisionRecorder({ config, paths, policy, assets });
     if (typeof recorder?.recordShieldDecision !== "function") throw new Error("shield audit recorder is unavailable");
-    const decide = async ({ body, signal, launcherContext: requestLauncherContext = null, detectorVersions: keyedVersions }) => {
+    // Without a provisioned worker, images stay unscanned (Q1). With one, an
+    // image request fails closed until the readiness check has passed.
+    if (image) {
+      images = await createImageScanner({
+        image,
+        scanSecrets: (body) => scanner.scan(body),
+        scanPrivacy: (body) => privacy.scan(body, { version: privacy.detectorVersions().privacy }),
+        context: () => ({ policyVersion: policy.version, detectorVersions: { ...policy.detectorVersions } }),
+        onReadiness: (result) => {
+          imageCoverage = result.ready ? "ocr-text" : "unavailable";
+          if (publish && !closed) {
+            publish().catch(() => process.stderr.write("ccshieldd: could not republish image coverage\n"));
+          }
+        },
+      });
+    }
+    const decide = async ({ body, signal, launcherContext: requestLauncherContext = null, detectorVersions: keyedVersions, allowUnscannedImages = false }) => {
       privacy.refresh();
       const detectorVersions = keyedVersions ?? privacy.detectorVersions();
       const launcherContext = {
@@ -96,8 +134,9 @@ export async function startShieldDaemon({
         throw shieldFailure("media_scan", "media_scan_failed", "shield media scan failed");
       }
       const hasMedia = media.imageCount > 0 || media.documentCount > 0 || media.reasonCodes.length > 0;
+      const overridden = allowUnscannedImages && media.images.length > 0 && media.reasonCodes.length === 0;
       const mediaFacts = hasMedia
-        ? { noCache: true, imageCount: media.imageCount, documentCount: media.documentCount, mediaOutcome: mediaOutcomeFor(media.reasonCodes) ?? "none" }
+        ? { noCache: true, imageCount: media.imageCount, documentCount: media.documentCount, mediaOutcome: mediaOutcomeFor(media.reasonCodes) ?? (overridden ? "unscanned_override" : "none") }
         : {};
       const shape = (decision) => ({
         ...decision,
@@ -107,23 +146,52 @@ export async function startShieldDaemon({
         bundleVersion: policy.version,
         detectorVersions: { ...detectorVersions },
       });
-      // Documents and unscannable images stop here, before any scanner sees them. Base64 images are
-      // forwarded unscanned in this phase; the text pipeline below still covers the rest of the body.
+      // Documents and unscannable images stop here, before any scanner sees them. Base64 images go
+      // through the image worker below, or forward unscanned when no worker is provisioned.
       if (media.reasonCodes.length > 0) return shape({ action: "block", reasonCodes: media.reasonCodes, transformCount: 0 });
-      const facts = classifyShieldRequest({ body, launcherContext });
+      // Masked images are spliced in first, so the text scanners and any text
+      // redaction work on exactly the body that will leave.
+      let scanBody = body;
+      let imageSecrets = 0;
+      let imagePii = [];
+      let imageTransforms = 0;
+      if (images && media.images.length > 0 && !overridden) {
+        if (!images.isReady()) {
+          throw imageCoverage === "pending"
+            ? shieldFailure("image_scan", "image_pending", "shield image worker is still starting", { retryAfterSeconds: 30 })
+            : shieldFailure("image_scan", "image_unavailable", "shield image worker is not ready");
+        }
+        let results;
+        try {
+          results = await images.inspect(media.images.map(({ bytes, lastTurn }) => ({ bytes, lastTurn })));
+        } catch (error) {
+          const refused = { too_many_images: "media_image_limit_blocked", image_rejected: "media_image_rejected_blocked" }[error?.code];
+          if (refused) return { ...shape({ action: "block", reasonCodes: [refused], transformCount: 0 }), mediaOutcome: mediaOutcomeFor([refused]) };
+          throw shieldFailure("image_scan", IMAGE_FAILURES.has(error?.code) ? error.code : "image_scan_unavailable", "shield image scan unavailable");
+        }
+        imageSecrets = results.filter((result) => result.status === "secret").length;
+        if (imageSecrets === 0) {
+          try { scanBody = patchImages(body, results.map((result, index) => ({ image: media.images[index], bytes: result.bytes }))); }
+          catch { throw shieldFailure("image_scan", "image_splice_invalid", "shield image splice failed"); }
+          imagePii = results.flatMap((result) => result.piiFindings);
+          imageTransforms = results.reduce((total, result) => total + Math.max(1, result.maskCount), 0);
+        }
+      }
+      const facts = classifyShieldRequest({ body: scanBody, launcherContext });
       let secretScan;
       let confirmedSecret;
       try {
-        secretScan = await scanner.scan(body);
+        secretScan = await scanner.scan(scanBody);
+        secretScan = { findings: withImageSecrets(secretScan.findings, imageSecrets) };
         confirmedSecret = secretScan.findings.length > 0;
       } catch { throw shieldFailure("secret_scan", "scanner_unavailable", "shield secret scanner unavailable"); }
       let privacyScan;
       try {
-        privacyScan = confirmedSecret ? { status: "ok", findings: [] } : await privacy.scan(body, { signal, version: detectorVersions.privacy });
+        privacyScan = confirmedSecret ? { status: "ok", findings: [] } : await privacy.scan(scanBody, { signal, version: detectorVersions.privacy });
       } catch { throw shieldFailure("privacy_scan", "privacy_unavailable", "shield privacy worker unavailable"); }
       if (privacyScan?.status !== "ok") throw shieldFailure("privacy_scan", privacyScan?.reason, "shield privacy worker unavailable", privacyScan ?? {});
       let piiFindings;
-      try { piiFindings = canonicalPrivacyFindings(privacyScan.findings); }
+      try { piiFindings = canonicalPrivacyFindings([...privacyScan.findings, ...imagePii]); }
       catch { throw shieldFailure("privacy_scan", "findings_invalid", "shield privacy findings are invalid"); }
       let decision;
       try {
@@ -138,12 +206,25 @@ export async function startShieldDaemon({
         });
       } catch { throw shieldFailure("policy", "policy_unavailable", "shield policy unavailable"); }
       if (confirmedSecret && decision.action !== "block") throw shieldFailure("policy", "secret_block_invalid", "shield confirmed secret must be blocked");
-      if (decision.action === "redact" && !isVerifiedRedaction({ original: body, result: privacyScan })) {
+      const textRedacted = privacyScan.findings.length > 0;
+      if (decision.action === "redact" && (textRedacted || imageTransforms === 0) && !isVerifiedRedaction({ original: scanBody, result: privacyScan })) {
         throw shieldFailure("redaction", "redaction_invalid", "shield privacy redaction is invalid");
       }
+      if (imageTransforms === 0) {
+        return shape({
+          ...decision,
+          ...(decision.action === "redact" ? { redactedBody: privacyScan.redactedBody, transformCount: privacyScan.redactions.reduce((total, item) => total + item.count, 0) } : {}),
+        });
+      }
+      // Normalized images always leave as transformed bytes, so an allow
+      // becomes a redaction and an approval forwards the spliced body.
+      if (decision.action === "block") return shape({ ...decision, transformCount: 0 });
+      const textTransforms = decision.action === "redact" && textRedacted ? privacyScan.redactions.reduce((total, item) => total + item.count, 0) : 0;
       return shape({
         ...decision,
-        ...(decision.action === "redact" ? { redactedBody: privacyScan.redactedBody, transformCount: privacyScan.redactions.reduce((total, item) => total + item.count, 0) } : {}),
+        action: decision.action === "allow" ? "redact" : decision.action,
+        redactedBody: textTransforms > 0 ? privacyScan.redactedBody : scanBody,
+        transformCount: textTransforms + imageTransforms,
       });
     };
 
@@ -165,8 +246,12 @@ export async function startShieldDaemon({
       isReady: async () => Boolean(await recorder.isReady?.() ?? true) && Boolean(await privacy.isReady?.()),
       scanStats: () => privacy.recentScans(),
       scanTotals: () => privacy.scanTotals(),
+      onImageOverrideChange: (count) => {
+        imageOverrides = count;
+        if (publish && !closed) publish().catch(() => process.stderr.write("ccshieldd: could not republish image coverage\n"));
+      },
     });
-    await writeIdentity({
+    publish = () => writeIdentity({
       paths,
       identity: {
         origin: shield.origin,
@@ -178,9 +263,10 @@ export async function startShieldDaemon({
         targetClass: config.targetClass,
         policyVersion: policy.version,
         detectorVersions: policy.detectorVersions,
-        media: { ...MEDIA_COVERAGE },
+        media: { documents: DOCUMENT_COVERAGE, images: imageOverrides > 0 ? "unscanned-override" : imageCoverage },
       },
     });
+    await publish();
   } catch (error) {
     await close().catch(() => {});
     throw error;
@@ -239,6 +325,29 @@ function canonicalPrivacyFindings(findings) {
     totals.set(finding.label, count);
   }
   return [...totals].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)).map(([category, count]) => Object.freeze({ category, count }));
+}
+
+const IMAGE_FAILURES = new Set(["image_pending", "image_unavailable", "image_timeout", "image_queue_full", "image_scan_unavailable", "image_splice_invalid"]);
+
+function withImageSecrets(findings, count) {
+  if (count === 0) return findings;
+  return [...findings, { category: "image-ocr-secret", count }].sort((left, right) => (left.category < right.category ? -1 : left.category > right.category ? 1 : 0));
+}
+
+const IMAGE_TIMEOUT_MS = 60_000;
+
+async function createDefaultImageScanner({ image, scanSecrets, scanPrivacy, context, onReadiness }) {
+  const worker = createImageWorker({ path: image.path, sha256: image.sha256 });
+  const inspector = createImageInspector({ worker, scanSecrets, scanPrivacy, context, timeoutMs: IMAGE_TIMEOUT_MS });
+  let state = { ready: false, reason: "pending" };
+  // The first Vision request takes ~30 s; readiness runs in the background and
+  // only image requests wait on it.
+  void checkImageReadiness({ worker }).then((result) => {
+    state = result;
+    onReadiness?.(result);
+    if (!result.ready) process.stderr.write(`ccshieldd: image worker is not ready (${result.reason}); image requests stay unavailable\n`);
+  });
+  return Object.freeze({ isReady: () => state.ready, readiness: () => ({ ...state }), inspect: (images) => inspector.inspect(images), close: () => worker.close() });
 }
 
 function resolveDestinationClass(config) {

@@ -129,6 +129,7 @@ test("diagnostics separate real daemon scan, policy and redaction failures while
       return { action: mode === "redaction" ? "redact" : "allow" };
     } }),
     readAssetsProvision: async () => ({ gitleaks: { path: gitleaks.executable, sha256: gitleaks.sha256, rules: gitleaks.ruleBundle }, privacy: { state: "verified", version: "privacy-1", worker: { command: "/private/fixture/worker", args: [], sha256: "c".repeat(64) } } }),
+    readImageProvision: async () => null,
     createScanner: async () => ({ version: "8", async scan() { if (mode === "secret") throw new Error("scanner-secret"); return { findings: [] }; } }),
     createPrivacy: async (options) => {
       const privacy = await createPrivacyFilter({ ...options, spawnWorker: () => worker, validateWorker: async () => {} });
@@ -193,6 +194,7 @@ test("a client disconnect aborts the daemon's privacy scan and frees its queued 
     readPolicyBundle: async () => ({ bundle: {}, publicKey: "fixture" }),
     loadPolicy: async () => ({ version: "policy-1", detectorVersions: { gitleaks: "8", privacy: "privacy-1" }, async evaluate() { return { action: "allow" }; } }),
     readAssetsProvision: async () => ({ gitleaks: { path: gitleaks.executable, sha256: gitleaks.sha256, rules: gitleaks.ruleBundle }, privacy: { state: "verified", version: "privacy-1", worker: { command: "/private/fixture/worker", args: [], sha256: "c".repeat(64) } } }),
+    readImageProvision: async () => null,
     createScanner: async () => ({ version: "8", async scan() { return { findings: [] }; } }),
     createPrivacy: async (options) => {
       filter = await createPrivacyFilter({ ...options, spawnWorker: () => worker, validateWorker: async () => {} });
@@ -269,6 +271,7 @@ test("the daemon keeps the privacy Retry-After estimate on its shield failure", 
     readPolicyBundle: async () => ({ bundle: {}, publicKey: "fixture" }),
     loadPolicy: async () => ({ version: "policy-1", detectorVersions: { gitleaks: "8", privacy: "privacy-1" }, async evaluate() { return { action: "allow" }; } }),
     readAssetsProvision: async () => ({ gitleaks: { path: gitleaks.executable, sha256: gitleaks.sha256, rules: gitleaks.ruleBundle }, privacy: { state: "verified", version: "privacy-1", worker: { command: "/private/fixture/worker", args: [], sha256: "c".repeat(64) } } }),
+    readImageProvision: async () => null,
     createScanner: async () => ({ version: "8", async scan() { return { findings: [] }; } }),
     createPrivacy: async () => ({
       version: "privacy-1", async isReady() { return true; }, recentScans: () => [], close() {},
@@ -1426,3 +1429,109 @@ async function readBody(request) {
   for await (const chunk of request) chunks.push(chunk);
   return Buffer.concat(chunks).toString("utf8");
 }
+
+test("an approved request with normalized images forwards the spliced body, not the original", async (t) => {
+  for (const cached of [false, true]) {
+    const received = [];
+    const upstream = await startFixture(t, async (request, response) => {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      received.push(Buffer.concat(chunks).toString("utf8"));
+      response.end("ok");
+    });
+    const grant = {};
+    const masked = JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text: "masked" }] }] });
+    const shield = await startShield(t, {
+      targetOrigin: upstream.origin,
+      approvalBroker: { async request() { return grant; }, consume: (received) => received === grant },
+      ...(cached ? {
+        decisionCache: createDecisionCache(),
+        decisionContext: () => ({ lane: "subscription", destinationClass: "subscription", policyVersion: "2026.09.02.2", detectorVersions: { gitleaks: "8.24.0" } }),
+      } : {}),
+      decide: async () => ({
+        action: "require_approval",
+        reasonCodes: ["internal_repository_code"],
+        lane: "subscription",
+        destinationClass: "subscription",
+        bundleVersion: "2026.09.02.2",
+        detectorVersions: { gitleaks: "8.24.0" },
+        noCache: true,
+        imageCount: 1,
+        documentCount: 0,
+        mediaOutcome: "none",
+        transformCount: 1,
+        redactedBody: Buffer.from(masked),
+      }),
+    });
+    const result = await fetch(`${shield.origin}/v1/messages`, {
+      method: "POST", headers: { "x-airkit-shield": CAPABILITY }, body: JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text: "original" }] }] }),
+    });
+    assert.equal(result.status, 200, `cached=${cached}`);
+    assert.deepEqual(received, [masked], `cached=${cached}`);
+  }
+});
+
+async function imageOverride(shield, method, body, headers = { "x-airkit-shield-control": CONTROL_CAPABILITY }) {
+  return await fetch(`${shield.origin}/_airkit/shield/image-override`, {
+    method,
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+async function postMessage(shield, launchId) {
+  return await fetch(`${shield.origin}/v1/messages`, {
+    method: "POST",
+    headers: { "x-airkit-shield": CAPABILITY, "content-type": "application/json", ...(launchId ? { "x-airkit-shield-launch": launchId } : {}) },
+    body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
+  });
+}
+
+test("a per-launch image override is control-authenticated, scoped to its launch id, and revocable", async (t) => {
+  const upstream = await startFixture(t, async (_request, response) => { response.end("ok"); });
+  const seen = [];
+  const counts = [];
+  const shield = await startShield(t, {
+    targetOrigin: upstream.origin,
+    decide: async ({ allowUnscannedImages }) => { seen.push(allowUnscannedImages); return { action: "allow" }; },
+    onImageOverrideChange: (count) => counts.push(count),
+  });
+  assert.equal((await imageOverride(shield, "POST", { launchId: LAUNCH_A }, {})).status, 401);
+  assert.equal((await imageOverride(shield, "POST", { launchId: "nope" })).status, 403);
+  assert.equal((await imageOverride(shield, "POST", { launchId: LAUNCH_A, extra: 1 })).status, 403);
+  assert.equal((await imageOverride(shield, "POST", { launchId: LAUNCH_A })).status, 204);
+  await postMessage(shield, LAUNCH_A);
+  await postMessage(shield, "2".repeat(32));
+  await postMessage(shield);
+  assert.equal((await imageOverride(shield, "DELETE", { launchId: LAUNCH_A })).status, 204);
+  await postMessage(shield, LAUNCH_A);
+  assert.deepEqual(seen, [true, false, false, false]);
+  assert.deepEqual(counts, [1, 0]);
+});
+
+test("image overrides are capped like approval channels", async (t) => {
+  const shield = await startShield(t, { targetOrigin: "https://api.anthropic.com", decide: async () => ({ action: "allow" }) });
+  const launchId = (index) => index.toString(16).padStart(32, "0");
+  for (let index = 0; index < 32; index += 1) assert.equal((await imageOverride(shield, "POST", { launchId: launchId(index) })).status, 204);
+  assert.equal((await imageOverride(shield, "POST", { launchId: launchId(32) })).status, 403);
+});
+
+test("an image readiness 503 tells the user why and what to do", async (t) => {
+  for (const [reason, retryAfter, pattern] of [
+    ["image_pending", "30", /30 秒/],
+    ["image_unavailable", null, /--allow-unscanned-images[\s\S]*--no-shield/],
+  ]) {
+    const shield = await startShield(t, {
+      targetOrigin: "https://api.anthropic.com",
+      decide: async () => { throw Object.assign(new Error("x"), { shieldFailure: { stage: "image_scan", reason, ...(retryAfter ? { retryAfterSeconds: 30 } : {}) } }); },
+    });
+    const response = await postMessage(shield);
+    assert.equal(response.status, 503);
+    assert.equal(response.headers.get("retry-after"), retryAfter);
+    const body = await response.json();
+    assert.equal(body.type, "error");
+    assert.equal(body.error.type, "api_error");
+    assert.equal(body.error.code, "shield_unavailable");
+    assert.match(body.error.message, pattern);
+  }
+});

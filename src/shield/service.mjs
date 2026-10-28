@@ -326,7 +326,7 @@ export async function ensureShieldReady({ lane, expectedTargetOrigin, env = proc
   };
 }
 
-export async function launchShieldChild({ command, args = [], ready, env = process.env, spawnChild = spawn, approvalBroker, createApprovalChannel: createChannel = createLauncherApprovalChannel, registerApprovalChannel: registerChannel = registerShieldApprovalChannel, unregisterApprovalChannel: unregisterChannel = unregisterShieldApprovalChannel } = {}) {
+export async function launchShieldChild({ command, args = [], ready, env = process.env, spawnChild = spawn, approvalBroker, allowUnscannedImages = false, createApprovalChannel: createChannel = createLauncherApprovalChannel, registerApprovalChannel: registerChannel = registerShieldApprovalChannel, unregisterApprovalChannel: unregisterChannel = unregisterShieldApprovalChannel, registerImageOverride = registerShieldImageOverride, unregisterImageOverride = unregisterShieldImageOverride } = {}) {
   if (typeof command !== "string" || command.length === 0 || command.includes("\0")) throw new Error("shield launch command is required");
   if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string" || arg.includes("\0"))) throw new Error("shield launch arguments must be strings");
   assertNoShieldEndpointOverride(args, ready?.origin);
@@ -334,10 +334,17 @@ export async function launchShieldChild({ command, args = [], ready, env = proce
   const launchId = createShieldLaunchId();
   const channel = await openShieldApprovalChannel({ approvalBroker, createApprovalChannel: createChannel });
   let registered = false;
+  let overridden = false;
   try {
     if (channel !== null) {
       await registerChannel({ ready, channel, launchId });
       registered = true;
+    }
+    // The override lives in the daemon's memory under this launch id only, so
+    // the next launch (or a daemon restart) is fail-closed again.
+    if (allowUnscannedImages) {
+      await registerImageOverride({ ready, launchId });
+      overridden = true;
     }
     const child = spawnChild(command, args, {
       env: buildShieldChildEnv(ready, env, launchId),
@@ -349,6 +356,7 @@ export async function launchShieldChild({ command, args = [], ready, env = proce
       child.once("close", (code, signal) => resolvePromise({ code, signal }));
     });
   } finally {
+    if (overridden) await unregisterImageOverride({ ready, launchId }).catch(() => {});
     if (registered) await unregisterChannel({ ready, launchId }).catch(() => {});
     await channel?.close?.();
   }
@@ -394,6 +402,26 @@ export async function unregisterShieldApprovalChannel({ ready, launchId, paths, 
     body: JSON.stringify({ launchId }),
   }).catch(() => null);
   if (response?.status !== 204) throw new Error("shield approval unregister failed");
+}
+
+export async function registerShieldImageOverride({ ready, launchId, paths, io, fetchImpl = fetch } = {}) {
+  if (!(await postImageOverride({ method: "POST", ready, launchId, paths, io, fetchImpl }))) throw new Error("shield image override registration failed");
+}
+
+export async function unregisterShieldImageOverride({ ready, launchId, paths, io, fetchImpl = fetch } = {}) {
+  if (!(await postImageOverride({ method: "DELETE", ready, launchId, paths, io, fetchImpl }))) throw new Error("shield image override unregister failed");
+}
+
+async function postImageOverride({ method, ready, launchId, paths, io, fetchImpl }) {
+  if (!ready?.origin) return false;
+  assertShieldLaunchId(launchId);
+  const config = await readShieldConfig({ paths: paths ?? shieldPaths({ lane: ready.lane }), io });
+  const response = await fetchImpl(`${ready.origin}/_airkit/shield/image-override`, {
+    method,
+    headers: { "x-airkit-shield-control": config.controlCapability, "content-type": "application/json" },
+    body: JSON.stringify({ launchId }),
+  }).catch(() => null);
+  return response?.status === 204;
 }
 
 export async function createShieldDestinationLease({ ready, targetOrigin, launcherContext, paths, io, fetchImpl = fetch } = {}) {
@@ -594,7 +622,8 @@ function sameDetectorVersions(actual, expected) {
 }
 
 function assertCompleteDetectorVersions(value) {
-  if (!value || typeof value !== "object" || Object.keys(value).length !== 2
+  const size = value && typeof value === "object" ? Object.keys(value).length : 0;
+  if ((size !== 2 && !(size === 3 && typeof value.image === "string"))
     || typeof value.gitleaks !== "string" || typeof value.privacy !== "string") {
     throw new Error("shield detector binding must include Gitleaks and Privacy");
   }

@@ -9,6 +9,7 @@ const FAILURE_REASONS = new Map([
   ["body_read", new Set(["body_read_failed", "body_too_large"])],
   ["evaluation", new Set(["evaluation_unavailable"])],
   ["media_scan", new Set(["media_scan_failed"])],
+  ["image_scan", new Set(["image_pending", "image_unavailable", "image_timeout", "image_queue_full", "image_scan_unavailable", "image_splice_invalid"])],
   ["secret_scan", new Set(["scanner_unavailable"])],
   ["privacy_scan", new Set([
     "privacy_unavailable", "worker_closed", "body_invalid", "admission_limit", "frame_limit", "queue_timeout",
@@ -50,9 +51,15 @@ const INTERNAL_HEADERS = new Set([
   "x-airkit-shield-launch",
 ]);
 const MAX_APPROVAL_CHANNELS = 32;
+const MAX_IMAGE_OVERRIDES = 32;
+// Claude Code shows error.message to the user, so an image 503 says why and what to do.
+const IMAGE_MESSAGES = Object.freeze({
+  image_pending: "Shield 圖片掃描仍在啟動中（約 30 秒）；請稍候約 30 秒再重試。",
+  image_unavailable: "Shield 圖片掃描無法使用（啟動檢查失敗），含圖片的請求已被攔截。請以 --allow-unscanned-images 重新啟動（僅本次略過圖片掃描，文字仍會掃描），或以 --no-shield 重新啟動（完全停用 Shield）。",
+});
 const LAUNCH_ID = /^[a-f0-9]{32}$/;
 
-export async function startShieldProxy({ capability, controlCapability, targetOrigin, allowDestinationLeases = false, decide, decisionCache = null, decisionContext = null, approvalBroker = null, recordShieldDecision = null, onDecision = null, isReady = null, scanStats = null, scanTotals = null, now = Date.now, port = 0 } = {}) {
+export async function startShieldProxy({ capability, controlCapability, targetOrigin, allowDestinationLeases = false, decide, decisionCache = null, decisionContext = null, approvalBroker = null, recordShieldDecision = null, onDecision = null, onImageOverrideChange = null, isReady = null, scanStats = null, scanTotals = null, now = Date.now, port = 0 } = {}) {
   assertCapability(capability);
   assertCapability(controlCapability);
   const target = targetOrigin === undefined && allowDestinationLeases ? null : assertFixedTarget(targetOrigin);
@@ -62,6 +69,7 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
     throw new TypeError("shield proxy approval broker is invalid");
   }
   if (isReady !== null && typeof isReady !== "function") throw new TypeError("shield proxy readiness function is invalid");
+  if (onImageOverrideChange !== null && typeof onImageOverrideChange !== "function") throw new TypeError("shield image override listener is invalid");
   if (typeof now !== "function") throw new TypeError("shield proxy clock is invalid");
   assertPort(port);
   if (scanStats !== null && typeof scanStats !== "function") throw new TypeError("shield scan stats source is invalid");
@@ -75,9 +83,10 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
   }
   const approvalChannels = new Map();
   const destinationLeases = new Map();
+  const imageOverrides = new Set();
   const failures = [];
   const server = createServer((request, response) => {
-    void handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision: record, isReady, approvalChannels, now, failures, scanStats, scanTotals });
+    void handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision: record, isReady, approvalChannels, imageOverrides, onImageOverrideChange, now, failures, scanStats, scanTotals });
   });
   await listenLoopback(server, port);
   const address = server.address();
@@ -91,7 +100,7 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
   };
 }
 
-async function handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision, isReady, approvalChannels, now, failures, scanStats, scanTotals }) {
+async function handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision, isReady, approvalChannels, imageOverrides, onImageOverrideChange, now, failures, scanStats, scanTotals }) {
   const startedAt = Date.now();
   const fail = (stage, reason, bytes = 0) => recordFailure(failures, { stage, reason, bytes, elapsedMs: Date.now() - startedAt });
   if (isDiagnosticsPath(request.url)) {
@@ -108,6 +117,23 @@ async function handleShieldRequest({ request, response, capability, controlCapab
     response.end(body); return;
   }
   const isApprovalRegistration = request.url === "/_airkit/shield/approval-channel" && (request.method === "POST" || request.method === "DELETE");
+  if (request.url === "/_airkit/shield/image-override" && (request.method === "POST" || request.method === "DELETE")) {
+    if (!capabilityMatches(request.headers["x-airkit-shield-control"], controlCapability)) {
+      request.resume();
+      await finish(response, { status: 401, code: "shield_unauthorized" });
+      return;
+    }
+    const launchId = await readApprovalUnregistration(request);
+    if (launchId === null || (request.method === "POST" && (imageOverrides.has(launchId) || imageOverrides.size >= MAX_IMAGE_OVERRIDES))) {
+      await finish(response, { status: 403, code: "shield_blocked" });
+      return;
+    }
+    const changed = request.method === "POST" ? (imageOverrides.add(launchId), true) : imageOverrides.delete(launchId);
+    if (changed) { try { onImageOverrideChange?.(imageOverrides.size); } catch {} }
+    response.writeHead(204, { "cache-control": "no-store" });
+    response.end();
+    return;
+  }
   const isLeaseRequest = request.url === "/_airkit/shield/destination-lease" && (request.method === "POST" || request.method === "DELETE");
   if (isLeaseRequest) {
     if (!allowDestinationLeases || !capabilityMatches(request.headers["x-airkit-shield-control"], controlCapability)) { request.resume(); await finish(response, { status: 401, code: "shield_unauthorized" }); return; }
@@ -253,8 +279,10 @@ async function handleShieldRequest({ request, response, capability, controlCapab
   if (lifecycle.signal.aborted) return;
   let decision;
   try {
-    const evaluate = async (signal = lifecycle.signal, detectorVersions) => await decide({ method: request.method ?? "GET", path, bytes: inspection.bytes, body: inspection.body, signal, launcherContext, ...(detectorVersions ? { detectorVersions } : {}) });
-    decision = decisionCache === null || launcherContext !== null
+    const launchId = request.headers["x-airkit-shield-launch"];
+    const allowUnscannedImages = typeof launchId === "string" && imageOverrides.has(launchId);
+    const evaluate = async (signal = lifecycle.signal, detectorVersions) => await decide({ method: request.method ?? "GET", path, bytes: inspection.bytes, body: inspection.body, signal, launcherContext, allowUnscannedImages, ...(detectorVersions ? { detectorVersions } : {}) });
+    decision = decisionCache === null || launcherContext !== null || allowUnscannedImages
       ? await evaluate()
       : await cachedDecision({ decisionCache, decisionContext, body: inspection.body, evaluate, signal: lifecycle.signal });
   } catch (error) {
@@ -262,7 +290,7 @@ async function handleShieldRequest({ request, response, capability, controlCapab
     const failure = error?.shieldFailure;
     if (FAILURE_REASONS.get(failure?.stage)?.has(failure?.reason)) fail(failure.stage, failure.reason, inspection.bytes);
     else fail("evaluation", "evaluation_unavailable", inspection.bytes);
-    await finish(response, { status: 503, code: "shield_unavailable", retryAfterSeconds: validRetryAfter(failure ?? {}) });
+    await finish(response, { status: 503, code: "shield_unavailable", retryAfterSeconds: validRetryAfter(failure ?? {}), message: failure?.stage === "image_scan" ? IMAGE_MESSAGES[failure.reason] : undefined });
     return;
   }
   const auditDecision = buildDecisionMetadata(decision, startedAt);
@@ -279,6 +307,16 @@ async function handleShieldRequest({ request, response, capability, controlCapab
     permitted = true;
   }
   if (decision?.action === "require_approval") {
+    // Normalized images make the approved body a transform of the original.
+    if (decision.redactedBody !== undefined) {
+      const transformed = validateRedactedBody(decision.redactedBody);
+      if (transformed === null) {
+        fail("redaction", "redaction_invalid", inspection.bytes);
+        await finish(response, { status: 503, code: "shield_unavailable" });
+        return;
+      }
+      forwardBody = transformed;
+    }
     permitted = await approveRequest({ approvalBroker, approvalChannel: launchApprovalChannel(approvalChannels, request.headers["x-airkit-shield-launch"]), decision, inspection, auditDecision, signal: lifecycle.signal });
     auditDecision.override = permitted;
   }
@@ -353,7 +391,7 @@ function recordFailure(failures, { stage, reason, bytes, elapsedMs }) {
 export function createShieldFailure(stage, reason, message, { retryAfterSeconds } = {}) {
   const defaults = {
     body_read: "body_read_failed", evaluation: "evaluation_unavailable", secret_scan: "scanner_unavailable",
-    privacy_scan: "privacy_unavailable", policy: "policy_unavailable", redaction: "redaction_invalid",
+    privacy_scan: "privacy_unavailable", image_scan: "image_scan_unavailable", policy: "policy_unavailable", redaction: "redaction_invalid",
     audit: "audit_unavailable", upstream: "transport_unavailable",
   };
   const safeStage = FAILURE_REASONS.has(stage) ? stage : "evaluation";
@@ -366,7 +404,7 @@ export function createShieldFailure(stage, reason, message, { retryAfterSeconds 
 
 // Only a full queue is worth retrying later; the estimate comes from the privacy filter.
 function validRetryAfter({ stage, reason, retryAfterSeconds }) {
-  const retryable = stage === "privacy_scan" && (reason === "admission_limit" || reason === "queue_timeout");
+  const retryable = (stage === "privacy_scan" && (reason === "admission_limit" || reason === "queue_timeout")) || (stage === "image_scan" && reason === "image_pending");
   return retryable && Number.isInteger(retryAfterSeconds) && retryAfterSeconds >= 1 && retryAfterSeconds <= 60
     ? retryAfterSeconds
     : undefined;
@@ -379,7 +417,8 @@ async function cachedDecision({ decisionCache, decisionContext: contextSource, b
   const key = { ...decisionContext, requestDigest };
   const result = await decisionCache.getOrCompute(key, async (sharedSignal) => {
     const decision = await evaluate(sharedSignal, decisionContext.detectorVersions);
-    const redactedBody = decision?.action === "redact" ? validateRedactedBody(decision.redactedBody) : Buffer.alloc(0);
+    const carriesBody = decision?.action === "redact" || (decision?.action === "require_approval" && decision.redactedBody !== undefined);
+    const redactedBody = carriesBody ? validateRedactedBody(decision.redactedBody) : Buffer.alloc(0);
     if (redactedBody === null) throw new Error("shield decision redaction is invalid");
     const action = decision?.action;
     const reasonCodes = validReasonCodes(decision?.reasonCodes)
@@ -395,7 +434,7 @@ async function cachedDecision({ decisionCache, decisionContext: contextSource, b
     action: cached.action,
     reasonCodes: cached.reasonCodes,
     transformCount: cached.transformCount,
-    ...(cached.action === "redact" ? { redactedBody: cached.body } : {}),
+    ...(cached.action === "redact" || (cached.action === "require_approval" && cached.body.length > 0) ? { redactedBody: cached.body } : {}),
     lane: decisionContext.lane,
     destinationClass: decisionContext.destinationClass,
     bundleVersion: decisionContext.policyVersion,
@@ -610,9 +649,9 @@ function waitForDrain(response, signal) {
   });
 }
 
-async function finish(response, { status, code, retryAfterSeconds }) {
+async function finish(response, { status, code, retryAfterSeconds, message }) {
   if (!response.headersSent) {
-    const body = Buffer.from(JSON.stringify({ error: { code } }));
+    const body = Buffer.from(JSON.stringify(message === undefined ? { error: { code } } : { type: "error", error: { type: "api_error", code, message } }));
     response.writeHead(status, {
       "content-type": "application/json", "content-length": String(body.byteLength),
       ...(retryAfterSeconds === undefined ? {} : { "retry-after": String(retryAfterSeconds) }),

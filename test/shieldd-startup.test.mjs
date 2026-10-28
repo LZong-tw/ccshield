@@ -95,7 +95,31 @@ test("daemon CLI exits on boot failure and prints only its fixed diagnostic even
   await assert.rejects(readFile(fixture.paths.identityPath), { code: "ENOENT" });
 });
 
-async function startupFixture(t) {
+const imagePin = (version) => async () => ({ path: "/x/image-worker", sha256: "a".repeat(64), source: { path: "/x/w.swift", sha256: "b".repeat(64) }, version });
+const reachedAudit = new Error("past the boot rule");
+
+test("a provisioned image worker requires a three-key bundle naming its version", async (t) => {
+  const twoKey = await startupFixture(t);
+  await assert.rejects(startShieldDaemon({ config: twoKey.config, paths: twoKey.paths, readImageProvision: imagePin("image-0123456789ab") }),
+    /image detector version/);
+  await assert.rejects(readFile(twoKey.workerPidPath), { code: "ENOENT" });
+  const mismatched = await startupFixture(t, { detectorVersions: { gitleaks: "8.24.0", image: "image-ffffffffffff", privacy: "privacy-1" } });
+  await assert.rejects(startShieldDaemon({ config: mismatched.config, paths: mismatched.paths, readImageProvision: imagePin("image-0123456789ab") }),
+    /image detector version/);
+});
+
+test("the boot rule passes a matching image version, and Q1 boots without a worker", async (t) => {
+  const three = await startupFixture(t, { detectorVersions: { gitleaks: "8.24.0", image: "image-0123456789ab", privacy: "privacy-1" } });
+  for (const readImageProvision of [imagePin("image-0123456789ab"), async () => null]) {
+    await assert.rejects(startShieldDaemon({ config: three.config, paths: three.paths, readImageProvision,
+      createDecisionRecorder: async () => { throw reachedAudit; } }), (error) => error === reachedAudit);
+  }
+  const twoKey = await startupFixture(t);
+  await assert.rejects(startShieldDaemon({ config: twoKey.config, paths: twoKey.paths, readImageProvision: async () => null,
+    createDecisionRecorder: async () => { throw reachedAudit; } }), (error) => error === reachedAudit);
+});
+
+async function startupFixture(t, { detectorVersions = { gitleaks: "8.24.0", privacy: "privacy-1" } } = {}) {
   const homeDir = await realpath(await mkdtemp(join(tmpdir(), "ccshield-boot-")));
   const paths = shieldPaths({ homeDir, env: {} });
   const workerPidPath = join(homeDir, "worker.pid");
@@ -134,7 +158,7 @@ setInterval(() => {}, 1000);\n`;
     opaAbi: "1",
     opaWasmSdkVersion: "1.8.0",
     wasmSha256: digest(wasm),
-    detectorVersions: { gitleaks: "8.24.0", privacy: "privacy-1" },
+    detectorVersions,
     selfTest: {
       input: { lane: "subscription", destinationClass: "subscription", interactive: false, repositoryClass: "public", pathClasses: ["source"], secretFindings: [], piiFindings: [] },
       expected: { action: "allow", reasonCodes: [], approvalEligible: false, redactions: [] },
