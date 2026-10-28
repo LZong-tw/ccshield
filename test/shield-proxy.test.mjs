@@ -14,6 +14,8 @@ import { approvalChannelRegistration, createApprovalChannel } from "../src/shiel
 import { createDecisionCache } from "../src/shield/decision-cache.mjs";
 import { createPrivacyFilter } from "../src/shield/privacy.mjs";
 import { startShieldDaemon } from "../src/shieldd.mjs";
+import { openShieldStore } from "../src/store.mjs";
+import { createShieldDecisionRecorder } from "../src/shield/audit.mjs";
 
 const CAPABILITY = "c".repeat(32);
 const CONTROL_CAPABILITY = "d".repeat(32);
@@ -1534,4 +1536,35 @@ test("an image readiness 503 tells the user why and what to do", async (t) => {
     assert.equal(body.error.code, "shield_unavailable");
     assert.match(body.error.message, pattern);
   }
+});
+
+test("an image forwarded under a launch override reaches the real audit store", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "ccshield-proxy-store-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const store = openShieldStore({ databasePath: join(root, "audit.sqlite"), masterKey: Buffer.alloc(32, 9) });
+  t.after(() => store.close());
+  const upstream = await startFixture(t, async (_request, response) => { response.end("ok"); });
+  const shield = await startShield(t, {
+    targetOrigin: upstream.origin,
+    recordShieldDecision: createShieldDecisionRecorder({ store }).recordShieldDecision,
+    decide: async ({ allowUnscannedImages }) => ({
+      action: "allow",
+      reasonCodes: ["policy_allow"],
+      lane: "subscription",
+      destinationClass: "subscription",
+      bundleVersion: "2026.10.28",
+      detectorVersions: { gitleaks: "8.30.1", privacy: "opf-1", image: "image-0123456789ab" },
+      noCache: true,
+      imageCount: 1,
+      documentCount: 0,
+      mediaOutcome: allowUnscannedImages ? "unscanned_override" : "none",
+      transformCount: 0,
+    }),
+  });
+  assert.equal((await imageOverride(shield, "POST", { launchId: LAUNCH_A })).status, 204);
+  const response = await postMessage(shield, LAUNCH_A);
+  assert.equal(response.status, 200);
+  const [row] = store.queryDecisions();
+  assert.equal(row.media_outcome, "unscanned_override");
+  assert.equal(row.image_count, 1);
 });
