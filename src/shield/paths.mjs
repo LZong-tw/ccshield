@@ -142,7 +142,7 @@ export function assertShieldIdentity(identity) {
 // check writes no `media`, and readers treat that as unscanned. Images are
 // `unscanned` without a worker, `pending` while its startup readiness check
 // runs, then `ocr-text` or `unavailable` (image requests fail closed).
-const MEDIA_COVERAGE_STATES = Object.freeze({ documents: ["unscanned", "blocked"], images: ["unscanned", "pending", "ocr-text", "unavailable"] });
+const MEDIA_COVERAGE_STATES = Object.freeze({ documents: ["unscanned", "blocked"], images: ["unscanned", "pending", "ocr-text", "unavailable", "unscanned-override"] });
 
 function assertMediaCoverage(media) {
   if (!media || typeof media !== "object" || Array.isArray(media)

@@ -852,12 +852,13 @@ const imageVersions = { gitleaks: "8.24.0", image: "image-0123456789ab", privacy
 async function imageDecide({ ready = true, inspect = async (images) => images.map(() => ({ status: "ok", bytes: MASKED_PNG, maskCount: 0, lowConfidenceMasked: 0, piiFindings: [] })), evaluate, privacyScan } = {}) {
   const calls = { scanner: [], privacy: [], policy: [], inspect: [] };
   let decide;
+  let report;
   await startDaemon({
     config,
     paths,
     readPolicyBundle: async () => ({ bundle: {}, publicKey: "pinned-ed25519-public-key" }),
     readImageProvision: async () => ({ version: "image-0123456789ab", path: "/opt/w", sha256: "a".repeat(64) }),
-    createImageScanner: async () => ({ isReady: () => ready, inspect: async (images) => { calls.inspect.push(images); return inspect(images); }, close() {} }),
+    createImageScanner: async ({ onReadiness }) => { report = onReadiness; return { isReady: () => ready, inspect: async (images) => { calls.inspect.push(images); return inspect(images); }, close() {} }; },
     createPrivacy: async () => ({ version: "privacy-1", async scan(body) { calls.privacy.push(Buffer.from(body)); return privacyScan?.(body) ?? { status: "ok", findings: [], redactions: [] }; }, close() {} }),
     createScanner: async () => ({ version: "8.24.0", scan: async (body) => { calls.scanner.push(Buffer.from(body)); return { findings: [] }; } }),
     loadPolicy: async () => ({
@@ -875,15 +876,17 @@ async function imageDecide({ ready = true, inspect = async (images) => images.ma
     startProxy: async (options) => { decide = options.decide; return { origin: "http://127.0.0.1:8811", close: async () => {} }; },
     writeIdentity: async () => {},
   });
-  return { calls, decide: (body) => decide({ body }) };
+  return { calls, decide: (body, options = {}) => decide({ body, ...options }), settle: (result) => report(result) };
 }
 
 const sourceOf = (body, index = 1) => JSON.parse(body.toString("utf8")).messages[0].content[index].source;
 const jpegBlock = { type: "image", source: { type: "base64", media_type: "image/jpeg", data: Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(24, 3)]).toString("base64") } };
 
 test("a provisioned worker that is not ready makes image requests unavailable before any scanner", async () => {
-  const { calls, decide } = await imageDecide({ ready: false });
-  await assert.rejects(decide(mediaBody(pngBlock)), (error) => error.shieldFailure?.stage === "image_scan" && error.shieldFailure?.reason === "image_unavailable");
+  const { calls, decide, settle } = await imageDecide({ ready: false });
+  await assert.rejects(decide(mediaBody(pngBlock)), (error) => error.shieldFailure?.stage === "image_scan" && error.shieldFailure?.reason === "image_pending" && error.shieldFailure?.retryAfterSeconds === 30);
+  settle({ ready: false, reason: "fixture_missing" });
+  await assert.rejects(decide(mediaBody(pngBlock)), (error) => error.shieldFailure?.stage === "image_scan" && error.shieldFailure?.reason === "image_unavailable" && error.shieldFailure?.retryAfterSeconds === undefined);
   assert.equal(calls.scanner.length + calls.privacy.length + calls.policy.length + calls.inspect.length, 0);
   const plain = await decide(mediaBody());
   assert.equal(plain.action, "allow", "text-only requests do not wait for image readiness");
@@ -977,4 +980,48 @@ test("daemon publishes image coverage and republishes it when readiness settles"
   assert.deepEqual(await published({ image: worker }), ["pending"]);
   assert.deepEqual(await published({ image: worker, settle: { ready: true } }), ["pending", "ocr-text"]);
   assert.deepEqual(await published({ image: worker, settle: { ready: false, reason: "fixture_missing" } }), ["pending", "unavailable"]);
+});
+
+test("a launch image override forwards images unscanned, still scans text, and is recorded", async () => {
+  const { calls, decide } = await imageDecide({ ready: false });
+  const decision = await decide(mediaBody(pngBlock), { allowUnscannedImages: true });
+  assert.equal(calls.inspect.length, 0, "the image worker is skipped");
+  assert.equal(calls.scanner.length, 1, "Gitleaks still scans the text");
+  assert.equal(calls.privacy.length, 1, "Privacy still scans the text");
+  assert.equal(decision.action, "allow");
+  assert.equal(decision.imageCount, 1);
+  assert.equal(decision.mediaOutcome, "unscanned_override");
+  assert.equal(decision.noCache, true);
+  const plain = await decide(mediaBody(), { allowUnscannedImages: true });
+  assert.equal(plain.mediaOutcome, undefined, "a request with no images is not marked");
+  await assert.rejects(decide(mediaBody(pngBlock)), (error) => error.shieldFailure?.reason === "image_pending", "other launches stay fail-closed");
+});
+
+test("a launch override still blocks documents and unscannable image sources", async () => {
+  const { decide } = await imageDecide({ ready: false });
+  const decision = await decide(mediaBody(pdfBlock), { allowUnscannedImages: true });
+  assert.equal(decision.action, "block");
+  assert.equal(decision.mediaOutcome, "blocked_document");
+});
+
+test("daemon publishes unscanned-override while any launch override is registered", async () => {
+  const identities = [];
+  let onChange;
+  await startDaemon({
+    config,
+    paths,
+    readPolicyBundle: async () => ({ bundle: {}, publicKey: "pinned-ed25519-public-key" }),
+    readImageProvision: async () => ({ version: "image-0123456789ab", path: "/opt/w", sha256: "a".repeat(64) }),
+    createImageScanner: async () => ({ isReady: () => false, inspect: async () => [], close() {} }),
+    createScanner: async () => ({ version: "8.24.0", scan: async () => ({ findings: [] }) }),
+    loadPolicy: async () => ({ version: "2026.09.02.4", detectorVersions: imageVersions, evaluate: async () => ({ action: "allow", reasonCodes: [], approvalEligible: false, redactions: [] }) }),
+    writePolicyState: async () => {},
+    startProxy: async (options) => { onChange = options.onImageOverrideChange; return { origin: "http://127.0.0.1:8811", close: async () => {} }; },
+    writeIdentity: async ({ identity }) => { identities.push(identity.media.images); },
+  });
+  onChange(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  onChange(0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(identities, ["pending", "unscanned-override", "pending"]);
 });

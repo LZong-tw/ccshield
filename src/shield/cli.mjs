@@ -195,8 +195,9 @@ async function createDefaultShieldDependencies(dependencies) {
       const state = await readShieldPolicyState({ paths: shieldPaths({ env, lane }), io: dependencies.io });
       return state ? { state: "healthy", version: state.version, detectorVersions: state.detectorVersions } : { state: "stopped", installed: false };
     },
-    async launch({ lane, targetOrigin: fixedTarget, pxpipe = false, command, args }) {
+    async launch({ lane, targetOrigin: fixedTarget, pxpipe = false, allowUnscannedImages = false, command, args }) {
       const lanePaths = shieldPaths({ env, lane });
+      if (allowUnscannedImages) (dependencies.stderr ?? process.stderr).write("ccshield: 圖片掃描已停用（僅本次啟動）；圖片不經 OCR 掃描或遮罩即送出，文字仍會掃描、遮罩或攔截。\n");
       let ready = await ensureReady({ lane, env, paths: lanePaths, io: dependencies.io, inspectService: dependencies.inspectService, isProcessAlive: dependencies.isProcessAlive, probeShield: dependencies.probeShield });
       await (dependencies.ensureOpfJob ?? ensureOpfJob)({ paths: lanePaths }).catch(() => null);
       // pxpipe sits behind Shield, so it only sees redacted traffic. It lives
@@ -232,7 +233,7 @@ async function createDefaultShieldDependencies(dependencies) {
         await hop?.close();
       };
       try {
-        outcome = await launchChild({ command, args, ready, env, spawnChild: dependencies.spawnChild });
+        outcome = await launchChild({ command, args, ready, env, allowUnscannedImages, spawnChild: dependencies.spawnChild });
         if (targetOrigin && await hasBackgroundClaudeHost(ready.origin, dependencies.backgroundHostDetector)) {
           leaseRetained = scheduleBackgroundHostRelease(ready.origin, {
             detector: dependencies.backgroundHostDetector,
@@ -269,13 +270,15 @@ function parseLaunch(argv) {
   const targetOrigin = targetIndex >= 0 ? argv[targetIndex + 1] : undefined;
   const beforeBoundary = argv.slice(0, boundary);
   const pxpipe = beforeBoundary.includes("--pxpipe");
+  const allowUnscannedImages = beforeBoundary.includes("--allow-unscanned-images");
+  const repeated = ["--pxpipe", "--allow-unscanned-images"].some((flag) => beforeBoundary.filter((value) => value === flag).length > 1);
   const validTarget = targetIndex < 0 || (targetIndex + 1 < boundary && isLoopbackTarget(targetOrigin));
-  if (laneIndex < 0 || !lane || boundary < 0 || boundary === argv.length - 1 || (lane !== "subscription" && lane !== "managed") || !validTarget || beforeBoundary.some((value) => !["--lane", lane, "--target", targetOrigin, "--pxpipe"].includes(value))) {
-    throw new Error("usage: ccshield launch --lane subscription|managed [--target http://127.0.0.1:port | --pxpipe] -- command [args...]");
+  if (laneIndex < 0 || !lane || boundary < 0 || boundary === argv.length - 1 || (lane !== "subscription" && lane !== "managed") || !validTarget || repeated || beforeBoundary.some((value) => !["--lane", lane, "--target", targetOrigin, "--pxpipe", "--allow-unscanned-images"].includes(value))) {
+    throw new Error("usage: ccshield launch --lane subscription|managed [--target http://127.0.0.1:port | --pxpipe] [--allow-unscanned-images] -- command [args...]");
   }
   if (lane === "managed" && (targetOrigin || pxpipe)) throw new Error("managed Shield launch requires AirKit lease lifecycle");
   if (pxpipe && targetOrigin) throw new Error("shield launch accepts --target or --pxpipe, not both");
-  return { lane, targetOrigin, pxpipe, command: argv[boundary + 1], args: argv.slice(boundary + 2) };
+  return { lane, targetOrigin, pxpipe, allowUnscannedImages, command: argv[boundary + 1], args: argv.slice(boundary + 2) };
 }
 
 function isLoopbackTarget(value) { try { const url = new URL(value); return url.protocol === "http:" && url.hostname === "127.0.0.1" && Number.isInteger(Number(url.port)) && Number(url.port) > 0 && url.pathname === "/" && !url.search && !url.hash; } catch { return false; } }
@@ -362,7 +365,7 @@ function parsePolicyInstall(argv) {
 }
 
 function renderShieldHelp() {
-  return `Commands:\n  ccshield install [--lane subscription|managed] [--gitleaks-path /absolute/gitleaks] [--write]\n  ccshield uninstall [--lane subscription|managed] [--write]\n  ccshield start [--lane subscription|managed]\n  ccshield stop [--lane subscription|managed]\n  ccshield status [--lane subscription|managed]\n  ccshield doctor [--lane subscription|managed]\n  ccshield policy <status [--lane subscription|managed]|install --bundle /absolute/policy-bundle --public-key /absolute/policy-public-key [--lane subscription|managed] [--write]>\n  ccshield privacy provision --gitleaks /absolute/gitleaks --gitleaks-rules /absolute/gitleaks-rules.toml [--bundle /absolute/privacy-manifest] [--policy-bundle /absolute/policy-bundle] [--lane subscription|managed] [--write]\n  ccshield image provision [--image-source /absolute/image-worker.swift] [--lane subscription|managed] [--write]\n  ccshield launch --lane subscription|managed [--target http://127.0.0.1:port] -- command [args...]\n`;
+  return `Commands:\n  ccshield install [--lane subscription|managed] [--gitleaks-path /absolute/gitleaks] [--write]\n  ccshield uninstall [--lane subscription|managed] [--write]\n  ccshield start [--lane subscription|managed]\n  ccshield stop [--lane subscription|managed]\n  ccshield status [--lane subscription|managed]\n  ccshield doctor [--lane subscription|managed]\n  ccshield policy <status [--lane subscription|managed]|install --bundle /absolute/policy-bundle --public-key /absolute/policy-public-key [--lane subscription|managed] [--write]>\n  ccshield privacy provision --gitleaks /absolute/gitleaks --gitleaks-rules /absolute/gitleaks-rules.toml [--bundle /absolute/privacy-manifest] [--policy-bundle /absolute/policy-bundle] [--lane subscription|managed] [--write]\n  ccshield image provision [--image-source /absolute/image-worker.swift] [--lane subscription|managed] [--write]\n  ccshield launch --lane subscription|managed [--target http://127.0.0.1:port] [--allow-unscanned-images] -- command [args...]\n`;
 }
 
 function renderShieldResult(command, result = {}) {

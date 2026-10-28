@@ -80,6 +80,9 @@ of the daemon that is running now:
 | `pending` | A worker is pinned and its startup readiness check is running (~30 s for the first Vision request). Image requests fail with 503 until it passes. |
 | `ocr-text` | Readiness passed. Images are OCR'd, scanned by Gitleaks and Privacy, and forwarded only as masked PNGs. |
 | `unavailable` | Readiness failed. Image requests fail with 503 until the daemon restarts. |
+| `unscanned-override` | At least one running launch was started with `ccshield launch --allow-unscanned-images`. That launch's images go out without OCR and each such request is audited with `media_outcome: unscanned_override`; its text is still scanned, masked or blocked. Other launches are unaffected. The override lives only in daemon memory and ends when the launch exits. |
+
+A pending readiness 503 carries `retry-after: 30` and asks you to retry in about 30 s. A failed readiness 503 tells you to relaunch with `--allow-unscanned-images` (images only, this launch) or, from `claude-sub`, `--no-shield` (Shield off entirely).
 
 `ocr-text` means the text Vision can read, not every visual detail. With a
 pinned worker the policy bundle must name it (`detectorVersions.image`), and

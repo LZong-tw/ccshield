@@ -76,6 +76,9 @@ export async function startShieldDaemon({
   // Image coverage starts as `pending` with a worker and changes once its
   // background readiness check settles; the identity is republished then.
   let imageCoverage = image ? "pending" : "unscanned";
+  // Launches started with --allow-unscanned-images; in memory only, so a
+  // restart returns every launch to fail-closed.
+  let imageOverrides = 0;
   let publish = null;
   let closed = false;
   const close = async () => {
@@ -116,7 +119,7 @@ export async function startShieldDaemon({
         },
       });
     }
-    const decide = async ({ body, signal, launcherContext: requestLauncherContext = null, detectorVersions: keyedVersions }) => {
+    const decide = async ({ body, signal, launcherContext: requestLauncherContext = null, detectorVersions: keyedVersions, allowUnscannedImages = false }) => {
       privacy.refresh();
       const detectorVersions = keyedVersions ?? privacy.detectorVersions();
       const launcherContext = {
@@ -131,8 +134,9 @@ export async function startShieldDaemon({
         throw shieldFailure("media_scan", "media_scan_failed", "shield media scan failed");
       }
       const hasMedia = media.imageCount > 0 || media.documentCount > 0 || media.reasonCodes.length > 0;
+      const overridden = allowUnscannedImages && media.images.length > 0 && media.reasonCodes.length === 0;
       const mediaFacts = hasMedia
-        ? { noCache: true, imageCount: media.imageCount, documentCount: media.documentCount, mediaOutcome: mediaOutcomeFor(media.reasonCodes) ?? "none" }
+        ? { noCache: true, imageCount: media.imageCount, documentCount: media.documentCount, mediaOutcome: mediaOutcomeFor(media.reasonCodes) ?? (overridden ? "unscanned_override" : "none") }
         : {};
       const shape = (decision) => ({
         ...decision,
@@ -151,8 +155,12 @@ export async function startShieldDaemon({
       let imageSecrets = 0;
       let imagePii = [];
       let imageTransforms = 0;
-      if (images && media.images.length > 0) {
-        if (!images.isReady()) throw shieldFailure("image_scan", "image_unavailable", "shield image worker is not ready");
+      if (images && media.images.length > 0 && !overridden) {
+        if (!images.isReady()) {
+          throw imageCoverage === "pending"
+            ? shieldFailure("image_scan", "image_pending", "shield image worker is still starting", { retryAfterSeconds: 30 })
+            : shieldFailure("image_scan", "image_unavailable", "shield image worker is not ready");
+        }
         let results;
         try {
           results = await images.inspect(media.images.map(({ bytes, lastTurn }) => ({ bytes, lastTurn })));
@@ -238,6 +246,10 @@ export async function startShieldDaemon({
       isReady: async () => Boolean(await recorder.isReady?.() ?? true) && Boolean(await privacy.isReady?.()),
       scanStats: () => privacy.recentScans(),
       scanTotals: () => privacy.scanTotals(),
+      onImageOverrideChange: (count) => {
+        imageOverrides = count;
+        if (publish && !closed) publish().catch(() => process.stderr.write("ccshieldd: could not republish image coverage\n"));
+      },
     });
     publish = () => writeIdentity({
       paths,
@@ -251,7 +263,7 @@ export async function startShieldDaemon({
         targetClass: config.targetClass,
         policyVersion: policy.version,
         detectorVersions: policy.detectorVersions,
-        media: { documents: DOCUMENT_COVERAGE, images: imageCoverage },
+        media: { documents: DOCUMENT_COVERAGE, images: imageOverrides > 0 ? "unscanned-override" : imageCoverage },
       },
     });
     await publish();
@@ -315,7 +327,7 @@ function canonicalPrivacyFindings(findings) {
   return [...totals].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)).map(([category, count]) => Object.freeze({ category, count }));
 }
 
-const IMAGE_FAILURES = new Set(["image_unavailable", "image_timeout", "image_queue_full", "image_scan_unavailable", "image_splice_invalid"]);
+const IMAGE_FAILURES = new Set(["image_pending", "image_unavailable", "image_timeout", "image_queue_full", "image_scan_unavailable", "image_splice_invalid"]);
 
 function withImageSecrets(findings, count) {
   if (count === 0) return findings;
