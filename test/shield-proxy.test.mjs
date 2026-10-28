@@ -21,16 +21,17 @@ const CAPABILITY = "c".repeat(32);
 const CONTROL_CAPABILITY = "d".repeat(32);
 const LAUNCH_A = "1".repeat(32);
 const LAUNCH_B = "2".repeat(32);
-// Worst case is 16 failures, 32 recent scans with a graph detail and saturated totals with every field at its bound: ~8.7 KB.
+// Worst case is 16 failures, 32 recent scans with a graph detail and saturated totals with every field at its bound, disk counters included: 9,302 bytes.
 const DIAGNOSTICS_MAX_BYTES = 12_288;
 
 test("diagnostics size limit covers the worst-case payload", () => {
   const reason = "conflicting-protocol-context";
   const max = 4_294_967_295;
   const failure = { stage: "privacy_scan", reason, bytes: 1_048_576, elapsedMs: 3_600_000 };
-  const scan = { status: "unavailable", reason, detail: "duplicate", hits: 65_536, misses: 65_536, segmentHits: 65_536, segmentMisses: 65_536, attached: 8, elapsedMs: 3_600_000, queuedMs: 3_600_000 };
+  const scan = { status: "unavailable", reason, detail: "duplicate", hits: 65_536, misses: 65_536, diskHits: 65_536, segmentHits: 65_536, segmentMisses: 65_536, attached: 8, elapsedMs: 3_600_000, queuedMs: 3_600_000 };
   const failuresByReason = Object.fromEntries(["admission_limit", "queue_timeout", "scan_timeout", "model_timeout", "model_error", "model_killed", "worker_unavailable", "other"].map((key) => [key, max]));
-  const totals = { scans: max, ok: max, unknown: max, unavailable: max, coalesced: max, aborted: max, failuresByReason };
+  const totals = { scans: max, ok: max, unknown: max, unavailable: max, coalesced: max, aborted: max,
+    diskHits: max, diskMisses: max, diskWrites: max, diskErrors: max, failuresByReason };
   const bytes = Buffer.byteLength(JSON.stringify({ failures: Array(16).fill(failure), scans: Array(32).fill(scan), totals }));
   assert.equal(bytes < DIAGNOSTICS_MAX_BYTES, true, `worst-case diagnostics are ${bytes} bytes`);
 });
@@ -173,7 +174,7 @@ test("diagnostics separate real daemon scan, policy and redaction failures while
   assert.doesNotMatch(JSON.stringify(await readDiagnostics(daemon.shield)), /body-secret|prediction-secret|credential-secret|scanner-secret|policy-secret|audit-secret|worker-private-secret|fixture|requestId/);
   const { scans } = await readDiagnostics(daemon.shield);
   assert.equal(Array.isArray(scans) && scans.length > 0 && scans.length <= 32, true);
-  for (const scan of scans) assert.deepEqual(Object.keys(scan).sort(), ["attached", "elapsedMs", "hits", "misses", "queuedMs", "reason", "segmentHits", "segmentMisses", "status"]);
+  for (const scan of scans) assert.deepEqual(Object.keys(scan).sort(), ["attached", "diskHits", "elapsedMs", "hits", "misses", "queuedMs", "reason", "segmentHits", "segmentMisses", "status"]);
 });
 
 test("a client disconnect aborts the daemon's privacy scan and frees its queued admission slot", async (t) => {
@@ -234,13 +235,16 @@ test("a client disconnect aborts the daemon's privacy scan and frees its queued 
   assert.deepEqual((await Promise.all([...held, late])).map((result) => result.reason), Array(4).fill("worker_closed"));
 });
 
-test("admission and queue failures reach the client as a Retry-After header, other 503s do not", async (t) => {
+test("admission, queue and cooperative model timeouts reach the client as a Retry-After header, other 503s do not", async (t) => {
   const upstream = await startFixture(t, async () => assert.fail("a failed decision must never forward"));
   const decisionContext = { lane: "subscription", destinationClass: "subscription", policyVersion: "policy-1", detectorVersions: { gitleaks: "1", privacy: "1" } };
   for (const [reason, retryAfterSeconds, expected, cached] of [
     ["admission_limit", 7, "7", false],
     ["queue_timeout", 60, "60", false],
     ["admission_limit", 12, "12", true],
+    ["model_timeout", 7, "7", false],
+    ["model_timeout", 61, null, false],
+    ["model_killed", 7, null, false],
     ["scan_timeout", 7, null, false],
     ["worker_unavailable", 7, null, false],
     ["admission_limit", 0, null, false],

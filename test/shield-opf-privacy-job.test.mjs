@@ -135,6 +135,8 @@ test("a successful first run provisions privacy and the running daemon swaps to 
   assert.equal(basename(worker), "privacy-opf-worker.mjs");
   assert.equal((await stat(worker)).mode & 0o777, 0o755);
   assert.equal(box.record.privacy.checkpoint.path, join(bundle.checkpoint, "original"));
+  const args = box.record.privacy.worker.args;
+  assert.equal(args[args.indexOf("--scan-timeout-ms") + 1], "240000", "each scan gets the 240-second request budget");
 
   advance(1000);
   await privacy.refresh();

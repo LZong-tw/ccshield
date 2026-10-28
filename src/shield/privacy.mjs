@@ -6,12 +6,14 @@ import { dirname, isAbsolute, resolve } from "node:path";
 import { envNamesFor, readEnv } from "../compat-env.mjs";
 import { attestShieldCheckpoint } from "./checkpoint.mjs";
 import { isValidOpfWorkerArgs } from "./opf-args.mjs";
+import { laneWindowCachePath } from "./paths.mjs";
 import { PRIVACY_PROTOCOL as PROTOCOL } from "./protocol.mjs";
 const MAX_BODY_BYTES = 1_048_576;
 const MAX_FRAME_BYTES = 4 * 1_048_576; // base64 redacted body (≤1 MiB → ~1.4 MiB) plus findings must fit
 const DEFAULT_TIMEOUT_MS = 2_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
 const MAX_ADMITTED_SCANS = 4;
+const DISK_COUNTS = ["diskHits", "diskMisses", "diskWrites", "diskErrors"];
 const MAX_ATTACHED_WAITERS = 8;
 const RECENT_SCANS = 32;
 const MAX_WINDOW_COUNT = 65_536;
@@ -39,15 +41,18 @@ const KNOWN_LABELS = new Set([
   "private_phone", "private_url", "private_date", "secret",
 ]);
 
-export async function createPrivacyFilter({ provision, spawnWorker = defaultSpawnWorker, validateWorker = validatePrivacyWorkerAsset, validateCheckpoint = attestShieldCheckpoint, validateFile = validatePrivacyPinnedFile, timeoutMs, startupTimeoutMs } = {}) {
+export async function createPrivacyFilter({ provision, paths, spawnWorker = defaultSpawnWorker, validateWorker = validatePrivacyWorkerAsset, validateCheckpoint = attestShieldCheckpoint, validateFile = validatePrivacyPinnedFile, timeoutMs, startupTimeoutMs } = {}) {
   const privacy = assertPrivacyProvision(provision);
+  // Without lane paths (the self-test) the OPF worker keeps its cache in memory.
+  const windowCacheArgs = privacy.checkpoint && paths !== undefined ? ["--window-cache-dir", laneWindowCachePath(paths)] : [];
   const startupBudgetMs = startupTimeoutMs ?? (privacy.checkpoint ? 60_000 : DEFAULT_STARTUP_TIMEOUT_MS);
-  const scanTimeoutMs = timeoutMs ?? (privacy.checkpoint ? Number(privacy.worker.args[21]) + 1_000 : DEFAULT_TIMEOUT_MS);
+  // One budget per request, from admission to reply: queueing, startup and the scan all spend it.
+  const scanTimeoutMs = timeoutMs ?? (privacy.checkpoint ? Number(privacy.worker.args[21]) : DEFAULT_TIMEOUT_MS);
   if (typeof spawnWorker !== "function") throw new TypeError("shield privacy worker launcher is required");
   if (typeof validateWorker !== "function") throw new TypeError("shield privacy worker validator is required");
   if (typeof validateCheckpoint !== "function") throw new TypeError("shield privacy checkpoint validator is required");
   if (typeof validateFile !== "function") throw new TypeError("shield privacy file validator is required");
-  if (!Number.isInteger(scanTimeoutMs) || scanTimeoutMs < 1 || scanTimeoutMs > (privacy.checkpoint ? 61_000 : 30_000)) throw new TypeError("shield privacy worker timeout is invalid");
+  if (!Number.isInteger(scanTimeoutMs) || scanTimeoutMs < 1 || scanTimeoutMs > (privacy.checkpoint ? 240_000 : 30_000)) throw new TypeError("shield privacy worker timeout is invalid");
   if (!Number.isInteger(startupBudgetMs) || startupBudgetMs < 1 || startupBudgetMs > 60_000) throw new TypeError("shield privacy startup timeout is invalid");
 
   let assertCheckpointUnchanged;
@@ -61,6 +66,7 @@ export async function createPrivacyFilter({ provision, spawnWorker = defaultSpaw
   const recent = [];
   const totals = {
     scans: 0, ok: 0, unknown: 0, unavailable: 0, coalesced: 0, aborted: 0,
+    diskHits: 0, diskMisses: 0, diskWrites: 0, diskErrors: 0,
     failuresByReason: Object.fromEntries([...TOTAL_FAILURE_REASONS, "other"].map((reason) => [reason, 0])),
   };
   const count = (counts, key) => { counts[key] = Math.min(MAX_TOTAL, counts[key] + 1); };
@@ -168,7 +174,7 @@ export async function createPrivacyFilter({ provision, spawnWorker = defaultSpaw
     try {
       worker = spawnWorker({
         command: privacy.checkpoint ? process.execPath : privacy.worker.command,
-        args: privacy.checkpoint ? [privacy.worker.command, ...privacy.worker.args] : privacy.worker.args,
+        args: privacy.checkpoint ? [privacy.worker.command, ...privacy.worker.args, ...windowCacheArgs] : privacy.worker.args,
         shell: false,
         stdio: ["pipe", "pipe", "pipe"],
       });
@@ -221,13 +227,29 @@ export async function createPrivacyFilter({ provision, spawnWorker = defaultSpaw
       .finally(() => { clearTimeout(timer); starting = null; });
     return await starting;
   };
-  // Seconds until the backlog should clear: waiting plus active scans at the recent median scan time.
+  // Median time of recent cold scans: mostly misses, or no window counts at all (the regex worker). Hot scans
+  // finish from cache in a fraction of the time and would understate what a backlog costs.
+  const coldMs = () => {
+    const times = recent.filter((scan) => scan.hits === null || (scan.misses > 0 && scan.misses >= scan.hits))
+      .map((scan) => scan.elapsedMs).sort((left, right) => left - right);
+    return times.length === 0 ? null : times[Math.floor(times.length / 2)];
+  };
+  const retryAfter = (estimateMs) => Math.min(60, Math.max(1, Math.ceil(estimateMs / 1000)));
+  // Seconds until the backlog should clear: waiting plus active scans at the cold median.
   const retryLater = (reason) => {
-    const times = recent.map((scan) => scan.elapsedMs).sort((left, right) => left - right);
-    const estimateMs = times.length === 0
-      ? scanTimeoutMs
-      : (queue.length + Number(active !== null)) * times[Math.floor(times.length / 2)];
-    return Object.freeze({ ...unavailable(reason), retryAfterSeconds: Math.min(60, Math.max(1, Math.ceil(estimateMs / 1000))) });
+    const cold = coldMs();
+    const estimateMs = cold === null ? scanTimeoutMs : (queue.length + Number(active !== null)) * cold;
+    return Object.freeze({ ...unavailable(reason), retryAfterSeconds: retryAfter(estimateMs) });
+  };
+  // OPF scans can take minutes; refuse now, rather than at queue timeout, a scan that could not start within its
+  // budget behind the cold work ahead of it. Without a cold sample nothing is projected.
+  const projectedRefusal = () => {
+    const cold = privacy.checkpoint && active !== null ? coldMs() : null;
+    if (cold === null) return null;
+    const now = Date.now();
+    const activeEnd = Math.min(Math.max(now, (active.dispatchedAt ?? now) + cold), active.admittedAt + scanTimeoutMs);
+    const startMs = activeEnd + queue.length * cold - now;
+    return startMs > scanTimeoutMs ? Object.freeze({ ...unavailable("admission_limit"), retryAfterSeconds: retryAfter(startMs) }) : null;
   };
   const drain = async () => {
     if (closed || active || queue.length === 0) return;
@@ -239,6 +261,7 @@ export async function createPrivacyFilter({ provision, spawnWorker = defaultSpaw
     let segments = null;
     let detail = null;
     const dispatchedAt = Date.now();
+    entry.dispatchedAt = dispatchedAt;
     try {
       if (!await ensureWorker() || entry.settled) return;
       const session = current;
@@ -251,7 +274,16 @@ export async function createPrivacyFilter({ provision, spawnWorker = defaultSpaw
         } catch { close("assets_invalid"); return; }
       }
       if (entry.settled || closed || current !== session) return;
-      const reply = await request(session, { type: "scan", body: entry.body.toString("base64") }, scanTimeoutMs);
+      let reply;
+      if (privacy.checkpoint) {
+        // OPF spends one budget from admission: queueing and model startup count. The worker enforces it and
+        // kills Python at budget + 5 s; this deadline only backs that up.
+        const budgetMs = entry.admittedAt + scanTimeoutMs - Date.now();
+        if (budgetMs <= 0) { result = retryLater("queue_timeout"); return; }
+        reply = await request(session, { type: "scan", body: entry.body.toString("base64"), budgetMs }, budgetMs + 6_000);
+      } else {
+        reply = await request(session, { type: "scan", body: entry.body.toString("base64") }, scanTimeoutMs);
+      }
       result = normalizeScanReply(reply);
       cache = windowCounts(reply);
       segments = segmentCounts(reply);
@@ -262,6 +294,7 @@ export async function createPrivacyFilter({ provision, spawnWorker = defaultSpaw
       entry.settle(result);
       // Record what the caller actually received; close() or a stopped worker may have settled it first.
       const own = entry.outcome === result;
+      if (own && cache) for (const name of DISK_COUNTS) if (cache[name] !== undefined) totals[name] = Math.min(MAX_TOTAL, totals[name] + cache[name]);
       recordScan(recent, {
         status: entry.outcome.status, reason: entry.outcome.reason ?? null, cache: own ? cache : null, segments: own ? segments : null,
         detail: own ? detail : null, attached: entry.attached, elapsedMs: Date.now() - dispatchedAt, queuedMs: dispatchedAt - entry.admittedAt,
@@ -315,6 +348,8 @@ export async function createPrivacyFilter({ provision, spawnWorker = defaultSpaw
       return await new Promise((resolve) => addWaiter(shared, resolve, signal));
     }
     if (queue.length + Number(active !== null) >= MAX_ADMITTED_SCANS) return retryLater("admission_limit");
+    const refusal = projectedRefusal();
+    if (refusal) return refusal;
     return await new Promise((resolve) => {
       const entry = {
         body: Buffer.from(body), settled: false, attached: 0, waiters: new Set(), admittedAt: Date.now(),
@@ -331,7 +366,7 @@ export async function createPrivacyFilter({ provision, spawnWorker = defaultSpaw
       };
       if (!inflight.has(digest)) inflight.set(digest, entry);
       addWaiter(entry, resolve, signal);
-      // Waiting has its own bounded deadline; scan time begins only at dispatch.
+      // Waiting has its own bounded deadline; for OPF it is the same budget the scan later runs on.
       entry.timer = setTimeout(() => {
         const index = queue.indexOf(entry);
         if (index !== -1) queue.splice(index, 1);
@@ -393,7 +428,9 @@ function recoveringHealth(reply) {
 function windowCounts(reply) {
   const cache = reply?.cache;
   const count = (value) => Number.isSafeInteger(value) && value >= 0 && value <= MAX_WINDOW_COUNT;
-  return isPlainObject(cache) && count(cache.hits) && count(cache.misses) ? { hits: cache.hits, misses: cache.misses } : null;
+  if (!isPlainObject(cache) || !count(cache.hits) || !count(cache.misses)) return null;
+  const disk = Object.fromEntries(DISK_COUNTS.filter((name) => count(cache[name])).map((name) => [name, cache[name]]));
+  return { hits: cache.hits, misses: cache.misses, ...disk };
 }
 
 function segmentCounts(reply) {
@@ -415,7 +452,7 @@ function recordScan(recent, { status, reason, cache, segments, detail, attached,
   const boundedMs = (value) => Math.min(3_600_000, Math.max(0, Math.floor(value)));
   // elapsedMs is worker time from dispatch; queuedMs is the wait from admission to dispatch.
   recent.push({
-    status, reason, ...(detail ? { detail } : {}), hits: cache?.hits ?? null, misses: cache?.misses ?? null,
+    status, reason, ...(detail ? { detail } : {}), hits: cache?.hits ?? null, misses: cache?.misses ?? null, diskHits: cache?.diskHits ?? null,
     segmentHits: segments?.hits ?? null, segmentMisses: segments?.misses ?? null,
     attached: Math.min(MAX_ATTACHED_WAITERS, attached), elapsedMs: boundedMs(elapsedMs), queuedMs: boundedMs(queuedMs),
   });
@@ -425,7 +462,11 @@ function recordScan(recent, { status, reason, cache, segments, detail, attached,
 function normalizeScanReply(reply) {
   if (reply?.[REQUEST_FAILURE] === true) return unavailable(reply.reason);
   if (!isPlainObject(reply) || reply.type !== "scan" || typeof reply.status !== "string") return unavailable("reply_invalid");
-  if (reply.status === "unknown") return Object.freeze({ status: "unknown", findings: Object.freeze([]), reason: ADAPTER_UNKNOWN_REASONS.has(reply.reason) ? reply.reason : "privacy_unavailable" });
+  if (reply.status === "unknown") {
+    const reason = ADAPTER_UNKNOWN_REASONS.has(reply.reason) ? reply.reason : "privacy_unavailable";
+    const retry = reason === "model_timeout" && Number.isInteger(reply.retryAfterSeconds) && reply.retryAfterSeconds >= 1 && reply.retryAfterSeconds <= 60;
+    return Object.freeze({ status: "unknown", findings: Object.freeze([]), reason, ...(retry ? { retryAfterSeconds: reply.retryAfterSeconds } : {}) });
+  }
   if (reply.status !== "ok" || !Array.isArray(reply.findings) || reply.findings.length > 128) return unavailable("reply_invalid");
   const findings = [];
   for (const finding of reply.findings) {

@@ -32,6 +32,7 @@ export function shieldPaths({ env = process.env, homeDir = homeFromEnv(env), uid
     imageProvisionPath: childPath(join(root, "image-provision.json"), root, "imageProvisionPath"),
     socketPath: childPath(socketPath ?? join(root, "shield.sock"), root, "socketPath"),
     auditDatabasePath: childPath(join(root, "audit.sqlite"), root, "auditDatabasePath"),
+    windowCachePath: childPath(join(root, "opf-window-cache"), root, "windowCachePath"),
     platform: linux ? "linux" : "darwin",
   };
   if (linux) {
@@ -305,6 +306,14 @@ function assertWritablePaths(paths) {
 
 function assertLane(lane) {
   if (lane !== "subscription" && lane !== "managed") throw new Error("shield lane must be subscription or managed");
+}
+
+// The OPF disk tier is per lane; only a shieldPaths() object may name it.
+export function laneWindowCachePath(paths) {
+  if (!canonicalShieldPaths.has(paths) || paths.windowCachePath !== join(paths.rootDir, "opf-window-cache")) {
+    throw new Error("shield window cache paths must use the canonical ccshield state layout");
+  }
+  return paths.windowCachePath;
 }
 
 function assertCanonicalPolicyStatePath(paths) {

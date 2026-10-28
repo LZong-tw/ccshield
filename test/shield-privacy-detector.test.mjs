@@ -16,17 +16,22 @@ function fakeFilter(version, log) {
   };
 }
 
+const lanePaths = Object.freeze({ lane: "subscription" });
+
 function harness({ assets, stored = assets, probe = async () => {}, failures = [] } = {}) {
   const log = [];
   let now = 0;
   const state = { stored };
   const created = [];
+  const lanes = [];
   const detector = openPrivacyDetector({
+    paths: lanePaths,
     assets,
     policy,
     readAssets: async () => state.stored,
-    createPrivacy: async ({ provision }) => {
+    createPrivacy: async ({ provision, paths }) => {
       created.push(provision.privacy.version);
+      lanes.push(paths);
       return fakeFilter(provision.privacy.version, log);
     },
     probe,
@@ -34,7 +39,7 @@ function harness({ assets, stored = assets, probe = async () => {}, failures = [
     recheckMs: 1000,
     onOpfFailure: (error) => failures.push(error.message),
   });
-  return { detector, log, state, created, advance: (ms) => { now += ms; } };
+  return { detector, log, state, created, lanes, advance: (ms) => { now += ms; } };
 }
 
 test("the daemon starts on the regex fallback while OPF is absent", async () => {
@@ -50,6 +55,15 @@ test("a verified OPF provision is used directly and regex is never started", asy
   const privacy = await detector;
   assert.deepEqual(created, ["privacy-1"]);
   assert.equal(privacy.detectorVersions().privacy, "privacy-1");
+});
+
+test("only the OPF filter is given the lane paths for its window cache", async () => {
+  const opfFirst = harness({ assets: { privacy: opfAssets, regex: regexAssets } });
+  await opfFirst.detector;
+  assert.deepEqual(opfFirst.lanes, [lanePaths]);
+  const regexOnly = harness({ assets: { privacy: { state: "absent" }, regex: regexAssets } });
+  await regexOnly.detector;
+  assert.deepEqual(regexOnly.lanes, [undefined]);
 });
 
 test("without a signed fallback naming the installed regex worker the daemon refuses to start", async () => {

@@ -18,7 +18,7 @@ const MAX_BODY_BYTES = 1_048_576;
 const MAX_SCANS = 4;
 const HELPERS = {
   "opf-cpu-grouped.py": "adb9dd7d6f47e482ccb0925e621a1375461b997833dfa5be6dfc67b9d58b6f0e",
-  "opf-window-cache.py": "e5c38fa18d71767b939c659ededbc063ea40a1d6fa235ec920a8d718bc832f9b",
+  "opf-window-cache.py": "6cab80adb4f510613e446bb6cffa43a2c9f304fb57957b45dd5f873cd894a149",
   "opf-mmap-weights.py": "8be0f49097d7317937ebe7572b09619925b0c10044f0376d6438f31400485bbc",
   "opf-viterbi-deadline.py": "6fbfb16aae67c6eecacc292f8d41dda13cbe7d6792d8c2be97b8d629cc590117",
 };
@@ -94,7 +94,9 @@ try:
     for module in attention:
         module.qkv.float()
         module.out.float()
-    cache = cache_module.ExactWindowLogitsCache(runtime.model, namespace=sys.argv[5])
+    cache_dir, cache_mib = sys.argv[9], int(sys.argv[10])
+    disk = cache_module.DiskTier(cache_dir, max_bytes=cache_mib << 20) if cache_dir and cache_mib > 0 else None
+    cache = cache_module.ExactWindowLogitsCache(runtime.model, namespace=sys.argv[5], disk=disk)
     runtime.model.forward = cache.forward
     blocks = [module for module in runtime.model.modules() if isinstance(module, (TransformerBlock, MLPBlock))]
     if not any(isinstance(module, TransformerBlock) for module in blocks) or not any(isinstance(module, MLPBlock) for module in blocks):
@@ -123,18 +125,23 @@ try:
     if not decode_calls[0]:
         raise RuntimeError("viterbi deadline decode not invoked")
     scan_budget_ms = int(sys.argv[6])
-    cooperative_seconds = (scan_budget_ms - min(5000, scan_budget_ms / 5)) / 1000
     print(json.dumps({"ready": True}), flush=True)
 except Exception:
     print(json.dumps({"ready": False}), flush=True)
     sys.exit(1)
 
-def window_counts(before):
+DISK_COUNTS = {"disk_hits": "diskHits", "disk_misses": "diskMisses", "disk_writes": "diskWrites", "disk_errors": "diskErrors"}
+
+def window_counts(before, windows):
     after = cache.snapshot()
-    return {"hits": after["hits"] - before["hits"], "misses": after["misses"] - before["misses"]}
+    counts = {"hits": after["hits"] - before["hits"], "misses": after["misses"] - before["misses"]}
+    counts.update({name: after[key] - before[key] for key, name in DISK_COUNTS.items() if key in after})
+    if windows is not None:
+        counts["windows"] = windows
+    return counts
 
 import queue, threading
-from math import isfinite
+from math import ceil, isfinite
 from time import monotonic
 
 # A timed-out scan keeps warming its remaining windows while the worker is idle, so the caller's retry
@@ -151,7 +158,7 @@ inbox = queue.Queue()
 
 def read_requests():
     for line in sys.stdin:
-        inbox.put(line)
+        inbox.put((monotonic(), line))
     inbox.put(None)
 
 threading.Thread(target=read_requests, daemon=True).start()
@@ -176,35 +183,52 @@ while True:
     if warming is not None and inbox.empty():
         warm()
         continue
-    line = inbox.get()
-    if line is None:
+    item = inbox.get()
+    if item is None:
         break
+    received, line = item
     request = None
+    windows = None
     before = cache.snapshot()
     try:
         if torch.get_num_threads() != THREADS or torch.is_autocast_enabled("cpu"):
             raise RuntimeError("inference settings changed")
         request = json.loads(line)
-        cache.begin_scan(cooperative_seconds)
+        budget_ms = request["budgetMs"]
+        if type(budget_ms) is not int or not 1 <= budget_ms <= scan_budget_ms:
+            raise RuntimeError("invalid scan budget")
+        # The budget runs from when the frame arrived, so time spent behind warming or another scan counts.
+        seconds = budget_ms / 1000 - (monotonic() - received)
+        if seconds <= 0:
+            raise cache_module.CooperativeScanTimeout("scan budget spent before start")
+        # OPF windows are 4096 tokens with stride 4096, so this is exactly the forward count.
+        windows = max(1, ceil(len(runtime.encoding.encode(request["text"], allowed_special="all")) / 4096))
+        cache.begin_scan(seconds, total_windows=windows)
         result = model.redact(request["text"]).to_dict()
         cache.check_deadline()
-        reply = json.dumps({"id": request["id"], "prediction": result, "cache": window_counts(before)}, ensure_ascii=False)
+        reply = json.dumps({"id": request["id"], "prediction": result, "cache": window_counts(before, windows)}, ensure_ascii=False)
         cache.check_deadline()
         print(reply, flush=True)
         if warming is not None and warming[0] == request["text"]:
             warming = None
-    except cache_module.CooperativeScanTimeout:
+    except cache_module.CooperativeScanTimeout as timeout:
         warming = (request["text"], 0.0) if WARM_SECONDS > 0 else None
-        print(json.dumps({"id": request["id"], "error": "model_timeout", "warming": warming is not None, "cache": window_counts(before)}), flush=True)
+        reply = {"id": request["id"], "error": "model_timeout", "warming": warming is not None, "cache": window_counts(before, windows)}
+        if timeout.remaining_ms is not None:
+            reply["remainingMs"] = timeout.remaining_ms
+        print(json.dumps(reply), flush=True)
     except Exception:
         print(json.dumps({"id": request.get("id") if isinstance(request, dict) else None, "error": "unavailable"}), flush=True)
     finally:
         cache.end_scan()
 `;
 
+// The daemon appends --window-cache-dir for its lane; the self-test omits it and
+// runs on the memory cache alone.
 function options(args) {
-  if (args.length !== 22) throw new Error("invalid worker arguments");
-  const names = ["--python", "--checkpoint", "--checkpoint-sha256", "--checkpoint-version", "--opf-source", "--opf-source-sha256", "--adapter-sha256", "--tokenizer", "--tokenizer-sha256", "--startup-timeout-ms", "--scan-timeout-ms"];
+  if (args.length !== 24 && args.length !== 26) throw new Error("invalid worker arguments");
+  const names = ["--python", "--checkpoint", "--checkpoint-sha256", "--checkpoint-version", "--opf-source", "--opf-source-sha256", "--adapter-sha256", "--tokenizer", "--tokenizer-sha256", "--startup-timeout-ms", "--scan-timeout-ms", "--window-cache-max-mib"];
+  if (args.length === 26) names.push("--window-cache-dir");
   const value = {};
   for (let i = 0; i < names.length; i += 1) {
     if (args[i * 2] !== names[i]) throw new Error("invalid worker arguments");
@@ -220,16 +244,31 @@ function options(args) {
   if (value["--tokenizer"].split("/").at(-1) !== "fb374d419588a4632f3f557e76b4b70aebbca790") throw new Error("invalid tokenizer name");
   for (const name of ["--startup-timeout-ms", "--scan-timeout-ms"]) {
     const timeout = Number(value[name]);
-    if (!Number.isInteger(timeout) || timeout < 1 || timeout > (name === "--scan-timeout-ms" ? 60_000 : 30_000)) throw new Error("invalid worker timeout");
+    if (!Number.isInteger(timeout) || timeout < 1 || timeout > (name === "--scan-timeout-ms" ? 240_000 : 30_000)) throw new Error("invalid worker timeout");
     value[name] = timeout;
   }
+  const maxMib = Number(value["--window-cache-max-mib"]);
+  if (!Number.isInteger(maxMib) || String(maxMib) !== value["--window-cache-max-mib"] || (maxMib !== 0 && (maxMib < 16 || maxMib > 4096))) throw new Error("invalid window cache size");
+  value["--window-cache-max-mib"] = maxMib;
+  const dir = value["--window-cache-dir"];
+  if (dir !== undefined && (!isAbsolute(dir) || resolve(dir) !== dir)) throw new Error("invalid window cache directory");
   return value;
 }
 
+const OPTIONAL_COUNTS = ["diskHits", "diskMisses", "diskWrites", "diskErrors", "windows"];
+
 function windowCounts(value) {
   const count = (n) => Number.isSafeInteger(n) && n >= 0 && n <= 65_536;
-  return value && typeof value === "object" && count(value.hits) && count(value.misses)
-    ? { cache: { hits: value.hits, misses: value.misses } } : {};
+  if (!value || typeof value !== "object" || !count(value.hits) || !count(value.misses)) return {};
+  const cache = { hits: value.hits, misses: value.misses };
+  for (const name of OPTIONAL_COUNTS) if (count(value[name])) cache[name] = value[name];
+  return { cache };
+}
+
+// The projected time to finish the unscanned windows, which the idle worker keeps warming.
+function retryAfter(reply) {
+  const ms = reply?.remainingMs;
+  return Number.isSafeInteger(ms) && ms >= 0 ? { retryAfterSeconds: Math.min(60, Math.max(1, Math.ceil(ms / 1000))) } : {};
 }
 
 async function validateTokenizer(path, expected) {
@@ -374,7 +413,8 @@ async function main() {
     env.TIKTOKEN_CACHE_DIR = dirname(config["--tokenizer"]);
     const child = spawn(config["--python"], ["-I", "-B", "-u", "-c", PYTHON, config["--checkpoint"], config["--opf-source"],
       join(workerDir, "opf-cpu-grouped.py"), join(workerDir, "opf-window-cache.py"), namespace, String(config["--scan-timeout-ms"]),
-      join(workerDir, "opf-mmap-weights.py"), join(workerDir, "opf-viterbi-deadline.py")],
+      join(workerDir, "opf-mmap-weights.py"), join(workerDir, "opf-viterbi-deadline.py"),
+      config["--window-cache-dir"] ?? "", String(config["--window-cache-max-mib"])],
       { stdio: ["pipe", "pipe", "ignore"], env });
     const current = { child, ready: false, dead: false, waiting: null };
     current.exited = new Promise((resolve) => child.once("close", resolve));
@@ -454,30 +494,34 @@ async function main() {
     starting ??= restart().finally(() => { starting = null; });
     return starting;
   };
-  const query = (current, text) => new Promise((resolve) => {
+  // Python owns the budget; this backstop only fires when it stops answering.
+  const query = (current, text, budgetMs) => new Promise((resolve) => {
     if (current.dead) { resolve(null); return; }
     const id = createHash("sha256").update(String(Date.now())).update(String(Math.random())).digest("hex");
     let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; current.fail(); }, config["--scan-timeout-ms"]);
+    const timer = setTimeout(() => { timedOut = true; current.fail(); }, budgetMs + 5_000);
     current.waiting = (reply) => {
       clearTimeout(timer);
       if (reply && reply.id !== id) current.fail();
       resolve(reply?.id === id ? reply : { error: timedOut ? "model_killed" : "model_error" });
     };
-    current.child.stdin.write(`${JSON.stringify({ id, text })}\n`);
+    current.child.stdin.write(`${JSON.stringify({ id, text, budgetMs })}\n`);
   });
   const handle = async (request, current) => {
     if (request.type !== "scan" || !validBase64(request.body)) return { type: request.type, id: request.id, status: "unknown" };
+    const budgetMs = request.budgetMs ?? config["--scan-timeout-ms"];
+    if (!Number.isInteger(budgetMs) || budgetMs < 1 || budgetMs > config["--scan-timeout-ms"]) return { type: "scan", id: request.id, status: "unknown" };
     try {
       const original = Buffer.from(request.body, "base64");
       if (original.length === 0 || original.length > MAX_BODY_BYTES) throw new Error("invalid body");
       const scan = prepareOpfScan(original);
       if (scan.text === "") return { type: "scan", id: request.id, status: "ok", findings: [] };
-      const reply = current ? await query(current, scan.text) : null;
+      const reply = current ? await query(current, scan.text, budgetMs) : null;
       // Window cache hits and misses per scan, so retry convergence is visible without any request content.
       const cache = windowCounts(reply?.cache);
+      if (reply?.error === "model_timeout") return { type: "scan", id: request.id, status: "unknown", reason: "model_timeout", ...retryAfter(reply), ...cache };
       if (reply?.error || !reply?.prediction) return { type: "scan", id: request.id, status: "unknown",
-        reason: ["model_timeout", "model_killed"].includes(reply?.error) ? reply.error : "model_error", ...cache };
+        reason: reply?.error === "model_killed" ? "model_killed" : "model_error", ...cache };
       return { type: "scan", id: request.id, ...adaptOpfPrediction(original, scan, reply.prediction), ...cache };
     } catch { return { type: "scan", id: request.id, status: "unknown" }; }
   };

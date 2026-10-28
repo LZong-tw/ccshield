@@ -10,7 +10,7 @@ import { MANIFEST_FORMAT_VERSION, provisionPrivacyRecord } from "./provision.mjs
 export const DEFAULT_OPF_SOURCE_DIR = fileURLToPath(new URL("../../detectors/opf/", import.meta.url));
 const WORKER_NAME = "privacy-opf-worker.mjs";
 // The CPU-only worker needs the widest scan bound the protocol allows.
-const SCAN_TIMEOUT_MS = 60_000;
+const SCAN_TIMEOUT_MS = 240_000;
 
 // Turns a verified OPF bundle into the manifest `ccshield privacy` accepts and
 // provisions it through the same path, so the daemon swaps off regex on its

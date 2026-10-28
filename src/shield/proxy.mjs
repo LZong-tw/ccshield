@@ -402,9 +402,12 @@ export function createShieldFailure(stage, reason, message, { retryAfterSeconds 
   });
 }
 
-// Only a full queue is worth retrying later; the estimate comes from the privacy filter.
+// Only a full queue, a cooperative model timeout (whose worker keeps warming the unscanned windows), or an
+// image scan still in progress is worth retrying later; the estimate comes from the scanner.
+const RETRYABLE_PRIVACY_REASONS = new Set(["admission_limit", "queue_timeout", "model_timeout"]);
 function validRetryAfter({ stage, reason, retryAfterSeconds }) {
-  const retryable = (stage === "privacy_scan" && (reason === "admission_limit" || reason === "queue_timeout")) || (stage === "image_scan" && reason === "image_pending");
+  const retryable =
+    (stage === "privacy_scan" && RETRYABLE_PRIVACY_REASONS.has(reason)) || (stage === "image_scan" && reason === "image_pending");
   return retryable && Number.isInteger(retryAfterSeconds) && retryAfterSeconds >= 1 && retryAfterSeconds <= 60
     ? retryAfterSeconds
     : undefined;

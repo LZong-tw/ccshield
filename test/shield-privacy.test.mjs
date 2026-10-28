@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { buildOpfWorkerArgs } from "../src/shield/opf-args.mjs";
+import { shieldPaths } from "../src/shield/paths.mjs";
 import { attestShieldCheckpoint } from "../src/shield/checkpoint.mjs";
 import { createPrivacyFilter, isVerifiedRedaction, privacyWorkerEnv, runPrivacyWorkerSelfTest } from "../src/shield/privacy.mjs";
 
@@ -25,14 +27,8 @@ const opfProvision = {
     tokenizer: { path: "/opt/ccshield/tiktoken-cache/fb374d419588a4632f3f557e76b4b70aebbca790", sha256: "e".repeat(64), version: "o200k_base" },
   },
 };
-opfProvision.privacy.worker = { ...opfProvision.privacy.worker, args: [
-  "--python", "/opt/ccshield/python", "--checkpoint", opfProvision.privacy.checkpoint.path,
-  "--checkpoint-sha256", opfProvision.privacy.checkpoint.sha256, "--checkpoint-version", opfProvision.privacy.checkpoint.version,
-  "--opf-source", opfProvision.privacy.source.path, "--opf-source-sha256", opfProvision.privacy.source.sha256,
-  "--adapter-sha256", opfProvision.privacy.adapter.sha256,
-  "--tokenizer", opfProvision.privacy.tokenizer.path, "--tokenizer-sha256", opfProvision.privacy.tokenizer.sha256,
-  "--startup-timeout-ms", "30000", "--scan-timeout-ms", "2000",
-] };
+opfProvision.privacy.worker = { ...opfProvision.privacy.worker,
+  args: buildOpfWorkerArgs({ ...opfProvision.privacy, python: "/opt/ccshield/python", scanTimeoutMs: 2_000 }) };
 const validateWorker = async () => {};
 const validateFile = async () => {};
 
@@ -115,7 +111,7 @@ test("recent scans keep only bounded window cache counts, status and allowlisted
     assert.equal("segmentHits" in result || "segmentMisses" in result, false);
   }
   const scans = filter.recentScans();
-  const counts = { segmentHits: null, segmentMisses: null, attached: 0 };
+  const counts = { diskHits: null, segmentHits: null, segmentMisses: null, attached: 0 };
   assert.deepEqual(scans.map(({ elapsedMs, queuedMs, ...scan }) => scan), [
     { status: "ok", reason: null, hits: 3, misses: 1, ...counts },
     { status: "unknown", reason: "model_timeout", hits: 0, misses: 2, ...counts },
@@ -136,7 +132,7 @@ test("recent scans keep only bounded window cache counts, status and allowlisted
   assert.equal(filter.recentScans()[0].hits, 3);
   const totals = filter.scanTotals();
   assert.deepEqual({ ...totals, failuresByReason: { ...totals.failuresByReason } }, {
-    scans: 12, ok: 8, unknown: 4, unavailable: 0, coalesced: 0, aborted: 0,
+    scans: 12, ok: 8, unknown: 4, unavailable: 0, coalesced: 0, aborted: 0, diskHits: 0, diskMisses: 0, diskWrites: 0, diskErrors: 0,
     failuresByReason: { admission_limit: 0, queue_timeout: 0, scan_timeout: 0, model_timeout: 1, model_error: 0, model_killed: 0, worker_unavailable: 0, other: 3 },
   });
   assert.doesNotMatch(JSON.stringify(totals), new RegExp(sentinel));
@@ -172,7 +168,7 @@ test("scan totals count every caller outcome since start, including rejections t
   t.mock.timers.tick(30_000);
   assert.deepEqual((await Promise.all(timed)).map((result) => result.reason), ["scan_timeout", "queue_timeout", "queue_timeout", "queue_timeout"]);
   assert.deepEqual(filter.scanTotals(), {
-    scans: 11, ok: 5, unknown: 0, unavailable: 6, coalesced: 2, aborted: 1,
+    scans: 11, ok: 5, unknown: 0, unavailable: 6, coalesced: 2, aborted: 1, diskHits: 0, diskMisses: 0, diskWrites: 0, diskErrors: 0,
     failuresByReason: { admission_limit: 1, queue_timeout: 3, scan_timeout: 1, model_timeout: 0, model_error: 0, model_killed: 0, worker_unavailable: 0, other: 0 },
   });
   const copy = filter.scanTotals();
@@ -369,7 +365,7 @@ test("OPF filter accepts the pinned ten-second scan budget", async (t) => {
   });
   const extended = { privacy: {
     ...opfProvision.privacy,
-    worker: { ...opfProvision.privacy.worker, args: [...opfProvision.privacy.worker.args.slice(0, 21), "10000"] },
+    worker: { ...opfProvision.privacy.worker, args: opfProvision.privacy.worker.args.with(21, "10000") },
   } };
   const filter = await createPrivacyFilter({
     provision: extended, spawnWorker: () => worker, validateWorker, validateFile,
@@ -386,7 +382,7 @@ test("OPF filter accepts a pinned twenty-five-second scan budget", async (t) => 
   });
   const extended = { privacy: {
     ...opfProvision.privacy,
-    worker: { ...opfProvision.privacy.worker, args: [...opfProvision.privacy.worker.args.slice(0, 21), "25000"] },
+    worker: { ...opfProvision.privacy.worker, args: opfProvision.privacy.worker.args.with(21, "25000") },
   } };
   const filter = await createPrivacyFilter({
     provision: extended, spawnWorker: () => worker, validateWorker, validateFile,
@@ -396,29 +392,185 @@ test("OPF filter accepts a pinned twenty-five-second scan budget", async (t) => 
   assert.equal((await filter.scan(Buffer.from('{"content":"synthetic"}'))).status, "ok");
 });
 
-test("OPF sixty-second scans retain their full budget and the parent's one-second reply grace", async (t) => {
+async function opfFilter(t, handler, budget = "60000") {
   const worker = fakeWorker((message, emit) => {
     if (message.type === "health") emit(health(message));
+    else handler?.(message, emit);
   });
-  const extended = { privacy: {
-    ...opfProvision.privacy,
-    worker: { ...opfProvision.privacy.worker, args: [...opfProvision.privacy.worker.args.slice(0, 21), "60000"] },
-  } };
-  const filter = await createPrivacyFilter({
-    provision: extended, spawnWorker: () => worker, validateWorker, validateFile,
-    validateCheckpoint: async () => async () => {},
-  });
+  const extended = { privacy: { ...opfProvision.privacy,
+    worker: { ...opfProvision.privacy.worker, args: opfProvision.privacy.worker.args.with(21, budget) } } };
+  const filter = await createPrivacyFilter({ provision: extended, spawnWorker: () => worker, validateWorker, validateFile,
+    validateCheckpoint: async () => async () => {} });
   t.after(() => filter.close());
-  t.mock.timers.enable({ apis: ["setTimeout"] });
+  return { worker, filter };
+}
+
+test("OPF scans hand the worker their whole budget and wait six seconds past it for the reply", async (t) => {
+  const { worker, filter } = await opfFilter(t);
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
   let settled = false;
   const scan = filter.scan(Buffer.from('{"content":"synthetic"}')).then((result) => { settled = true; return result; });
   await flushTasks();
-  t.mock.timers.tick(60_999);
+  const message = worker.messages.find((entry) => entry.type === "scan");
+  assert.equal(message.budgetMs, 60_000);
+  t.mock.timers.tick(65_999);
   await flushTasks();
   assert.equal(settled, false);
-  const message = worker.messages.find((entry) => entry.type === "scan");
   emit(worker, { type: "scan", id: message.id, status: "ok", findings: [] });
   assert.equal((await scan).status, "ok");
+});
+
+test("an OPF reply arriving after the request deadline is dropped and never reads as ok", async (t) => {
+  const { worker, filter } = await opfFilter(t);
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const scan = filter.scan(Buffer.from('{"content":"synthetic"}'));
+  await flushTasks();
+  const message = worker.messages.find((entry) => entry.type === "scan");
+  t.mock.timers.tick(66_000);
+  await flushTasks();
+  emit(worker, { type: "scan", id: message.id, status: "ok", findings: [] });
+  const result = await scan;
+  assert.notEqual(result.status, "ok");
+  assert.equal(result.reason, "scan_timeout");
+});
+
+test("time an OPF scan spends queued comes out of the budget its worker frame carries", async (t) => {
+  const { worker, filter } = await opfFilter(t);
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const first = filter.scan(Buffer.from('{"content":"first"}'));
+  await flushTasks();
+  const second = filter.scan(Buffer.from('{"content":"second"}'));
+  t.mock.timers.tick(20_000);
+  await flushTasks();
+  const [head] = worker.messages.filter((entry) => entry.type === "scan");
+  emit(worker, { type: "scan", id: head.id, status: "ok", findings: [] });
+  await first;
+  await flushTasks();
+  const tail = worker.messages.filter((entry) => entry.type === "scan")[1];
+  assert.equal(tail.budgetMs, 40_000);
+  emit(worker, { type: "scan", id: tail.id, status: "ok", findings: [] });
+  assert.equal((await second).status, "ok");
+});
+
+test("only a model_timeout keeps the worker's bounded Retry-After", async (t) => {
+  const replies = [
+    [{ reason: "model_timeout", retryAfterSeconds: 7 }, 7],
+    [{ reason: "model_timeout", retryAfterSeconds: 61 }, undefined],
+    [{ reason: "model_timeout", retryAfterSeconds: 0 }, undefined],
+    [{ reason: "model_timeout", retryAfterSeconds: 2.5 }, undefined],
+    [{ reason: "model_error", retryAfterSeconds: 7 }, undefined],
+  ];
+  let next = 0;
+  const { filter } = await opfFilter(t, (message, emit) => emit({ type: "scan", id: message.id, status: "unknown", ...replies[next++][0] }));
+  for (const [, expected] of replies) {
+    const result = await filter.scan(Buffer.from(`{"content":"synthetic-${next}"}`));
+    assert.equal(result.status, "unknown");
+    assert.equal(result.retryAfterSeconds, expected);
+  }
+});
+
+test("OPF admission refuses at once, with Retry-After, a scan that cold scans ahead of it would push past its budget", async (t) => {
+  const { worker, filter } = await opfFilter(t, undefined, "25000");
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  let bodies = 0;
+  const sent = () => worker.messages.filter((entry) => entry.type === "scan");
+  const dispatched = async (count) => {
+    for (let spins = 0; spins < 50 && sent().length < count; spins += 1) await flushTasks();
+    assert.equal(sent().length, count);
+  };
+  const reply = (cache) => emit(worker, { type: "scan", id: sent().at(-1).id, status: "ok", findings: [], cache });
+  const extra = () => filter.scan(Buffer.from(JSON.stringify({ body: bodies++ })));
+  const run = async (elapsedMs, cache) => {
+    const scan = extra();
+    await dispatched(sent().length + 1);
+    t.mock.timers.tick(elapsedMs);
+    reply(cache);
+    return await scan;
+  };
+
+  // Hot samples alone project nothing: a scan behind active and queued work waits instead of being refused.
+  for (let index = 0; index < 3; index += 1) await run(500, { hits: 5, misses: 0 });
+  let settled = 0;
+  const hot = [extra(), extra(), extra()].map((scan) => scan.then((result) => { settled += 1; return result; }));
+  await dispatched(4);
+  await flushTasks();
+  assert.equal(settled, 0, "no cold sample means no early refusal");
+  for (let index = 5; index <= 7; index += 1) {
+    reply({ hits: 5, misses: 0 });
+    if (index < 7) await dispatched(index);
+  }
+  await Promise.all(hot);
+
+  await run(20_000, { hits: 0, misses: 3 });
+  for (let index = 0; index < 3; index += 1) await run(100, { hits: 4, misses: 0 });
+  const held = [extra(), extra()];
+  await dispatched(sent().length + 1);
+  // Active ends ~20 s in and the queued one ~40 s: a third would start past its 25 s budget.
+  const refused = await extra();
+  assert.equal(refused.reason, "admission_limit");
+  assert.equal(refused.retryAfterSeconds, 40, "only the cold 20 s median counts; short hot scans do not pull it down");
+  t.mock.timers.tick(40_000);
+  await Promise.allSettled(held);
+});
+
+test("OPF diagnostics carry disk hits per scan and cumulative disk counters", async (t) => {
+  const caches = [
+    { hits: 1, misses: 2, windows: 3, diskHits: 1, diskMisses: 2, diskWrites: 2, diskErrors: 0 },
+    { hits: 0, misses: 1, windows: 1, diskHits: 0, diskMisses: 1, diskWrites: 0, diskErrors: 1 },
+    { hits: 2, misses: 0 },
+  ];
+  let next = 0;
+  const { filter } = await opfFilter(t, (message, emit) => emit({ type: "scan", id: message.id, status: "ok", findings: [], cache: caches[next++] }));
+  for (let index = 0; index < caches.length; index += 1) await filter.scan(Buffer.from(`{"content":"disk-${index}"}`));
+  assert.deepEqual(filter.recentScans().map((scan) => scan.diskHits), [1, 0, null]);
+  const { diskHits, diskMisses, diskWrites, diskErrors } = filter.scanTotals();
+  assert.deepEqual({ diskHits, diskMisses, diskWrites, diskErrors }, { diskHits: 1, diskMisses: 3, diskWrites: 2, diskErrors: 1 });
+});
+
+test("OPF filter refuses a request budget beyond 240 seconds", async () => {
+  await assert.rejects(createPrivacyFilter({ provision: opfProvision, timeoutMs: 240_001, spawnWorker: () => assert.fail("no worker may start"),
+    validateWorker, validateFile, validateCheckpoint: async () => async () => {} }), /timeout is invalid/);
+});
+
+test("the OPF worker is spawned with its lane's window cache directory", async (t) => {
+  const paths = shieldPaths({ homeDir: "/tmp/home", uid: 501, lane: "managed" });
+  let spawned;
+  const worker = fakeWorker((message, emit) => { if (message.type === "health") emit(health(message)); });
+  const filter = await createPrivacyFilter({
+    provision: opfProvision, paths, validateWorker, validateFile, validateCheckpoint: async () => async () => {},
+    spawnWorker: ({ args }) => { spawned = args; return worker; },
+  });
+  t.after(() => filter.close());
+  assert.deepEqual(spawned, [opfProvision.privacy.worker.command, ...opfProvision.privacy.worker.args, "--window-cache-dir", paths.windowCachePath]);
+});
+
+test("OPF filter rejects lane paths that did not come from shieldPaths", async () => {
+  const real = shieldPaths({ homeDir: "/tmp/home", uid: 501 });
+  for (const paths of [{ ...real }, { ...real, windowCachePath: "/tmp/elsewhere" }]) {
+    await assert.rejects(createPrivacyFilter({
+      provision: opfProvision, paths, validateWorker, validateFile, validateCheckpoint: async () => async () => {},
+      spawnWorker: () => assert.fail("no worker may start"),
+    }), /canonical/);
+  }
+});
+
+test("the regex worker never receives a window cache directory", async (t) => {
+  let spawned;
+  const worker = fakeWorker((message, emit) => { if (message.type === "health") emit(health(message)); });
+  const filter = await createPrivacyFilter({ provision, paths: shieldPaths({ homeDir: "/tmp/home", uid: 501 }), validateWorker,
+    spawnWorker: ({ args }) => { spawned = args; return worker; } });
+  t.after(() => filter.close());
+  assert.deepEqual(spawned, provision.privacy.worker.args);
+});
+
+test("OPF filter accepts the 240-second request budget", async (t) => {
+  const worker = fakeWorker((message, emit) => { if (message.type === "health") emit(health(message)); });
+  const extended = { privacy: { ...opfProvision.privacy,
+    worker: { ...opfProvision.privacy.worker, args: opfProvision.privacy.worker.args.with(21, "240000") } } };
+  const filter = await createPrivacyFilter({ provision: extended, spawnWorker: () => worker, validateWorker, validateFile,
+    validateCheckpoint: async () => async () => {} });
+  t.after(() => filter.close());
+  assert.equal(filter.version, "privacy-1");
 });
 
 test("privacy scans serialize four admitted requests while health bypasses the scan queue", async (t) => {
@@ -651,7 +803,7 @@ test("aborting an active scan releases the caller while the worker still finishe
   emit(worker, { type: "scan", id: worker.messages.at(-1).id, status: "ok", findings: [], cache: { hits: 1, misses: 2 } });
   await flushTasks();
   assert.deepEqual(filter.recentScans().map(({ elapsedMs, queuedMs, ...scan }) => scan), [
-    { status: "ok", reason: null, hits: 1, misses: 2, segmentHits: null, segmentMisses: null, attached: 0 },
+    { status: "ok", reason: null, hits: 1, misses: 2, diskHits: null, segmentHits: null, segmentMisses: null, attached: 0 },
   ]);
   assert.equal(worker.messages.filter((message) => message.type === "scan").length, 1);
 });
@@ -1115,7 +1267,7 @@ test("OPF scan waits beyond the generic two-second deadline when provisioned for
   });
   const extended = { privacy: {
     ...opfProvision.privacy,
-    worker: { ...opfProvision.privacy.worker, args: [...opfProvision.privacy.worker.args.slice(0, 21), "10000"] },
+    worker: { ...opfProvision.privacy.worker, args: opfProvision.privacy.worker.args.with(21, "10000") },
   } };
   const filter = await createPrivacyFilter({
     provision: extended, spawnWorker: () => worker, validateWorker, validateFile,
@@ -1321,10 +1473,12 @@ test("OPF provision self-test uses a valid synthetic mailbox and requires privat
       });
     }
   });
+  let selfTestArgs;
   assert.deepEqual(await runPrivacyWorkerSelfTest(opfProvision, {
-    spawnWorker: () => worker, validateWorker, validateFile, validateCheckpoint: async () => async () => {},
+    spawnWorker: ({ args }) => { selfTestArgs = args; return worker; }, validateWorker, validateFile, validateCheckpoint: async () => async () => {},
   }), { version: "privacy-1" });
   assert.equal(scannedBody, '{"content":"alice@example.com"}');
+  assert.equal(selfTestArgs.includes("--window-cache-dir"), false, "the self-test must stay on the memory cache");
 
   const wrongLabel = fakeWorker((message, emit) => {
     if (message.type === "health") emit(health(message));
