@@ -457,3 +457,20 @@ Listed for D1 only; nothing here is renamed in Phase 5. `AIRKIT_*` entries in `s
 - `test/compat-request-errors.test.mjs` — `x-airkit-request-id` 74,102,156,260,265,310,357,374,397
 - `test/completion-host.test.mjs` — `AIRKIT_VERIFY_COMPLETION_HOST` 47,95
 - `test/completion-install.test.mjs` — `AIRKIT_COMPLETION_MODE` 64
+
+## Corrections and Stage A decisions (2026-10-28, Asia/Taipei)
+
+Review corrections:
+
+- OPF aliases are never mapped back to the original text, so there is no "rehydration". The rehydration wording and test 6 are dropped.
+- Renaming the regex worker protocol (`airkit-privacy-ndjson-v1`) belongs to Stage C (D5), not Stage A/B.
+- `service.mjs:803` emits the capability header (it is the probe) and does not consume it.
+- No `protocol` key goes into `assets-provision.json`, because the live `ad346b2` daemon would reject it.
+
+Stage A as implemented:
+
+- The proxy accepts both `x-ccshield-*` and `x-airkit-shield*`, and both `/_ccshield/` and `/_airkit/shield/`. It strips both header families before forwarding upstream. If the two capability spellings arrive with different values, the request gets 401.
+- The daemon writes `wire: 2` into its identity. Old CLIs ignore that field.
+- The CLI uses the new names only when the identity says `wire >= 2`. Otherwise it uses the old names, so a new CLI still works with an old running daemon.
+- session-check accepts either spelling.
+- Verification: full suite outside the sandbox with a temp HOME. Baseline 1665d17 had 737 tests and 0 failures. This branch has 748 tests and 0 failures.
