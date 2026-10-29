@@ -147,12 +147,14 @@ daemon restart needs the user's approval. Nothing here is done by an agent.
 - Identity publishes `wire: 2`.
 - CLI and launcher emit new names only behind the gate. Against R's own daemon
   that means new names. Against an older daemon, old names.
+  > **Superseded (2026-10-29):** see "Review corrections" below. Protocol rename moved to Stage C (D5); not in Stage A.
 - Protocol: `provision.mjs` and `privacy.mjs:385` accept either protocol string.
   The daemon sends **the protocol named in the manifest it loaded**, not a
   constant.
 - Both workers accept either request protocol and echo it back. The worker bytes
   change, so a re-provision is needed. Provisioning **still writes the old
   string** in R, so an old daemon reading the rewritten manifest keeps working.
+  > **Superseded (2026-10-29):** see "Review corrections" below. OPF aliases are never rehydrated; the `airkit_id_` rename was not done in a8e2beb and is deferred.
 - `airkit_id_` → `ccshield_id_` in the adapter. It is never parsed back by name,
   so there is nothing to accept twice. Rehydration uses the per-request alias map
   [INFERENCE: read `aliasFor` (`opf-adapter.mjs:298-310`), not the reverse path;
@@ -162,6 +164,7 @@ daemon restart needs the user's approval. Nothing here is done by an agent.
 - Old env names are still mapped (unchanged).
 
 **Stage B — write the new names** (release R+1; needs R's daemon running everywhere)
+  > **Superseded (2026-10-29):** see "Review corrections" below. No protocol rename in the manifest before Stage C (D5).
 - Provisioning writes `ccshield-privacy-ndjson-v1` into the manifest. Worker
   bytes are unchanged from R, so the content-addressed worker directory
   (`opf-privacy.mjs:56`) is reused and only the manifest changes.
@@ -273,7 +276,7 @@ Stage A, red first:
    unknown protocol is still dropped with no reply.
 5. Skew. A daemon fixture without `wire` plus the new CLI: old names are sent
    and nothing new reaches upstream.
-6. Alias. A redacted body carries `ccshield_id_a`, and rehydration round-trips.
+6. ~~Alias.~~ Dropped (see Review corrections: no rehydration). Alias. A redacted body carries `ccshield_id_a`, and rehydration round-trips.
    The collision test at `shield-opf-adapter.test.mjs:205-218` is repeated with
    both prefixes in the input text.
 7. Keep every existing old-literal test as it is in Stage A. Those tests are the
