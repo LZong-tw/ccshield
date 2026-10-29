@@ -222,7 +222,9 @@ test("privacy unknown reasons preserve only the pinned worker and adapter's fixe
     const filter = await createPrivacyFilter({ provision, spawnWorker: () => worker, validateWorker });
     t.after(() => filter.close());
     const result = await filter.scan(Buffer.from(JSON.stringify({ content: sentinel })));
-    assert.deepEqual(result, { status: "unknown", findings: [], reason: allowed.includes(reason) ? reason : "privacy_unavailable" });
+    const { queuedMs, ...rest } = result;
+    assert.equal(Number.isInteger(queuedMs) && queuedMs >= 0, true);
+    assert.deepEqual(rest, { status: "unknown", findings: [], reason: allowed.includes(reason) ? reason : "privacy_unavailable" });
     assert.doesNotMatch(JSON.stringify(result), new RegExp(sentinel));
     if (["model_killed", "model_error", "model_timeout"].includes(reason)) {
       assert.equal(await filter.isReady(), false);
@@ -743,7 +745,10 @@ test("a failed shared scan hands every waiter the same unknown result", async (t
   await flushTasks();
   emit(worker, { type: "scan", id: worker.messages.at(-1).id, status: "unknown", reason: "model_error" });
   const results = await Promise.all(scans);
-  for (const result of results) assert.deepEqual(result, { status: "unknown", findings: [], reason: "model_error" });
+  for (const { queuedMs, ...result } of results) {
+    assert.equal(Number.isInteger(queuedMs), true);
+    assert.deepEqual(result, { status: "unknown", findings: [], reason: "model_error" });
+  }
   assert.equal(worker.messages.filter((message) => message.type === "scan").length, 1);
 });
 

@@ -71,6 +71,22 @@ time a new `node` binary reads it, macOS may show an access prompt; choose
 file with looser permissions is refused. Linux Secret Service support is
 planned.
 
+## Failure log
+
+When the daemon answers `503 shield_unavailable` (or blocks an oversized body),
+it appends one JSON line to `failures.jsonl` in the lane's state directory
+(`~/.local/share/ccshield/<lane>/`, mode 0600): `ts`, `stage`, `reason`,
+`bytes`, `elapsedMs`, `queuedMs` when the privacy queue reported it, and
+`launch`, a 12-character SHA-256 prefix of the launch id. Body text, redacted
+text and headers are never written. The file rotates to `failures.jsonl.1` at
+256 KiB, so at most two files exist. `ccshield doctor` prints the last 10
+entries as `recentFailures`.
+
+On macOS the launchd job also sends the daemon's stdout and stderr to
+`daemon.out.log` and `daemon.err.log` in the same directory. A plist written by
+an older release has neither path; rerun `ccshield install --write` to adopt
+them.
+
 ## Threat model: OPF window cache
 
 The OPF detector can keep model logits for complete 4096-token windows on disk,

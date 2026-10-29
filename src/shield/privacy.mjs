@@ -293,6 +293,8 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
       // Only a worker that advertises cooperative timeouts keeps its model and window cache alive across model_timeout.
       if (result.status === "unknown" && (["model_killed", "model_error"].includes(result.reason) || (result.reason === "model_timeout" && !session.cooperativeTimeout))) session.ready = false;
     } catch {} finally {
+      // A failed scan carries its queue wait so the daemon's failure log can tell queueing from model time.
+      if (result.status === "unknown") result = Object.freeze({ ...result, queuedMs: dispatchedAt - entry.admittedAt });
       entry.settle(result);
       // Record what the caller actually received; close() or a stopped worker may have settled it first.
       const own = entry.outcome === result;

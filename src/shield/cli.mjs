@@ -11,6 +11,7 @@ import { readShieldAssetsProvision, readShieldIdentity, readShieldPolicyState, s
 import { provisionImageWorker } from "./image-provision.mjs";
 import { provisionShieldAssets } from "./provision.mjs";
 import { installShieldPolicyProvision, readShieldPolicyProvision } from "./policy-bundle.mjs";
+import { readFailureLog } from "./failure-log.mjs";
 import { readShieldOperationalStatus } from "./operational-status.mjs";
 import { hasBackgroundClaudeHost, scheduleBackgroundHostRelease } from "./background-host.mjs";
 import { ANTHROPIC_ORIGIN, startPxpipeHop } from "./pxpipe-hop.mjs";
@@ -84,6 +85,7 @@ async function createDefaultShieldDependencies(dependencies) {
   const readAssets = dependencies.readShieldAssetsProvision ?? readShieldAssetsProvision;
   const fetchDetectors = dependencies.fetchDetectorAssets ?? fetchDetectorAssets;
   const doctorDetectors = dependencies.doctorDetectorAssets ?? doctorDetectorAssets;
+  const readFailures = dependencies.readFailureLog ?? readFailureLog;
   const readPolicyProvision = dependencies.readShieldPolicyProvision ?? readShieldPolicyProvision;
   const installService = dependencies.installShieldService ?? installShieldService;
   const provisionAssets = dependencies.provisionShieldAssets ?? provisionShieldAssets;
@@ -158,6 +160,7 @@ async function createDefaultShieldDependencies(dependencies) {
         operational,
         masterKey: { source: key.source, ...(key.warning ? { warning: key.warning } : {}) },
         detectors,
+        recentFailures: (await readFailures(lanePaths.failureLogPath, { limit: RECENT_FAILURES })).map(describeFailure),
         checked: true,
       };
     },
@@ -383,6 +386,12 @@ async function runPluginCommand(argv) {
   }
   if (sub !== "install") throw new Error("usage: ccshield plugin install [--plugin-root /absolute/dir] [--write]");
   return installPlugin(options);
+}
+
+const RECENT_FAILURES = 10;
+
+function describeFailure({ ts, stage, reason, ...fields }) {
+  return [ts ?? "-", `${stage}/${reason}`, ...Object.entries(fields).filter(([, value]) => value !== undefined).map(([key, value]) => `${key}=${value}`)].join(" ");
 }
 
 function renderShieldHelp() {
