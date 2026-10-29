@@ -257,6 +257,7 @@ export async function startShieldDaemon({
         origin: shield.origin,
         capability: config.capability,
         version: 1,
+        wire: 2,
         pid,
         lane: config.lane,
         generation: config.generation,

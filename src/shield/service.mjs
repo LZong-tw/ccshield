@@ -187,10 +187,10 @@ export async function transitionShieldPolicy({ paths, installPolicy, io = defaul
     const stopped = await inspectService({ paths, io, runLaunchctl, runSystemctl });
     if (stopped.active) throw new Error("shield policy transition could not stop the prior daemon");
     if (await isProcessAlive(previous.pid)) throw new Error("shield policy transition could not stop the prior daemon");
-    if (await probeShield(previous.origin, previous.capability)) throw new Error("shield policy transition prior proxy remains reachable");
+    if (await probeShield(previous.origin, previous.capability, previous.wire)) throw new Error("shield policy transition prior proxy remains reachable");
   } else if (previous) {
     if (await isProcessAlive(previous.pid)) throw new Error("shield policy transition cannot quiesce a live stale daemon");
-    if (await probeShield(previous.origin, previous.capability)) throw new Error("shield policy transition prior proxy remains reachable");
+    if (await probeShield(previous.origin, previous.capability, previous.wire)) throw new Error("shield policy transition prior proxy remains reachable");
   }
   const installed = await installPolicy();
   const recordTransition = async (config = null) => {
@@ -313,7 +313,7 @@ export async function ensureShieldReady({ lane, expectedTargetOrigin, env = proc
   if (!sameDetectorVersions(identity.detectorVersions, policyState.detectorVersions)) {
     throw new Error("shield detector version mismatch; restart the shield service");
   }
-  if (!(await probeShield(identity.origin, identity.capability))) {
+  if (!(await probeShield(identity.origin, identity.capability, identity.wire))) {
     throw new Error("shield listener readiness probe failed; restart the shield service");
   }
   return {
@@ -323,7 +323,16 @@ export async function ensureShieldReady({ lane, expectedTargetOrigin, env = proc
     targetClass: identity.targetClass,
     policyVersion: identity.policyVersion,
     detectorVersions: identity.detectorVersions,
+    ...(identity.wire === undefined ? {} : { wire: identity.wire }),
   };
+}
+
+// Header and path names for the daemon behind `ready`. Old daemons only know the
+// airkit spellings; remove the wire-1 branch once no supported daemon lacks wire 2.
+export function shieldWireNames(ready) {
+  return (ready?.wire ?? 1) >= 2
+    ? { capability: "x-ccshield-capability", control: "x-ccshield-control", launch: "x-ccshield-launch", prefix: "/_ccshield/" }
+    : { capability: "x-airkit-shield", control: "x-airkit-shield-control", launch: "x-airkit-shield-launch", prefix: "/_airkit/shield/" };
 }
 
 export async function launchShieldChild({ command, args = [], ready, env = process.env, spawnChild = spawn, approvalBroker, allowUnscannedImages = false, createApprovalChannel: createChannel = createLauncherApprovalChannel, registerApprovalChannel: registerChannel = registerShieldApprovalChannel, unregisterApprovalChannel: unregisterChannel = unregisterShieldApprovalChannel, registerImageOverride = registerShieldImageOverride, unregisterImageOverride = unregisterShieldImageOverride } = {}) {
@@ -381,9 +390,9 @@ export async function registerShieldApprovalChannel({ ready, channel, launchId, 
   const config = await readShieldConfig({ paths: paths ?? shieldPaths({ lane: ready.lane }), io });
   let response;
   try {
-    response = await fetchImpl(`${ready.origin}/_airkit/shield/approval-channel`, {
+    response = await fetchImpl(`${ready.origin}${shieldWireNames(ready).prefix}approval-channel`, {
       method: "POST",
-      headers: { "x-airkit-shield-control": config.controlCapability, "content-type": "application/json" },
+      headers: { [shieldWireNames(ready).control]: config.controlCapability, "content-type": "application/json" },
       body: JSON.stringify(registration),
     });
   } catch {
@@ -396,9 +405,9 @@ export async function unregisterShieldApprovalChannel({ ready, launchId, paths, 
   if (!ready?.origin) return;
   assertShieldLaunchId(launchId);
   const config = await readShieldConfig({ paths: paths ?? shieldPaths({ lane: ready.lane }), io });
-  const response = await fetchImpl(`${ready.origin}/_airkit/shield/approval-channel`, {
+  const response = await fetchImpl(`${ready.origin}${shieldWireNames(ready).prefix}approval-channel`, {
     method: "DELETE",
-    headers: { "x-airkit-shield-control": config.controlCapability, "content-type": "application/json" },
+    headers: { [shieldWireNames(ready).control]: config.controlCapability, "content-type": "application/json" },
     body: JSON.stringify({ launchId }),
   }).catch(() => null);
   if (response?.status !== 204) throw new Error("shield approval unregister failed");
@@ -416,9 +425,9 @@ async function postImageOverride({ method, ready, launchId, paths, io, fetchImpl
   if (!ready?.origin) return false;
   assertShieldLaunchId(launchId);
   const config = await readShieldConfig({ paths: paths ?? shieldPaths({ lane: ready.lane }), io });
-  const response = await fetchImpl(`${ready.origin}/_airkit/shield/image-override`, {
+  const response = await fetchImpl(`${ready.origin}${shieldWireNames(ready).prefix}image-override`, {
     method,
-    headers: { "x-airkit-shield-control": config.controlCapability, "content-type": "application/json" },
+    headers: { [shieldWireNames(ready).control]: config.controlCapability, "content-type": "application/json" },
     body: JSON.stringify({ launchId }),
   }).catch(() => null);
   return response?.status === 204;
@@ -429,9 +438,9 @@ export async function createShieldDestinationLease({ ready, targetOrigin, launch
   if (launcherContext !== undefined) classifyShieldRequest({ body: Buffer.alloc(0), launcherContext });
   const config = await readShieldConfig({ paths: paths ?? shieldPaths({ lane: ready.lane }), io });
   const capability = randomUUID().replaceAll("-", "");
-  const response = await fetchImpl(`${ready.origin}/_airkit/shield/destination-lease`, {
+  const response = await fetchImpl(`${ready.origin}${shieldWireNames(ready).prefix}destination-lease`, {
     method: "POST",
-    headers: { "x-airkit-shield-control": config.controlCapability, "content-type": "application/json" },
+    headers: { [shieldWireNames(ready).control]: config.controlCapability, "content-type": "application/json" },
     body: JSON.stringify({ capability, targetOrigin, expiresAt: Date.now() + 30_000, ...(launcherContext === undefined ? {} : { launcherContext }) }),
   }).catch(() => null);
   if (response?.status !== 204) throw new Error("shield managed destination lease registration failed");
@@ -441,9 +450,9 @@ export async function createShieldDestinationLease({ ready, targetOrigin, launch
 export async function revokeShieldDestinationLease({ ready, paths, io, fetchImpl = fetch } = {}) {
   if ((ready?.lane !== "managed" && ready?.lane !== "subscription") || !ready.origin || !ready.capability) return;
   const config = await readShieldConfig({ paths: paths ?? shieldPaths({ lane: ready.lane }), io });
-  const response = await fetchImpl(`${ready.origin}/_airkit/shield/destination-lease`, {
+  const response = await fetchImpl(`${ready.origin}${shieldWireNames(ready).prefix}destination-lease`, {
     method: "DELETE",
-    headers: { "x-airkit-shield-control": config.controlCapability, "content-type": "application/json" },
+    headers: { [shieldWireNames(ready).control]: config.controlCapability, "content-type": "application/json" },
     body: JSON.stringify({ capability: ready.capability }),
   }).catch(() => null);
   if (response?.status !== 204) throw new Error("shield managed destination lease revocation failed");
@@ -452,9 +461,9 @@ export async function revokeShieldDestinationLease({ ready, paths, io, fetchImpl
 export async function renewShieldDestinationLease({ ready, targetOrigin, paths, io, fetchImpl = fetch } = {}) {
   if ((ready?.lane !== "managed" && ready?.lane !== "subscription") || !ready.origin || !ready.capability || !targetOrigin) return false;
   const config = await readShieldConfig({ paths: paths ?? shieldPaths({ lane: ready.lane }), io });
-  const response = await fetchImpl(`${ready.origin}/_airkit/shield/destination-lease`, {
+  const response = await fetchImpl(`${ready.origin}${shieldWireNames(ready).prefix}destination-lease`, {
     method: "POST",
-    headers: { "x-airkit-shield-control": config.controlCapability, "content-type": "application/json" },
+    headers: { [shieldWireNames(ready).control]: config.controlCapability, "content-type": "application/json" },
     body: JSON.stringify({ capability: ready.capability, targetOrigin, expiresAt: Date.now() + 30_000, renew: true }),
   }).catch(() => null);
   return response?.status === 204;
@@ -471,7 +480,8 @@ export function buildShieldChildEnv(ready, env = process.env, launchId) {
   const keptHeaders = String(env.ANTHROPIC_CUSTOM_HEADERS ?? "")
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .filter((line) => line !== "" && !/^x-airkit-shield(?:-|:)/i.test(line));
+    .filter((line) => line !== "" && !/^x-(?:airkit-shield|ccshield)(?:-|:)/i.test(line));
+  const names = shieldWireNames(ready);
   const childEnv = {
     ...env,
     ANTHROPIC_API_BASE_URL: ready.origin,
@@ -479,8 +489,8 @@ export function buildShieldChildEnv(ready, env = process.env, launchId) {
     CLAUDE_AGENT_API_BASE_URL: ready.origin,
     ANTHROPIC_CUSTOM_HEADERS: [
       ...keptHeaders,
-      `x-airkit-shield: ${ready.capability}`,
-      ...(launchId === undefined ? [] : [`x-airkit-shield-launch: ${launchId}`]),
+      `${names.capability}: ${ready.capability}`,
+      ...(launchId === undefined ? [] : [`${names.launch}: ${launchId}`]),
     ].join("\n"),
   };
   for (const name of ["CCSHIELD_CONTROL_CAPABILITY", "CCSHIELD_APPROVAL_CAPABILITY", "CCSHIELD_APPROVAL_SOCKET", "CCSHIELD_CAPABILITY"]) {
@@ -798,10 +808,11 @@ async function defaultLaunchctl(args) {
   }
 }
 
-async function defaultProbeShield(origin, capability) {
+async function defaultProbeShield(origin, capability, wire) {
+  const names = shieldWireNames({ wire });
   try {
-    const response = await fetch(new URL("/_airkit/shield/ready", origin), {
-      headers: { "x-airkit-shield": capability },
+    const response = await fetch(new URL(`${names.prefix}ready`, origin), {
+      headers: { [names.capability]: capability },
       redirect: "manual",
       signal: AbortSignal.timeout(1_000),
     });

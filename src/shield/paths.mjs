@@ -135,6 +135,12 @@ export function assertShieldIdentity(identity) {
     policyVersion: identity.policyVersion,
     detectorVersions,
   };
+  // wire 2 = the daemon accepts the x-ccshield-* headers and /_ccshield/ paths.
+  // A daemon from before Phase 5 writes no `wire`, so it gets the old names.
+  if (Object.hasOwn(identity, "wire")) {
+    if (!Number.isInteger(identity.wire) || identity.wire < 1) throw new Error("shield identity wire is invalid");
+    validated.wire = identity.wire;
+  }
   if (Object.hasOwn(identity, "media")) validated.media = assertMediaCoverage(identity.media);
   return validated;
 }

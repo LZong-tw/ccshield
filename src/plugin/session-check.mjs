@@ -3,8 +3,8 @@ import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
-// TODO(P5): rename with the rest of the x-airkit-shield wire names.
-const CAPABILITY_HEADER = /^x-airkit-shield:\s*\S/i;
+// x-airkit-shield is the pre-Phase-5 spelling, still emitted for an old daemon.
+const CAPABILITY_HEADER = /^x-(?:ccshield-capability|airkit-shield):\s*\S/i;
 const WARNING = "ccshield: this session is not behind ccshield; requests go out unscanned. Start it with `ccshield launch --lane subscription -- claude`.";
 
 // Claude Code hands its own environment to hooks, so a session started by
