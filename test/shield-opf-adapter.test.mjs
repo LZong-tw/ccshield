@@ -1606,7 +1606,7 @@ syncBuiltinESMExports();
       args[args.indexOf("--startup-timeout-ms") + 1] = String(startup);
       return [worker, ...args];
     };
-    const args = workerArgs({ startup: 30_000, scan: 30_000 });
+    const args = workerArgs({ startup: 60_000, scan: 30_000 });
     const scanExpiryArgs = workerArgs({ startup: 30_000, scan: 2_000 });
     const startupExpiryArgs = workerArgs({ startup: 1_000, scan: 2_000 });
     const runTimeout = 45_000;
@@ -1685,6 +1685,7 @@ syncBuiltinESMExports();
     const base = workerArgs({ startup: 30_000, scan: 2_000 });
     for (const [label, bad] of [
       ["unbounded scan budget", workerArgs({ startup: 30_000, scan: 240_001 })],
+      ["startup budget over 60 s", workerArgs({ startup: 60_001, scan: 2_000 })],
       ["relative cache directory", [...base, "--window-cache-dir", "window-cache"]],
       ["unnormalised cache directory", [...base, "--window-cache-dir", `${temp}//window-cache`]],
       ["cache directory without a value", [...base, "--window-cache-dir"]],
