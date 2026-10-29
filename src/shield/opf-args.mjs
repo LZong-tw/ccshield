@@ -1,6 +1,6 @@
 import { isAbsolute, resolve } from "node:path";
 
-export const OPF_STARTUP_TIMEOUT_MS = 30_000;
+export const OPF_STARTUP_TIMEOUT_MS = 60_000;
 export const OPF_SCAN_TIMEOUT_MS = Object.freeze([2_000, 10_000, 25_000, 60_000, 240_000]);
 export const OPF_WINDOW_CACHE_MAX_MIB = 256;
 

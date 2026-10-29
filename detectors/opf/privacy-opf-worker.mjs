@@ -244,7 +244,7 @@ function options(args) {
   if (value["--tokenizer"].split("/").at(-1) !== "fb374d419588a4632f3f557e76b4b70aebbca790") throw new Error("invalid tokenizer name");
   for (const name of ["--startup-timeout-ms", "--scan-timeout-ms"]) {
     const timeout = Number(value[name]);
-    if (!Number.isInteger(timeout) || timeout < 1 || timeout > (name === "--scan-timeout-ms" ? 240_000 : 30_000)) throw new Error("invalid worker timeout");
+    if (!Number.isInteger(timeout) || timeout < 1 || timeout > (name === "--scan-timeout-ms" ? 240_000 : 60_000)) throw new Error("invalid worker timeout");
     value[name] = timeout;
   }
   const maxMib = Number(value["--window-cache-max-mib"]);

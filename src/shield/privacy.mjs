@@ -11,7 +11,7 @@ import { PRIVACY_PROTOCOL as PROTOCOL } from "./protocol.mjs";
 const MAX_BODY_BYTES = 1_048_576;
 const MAX_FRAME_BYTES = 4 * 1_048_576; // base64 redacted body (≤1 MiB → ~1.4 MiB) plus findings must fit
 const DEFAULT_TIMEOUT_MS = 2_000;
-const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
+const DEFAULT_STARTUP_TIMEOUT_MS = 60_000;
 const MAX_ADMITTED_SCANS = 4;
 const DISK_COUNTS = ["diskHits", "diskMisses", "diskWrites", "diskErrors"];
 const MAX_ATTACHED_WAITERS = 8;

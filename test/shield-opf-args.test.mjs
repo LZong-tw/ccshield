@@ -17,7 +17,7 @@ test("the OPF worker argv keeps its 24-argument wire order", () => {
     "--opf-source", "/opt/ccshield/opf", "--opf-source-sha256", "b".repeat(64),
     "--adapter-sha256", "c".repeat(64),
     "--tokenizer", references.tokenizer.path, "--tokenizer-sha256", "d".repeat(64),
-    "--startup-timeout-ms", "30000", "--scan-timeout-ms", "2000",
+    "--startup-timeout-ms", "60000", "--scan-timeout-ms", "2000",
     "--window-cache-max-mib", "256",
   ]);
   assert.equal(isValidOpfWorkerArgs(args, references), true);
@@ -27,7 +27,7 @@ test("the OPF worker argv rejects anything the builder would not produce", () =>
   const replace = (index, value) => args.map((entry, at) => at === index ? value : entry);
   for (const bad of [
     replace(21, "3000"), replace(21, "02000"), replace(1, "python"), replace(1, "/opt//python"), replace(5, "f".repeat(64)),
-    replace(19, "60000"), args.slice(0, 20), args.slice(0, 22), args.slice(0, 23), [...args, "--extra"], null,
+    replace(19, "30000"), args.slice(0, 20), args.slice(0, 22), args.slice(0, 23), [...args, "--extra"], null,
     replace(21, "300000"), replace(22, "--window-cache-dir"), replace(23, "8"), replace(23, "4097"), replace(23, "-1"), replace(23, "0256"),
   ]) assert.equal(isValidOpfWorkerArgs(bad, references), false, JSON.stringify(bad));
   assert.equal(isValidOpfWorkerArgs(args, { ...references, checkpoint: undefined }), false);
