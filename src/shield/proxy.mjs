@@ -4,7 +4,13 @@ import { readApprovalChannelRegistration, requestApprovalChannel } from "./appro
 import { classifyShieldRequest } from "./classify.mjs";
 
 const INSPECTION_MAX_BYTES = 1_048_576;
-const DIAGNOSTICS_PATH = "/_airkit/shield/diagnostics";
+// Phase 5 transition: /_ccshield/ and x-ccshield-* are the new names; the
+// /_airkit/shield/ and x-airkit-shield* spellings stay accepted until Stage C.
+const CONTROL_PREFIX = "/_airkit/shield/";
+const NEW_CONTROL_PREFIX = "/_ccshield/";
+const DIAGNOSTICS_PATHS = [`${CONTROL_PREFIX}diagnostics`, `${NEW_CONTROL_PREFIX}diagnostics`];
+const DIAGNOSTICS_PATH = DIAGNOSTICS_PATHS[0];
+const SHIELD_HEADER = /^x-(?:airkit-shield|ccshield)(?:-|$)/i;
 const FAILURE_REASONS = new Map([
   ["body_read", new Set(["body_read_failed", "body_too_large"])],
   ["evaluation", new Set(["evaluation_unavailable"])],
@@ -44,11 +50,6 @@ const INTERNAL_HEADERS = new Set([
   "x-forwarded-host",
   "x-forwarded-proto",
   "x-original-url",
-  "x-airkit-shield",
-  "x-airkit-shield-control",
-  "x-airkit-shield-approval",
-  "x-airkit-shield-approval-socket",
-  "x-airkit-shield-launch",
 ]);
 const MAX_APPROVAL_CHANNELS = 32;
 const MAX_IMAGE_OVERRIDES = 32;
@@ -103,10 +104,11 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
 async function handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision, isReady, approvalChannels, imageOverrides, onImageOverrideChange, now, failures, scanStats, scanTotals }) {
   const startedAt = Date.now();
   const fail = (stage, reason, bytes = 0) => recordFailure(failures, { stage, reason, bytes, elapsedMs: Date.now() - startedAt });
+  request.url = canonicalControlPath(request.url);
   if (isDiagnosticsPath(request.url)) {
     request.resume();
     response.setHeader("cache-control", "no-store");
-    if (!capabilityMatches(request.headers["x-airkit-shield-control"], controlCapability)) {
+    if (!capabilityMatches(shieldHeader(request, "control"), controlCapability)) {
       await finish(response, { status: 401, code: "shield_unauthorized" }); return;
     }
     if (request.method !== "GET" || request.url !== DIAGNOSTICS_PATH) {
@@ -118,7 +120,7 @@ async function handleShieldRequest({ request, response, capability, controlCapab
   }
   const isApprovalRegistration = request.url === "/_airkit/shield/approval-channel" && (request.method === "POST" || request.method === "DELETE");
   if (request.url === "/_airkit/shield/image-override" && (request.method === "POST" || request.method === "DELETE")) {
-    if (!capabilityMatches(request.headers["x-airkit-shield-control"], controlCapability)) {
+    if (!capabilityMatches(shieldHeader(request, "control"), controlCapability)) {
       request.resume();
       await finish(response, { status: 401, code: "shield_unauthorized" });
       return;
@@ -136,7 +138,7 @@ async function handleShieldRequest({ request, response, capability, controlCapab
   }
   const isLeaseRequest = request.url === "/_airkit/shield/destination-lease" && (request.method === "POST" || request.method === "DELETE");
   if (isLeaseRequest) {
-    if (!allowDestinationLeases || !capabilityMatches(request.headers["x-airkit-shield-control"], controlCapability)) { request.resume(); await finish(response, { status: 401, code: "shield_unauthorized" }); return; }
+    if (!allowDestinationLeases || !capabilityMatches(shieldHeader(request, "control"), controlCapability)) { request.resume(); await finish(response, { status: 401, code: "shield_unauthorized" }); return; }
     const lease = await readDestinationLease(request, request.method === "POST", now);
     const current = request.method === "POST" ? destinationLeases.get(lease?.capability) ?? null : null;
     if (current !== null && current.expiresAt <= now()) destinationLeases.delete(lease.capability);
@@ -153,7 +155,7 @@ async function handleShieldRequest({ request, response, capability, controlCapab
     else destinationLeases.delete(lease.capability);
     response.writeHead(204, { "cache-control": "no-store" }); response.end(); return;
   }
-  const requestCapability = request.headers["x-airkit-shield"];
+  const requestCapability = shieldHeader(request, "capability");
   const lease = allowDestinationLeases ? destinationLeases.get(String(requestCapability ?? "")) ?? null : null;
   if (lease !== null && lease.expiresAt <= now()) destinationLeases.delete(String(requestCapability ?? ""));
   const leaseTarget = lease !== null && lease.expiresAt > now() ? lease.target : null;
@@ -220,7 +222,7 @@ async function handleShieldRequest({ request, response, capability, controlCapab
   }
 
   if (isApprovalRegistration) {
-    if (!capabilityMatches(request.headers["x-airkit-shield-control"], controlCapability)) {
+    if (!capabilityMatches(shieldHeader(request, "control"), controlCapability)) {
       request.resume();
       await finish(response, { status: 401, code: "shield_unauthorized" });
       return;
@@ -279,7 +281,7 @@ async function handleShieldRequest({ request, response, capability, controlCapab
   if (lifecycle.signal.aborted) return;
   let decision;
   try {
-    const launchId = request.headers["x-airkit-shield-launch"];
+    const launchId = shieldHeader(request, "launch");
     const allowUnscannedImages = typeof launchId === "string" && imageOverrides.has(launchId);
     const evaluate = async (signal = lifecycle.signal, detectorVersions) => await decide({ method: request.method ?? "GET", path, bytes: inspection.bytes, body: inspection.body, signal, launcherContext, allowUnscannedImages, ...(detectorVersions ? { detectorVersions } : {}) });
     decision = decisionCache === null || launcherContext !== null || allowUnscannedImages
@@ -317,7 +319,7 @@ async function handleShieldRequest({ request, response, capability, controlCapab
       }
       forwardBody = transformed;
     }
-    permitted = await approveRequest({ approvalBroker, approvalChannel: launchApprovalChannel(approvalChannels, request.headers["x-airkit-shield-launch"]), decision, inspection, auditDecision, signal: lifecycle.signal });
+    permitted = await approveRequest({ approvalBroker, approvalChannel: launchApprovalChannel(approvalChannels, shieldHeader(request, "launch")), decision, inspection, auditDecision, signal: lifecycle.signal });
     auditDecision.override = permitted;
   }
   try {
@@ -375,10 +377,27 @@ function isDiagnosticsPath(value) {
     paths.push(new URL(value, "http://shield.local").pathname);
   } catch {}
   return paths.some((path) => {
-    if (path.startsWith(DIAGNOSTICS_PATH)) return true;
-    try { return decodeURIComponent(path).startsWith(DIAGNOSTICS_PATH); }
+    if (DIAGNOSTICS_PATHS.some((prefix) => path.startsWith(prefix))) return true;
+    try { return DIAGNOSTICS_PATHS.some((prefix) => decodeURIComponent(path).startsWith(prefix)); }
     catch { return false; }
   });
+}
+
+function canonicalControlPath(url) {
+  return typeof url === "string" && url.startsWith(NEW_CONTROL_PREFIX) ? CONTROL_PREFIX + url.slice(NEW_CONTROL_PREFIX.length) : url;
+}
+
+const HEADER_NAMES = {
+  capability: ["x-ccshield-capability", "x-airkit-shield"],
+  control: ["x-ccshield-control", "x-airkit-shield-control"],
+  launch: ["x-ccshield-launch", "x-airkit-shield-launch"],
+};
+
+// A request carrying both spellings with different values is ambiguous; treat it as absent.
+function shieldHeader(request, kind) {
+  const [current, legacy] = HEADER_NAMES[kind].map((name) => request.headers[name]);
+  if (current !== undefined && legacy !== undefined && current !== legacy) return undefined;
+  return current ?? legacy;
 }
 
 function recordFailure(failures, { stage, reason, bytes, elapsedMs }) {
@@ -591,7 +610,7 @@ function hasIdentityContentEncoding(value) {
 function forwardHeaders(headers) {
   const forwarded = new Headers();
   for (const [name, value] of Object.entries(headers ?? {})) {
-    if (INTERNAL_HEADERS.has(name.toLowerCase()) || value === undefined) continue;
+    if (INTERNAL_HEADERS.has(name.toLowerCase()) || SHIELD_HEADER.test(name) || value === undefined) continue;
     forwarded.set(name, Array.isArray(value) ? value.join(", ") : value);
   }
   return forwarded;
@@ -601,7 +620,7 @@ function writeUpstreamHeaders(response, upstream) {
   const headers = {};
   for (const [name, value] of upstream.headers) {
     const normalized = name.toLowerCase();
-    if (normalized !== "content-encoding" && normalized !== "content-length" && !INTERNAL_HEADERS.has(normalized)) headers[name] = value;
+    if (normalized !== "content-encoding" && normalized !== "content-length" && !INTERNAL_HEADERS.has(normalized) && !SHIELD_HEADER.test(normalized)) headers[name] = value;
   }
   response.writeHead(upstream.status, headers);
 }

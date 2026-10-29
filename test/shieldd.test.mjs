@@ -86,6 +86,7 @@ test("daemon activates validated policy before proxy readiness and publishes its
     origin: "http://127.0.0.1:8811",
     capability: config.capability,
     version: 1,
+    wire: 2,
     pid: 4242,
     lane: "subscription",
     generation: "generation-1",
