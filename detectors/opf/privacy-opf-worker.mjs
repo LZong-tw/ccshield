@@ -560,7 +560,13 @@ async function main() {
       } else {
         scans += 1;
         task = scanQueue.then(async () => {
-          const reply = await handle(request, await ensureReady());
+          let current;
+          try { current = await ensureReady(); } catch (error) {
+            // A failed start still owes this scan a reply before the worker stops.
+            emit({ type: "scan", id: request.id, status: "unknown" });
+            throw error;
+          }
+          const reply = await handle(request, current);
           if (reply.status === "unknown") {
             emit(reply);
             await ensureReady();
