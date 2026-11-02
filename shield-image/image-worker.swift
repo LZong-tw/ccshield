@@ -112,15 +112,26 @@ func encode(_ context: CGContext) throws -> Data {
     return output
 }
 
+func makeTextRequest() -> VNRecognizeTextRequest {
+    let request = VNRecognizeTextRequest()
+    // macOS 27's default revision (3) fails every request after the first in a
+    // process with e5rtError 13 and costs ~30 s to load. Revision 2 reads the
+    // same zh-Hant/en-US text, stays usable across requests, and loads in ~3 s.
+    if VNRecognizeTextRequest.supportedRevisions.contains(2) {
+        request.revision = 2  // VNRecognizeTextRequestRevision2, deprecated by name only
+    }
+    request.recognitionLevel = .accurate
+    return request
+}
+
 func supportedLanguages() -> [String] {
-    (try? VNRecognizeTextRequest().supportedRecognitionLanguages()) ?? []
+    (try? makeTextRequest().supportedRecognitionLanguages()) ?? []
 }
 
 func ocr(_ context: CGContext) throws -> [String: Any] {
     let width = context.width, height = context.height
     guard let image = context.makeImage() else { throw ocrFailure("make_image") }
-    let request = VNRecognizeTextRequest()
-    request.recognitionLevel = .accurate
+    let request = makeTextRequest()
     request.usesLanguageCorrection = false
     request.minimumTextHeight = 0
     let available = supportedLanguages()
