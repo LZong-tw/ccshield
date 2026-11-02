@@ -478,12 +478,18 @@ function validateAllValues(values, expected) {
   }
 }
 
+// Logs only structural names (rule, context, key) so a blocked request says which control field tripped.
+function controlMutation(rule, context, key) {
+  try { process.stderr.write(`[opf-adapter] protocol control mutation rule=${rule} context=${context} key=${JSON.stringify(key ?? null)}\n`); } catch {}
+  return new Error("protocol control mutation");
+}
+
 // pinned, when given, collects the typed control and selector scalars of `before`.
 function validateJsonShape(before, after, context = before.type === "object"
   && before.children.some(({ key, value }) => key === "messages" && value.type === "array") ? "request" : "data", pinned) {
   const container = (node) => node.type === "object" || node.type === "array";
   const control = ["control", "thinking", "cache", "choice", "output"].includes(context);
-  if (control && (before.type !== after.type || !container(before) && before.value !== after.value)) throw new Error("protocol control mutation");
+  if (control && (before.type !== after.type || !container(before) && before.value !== after.value)) throw controlMutation("value", context, null);
   if (container(before) !== container(after) || (container(before) && before.type !== after.type)) throw new Error("invalid JSON topology");
   if (!container(before)) return;
   if (before.children.length !== after.children.length) throw new Error("invalid JSON topology");
@@ -499,7 +505,7 @@ function validateJsonShape(before, after, context = before.type === "object"
       if (keys.has(candidate.key) && keys.get(candidate.key) !== entry.key) throw new Error("JSON key collision");
       keys.set(candidate.key, entry.key);
       if ((control || ["tool", "citation", "source"].includes(context) || fixed[context]?.includes(entry.key))
-        && candidate.key !== entry.key) throw new Error("protocol control mutation");
+        && candidate.key !== entry.key) throw controlMutation("key", context, entry.key);
       const requiredTypes = {
         request: { model: "string", max_tokens: "number", temperature: "number", top_p: "number", top_k: "number", stream: "boolean",
           thinking: "object", tool_choice: "object", output_config: "object" },
@@ -515,12 +521,12 @@ function validateJsonShape(before, after, context = before.type === "object"
       if (required && [entry.value, candidate.value].some((node) => required === "number"
         ? node.type !== "literal" || !/^-?\d/.test(node.value) || !Number.isFinite(Number(node.value))
         : required === "boolean" ? node.type !== "literal" || !["true", "false"].includes(node.value)
-          : node.type !== required)) throw new Error("protocol control mutation");
+          : node.type !== required)) throw controlMutation(`type:${required}`, context, entry.key);
       const selector = context === "request" && entry.key === "model"
         || context === "message" && entry.key === "role"
         || context === "block" && entry.key === "type"
         || context === "block" && entry.key === "name" && before.children.some(({ key, value }) => key === "type" && ["tool_use", "server_tool_use"].includes(value.value));
-      if (selector && (entry.value.type !== candidate.value.type || entry.value.value !== candidate.value.value)) throw new Error("protocol control mutation");
+      if (selector && (entry.value.type !== candidate.value.type || entry.value.value !== candidate.value.value)) throw controlMutation("selector", context, entry.key);
       if ((required || selector) && !container(entry.value)) pinned?.add(entry.value);
     }
     let childContext = control ? "control" : "data";
