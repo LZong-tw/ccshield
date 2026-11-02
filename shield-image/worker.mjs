@@ -92,6 +92,7 @@ export function createImageWorker({ path, sha256, timeoutMs = 10_000, probeTimeo
   let nextId = 1;
   let queue = Promise.resolve();
   let closed = false;
+  let lastStep = null;
 
   function settle(error, line) {
     const current = pending;
@@ -99,11 +100,14 @@ export function createImageWorker({ path, sha256, timeoutMs = 10_000, probeTimeo
     pending = null;
     clearTimeout(current.timer);
     if (error) return current.reject(error);
+    const step = lastStep;
+    lastStep = null;
     try {
       let message;
       try { message = JSON.parse(line); } catch { fail("worker_protocol"); }
       current.resolve(parseResponse(message, current.op, current.id, limits));
     } catch (failure) {
+      if (failure.code === "ocr_failed" && step) failure.message = `image worker: ocr_failed (${step})`;
       if (failure.code === "worker_protocol") stop();
       current.reject(failure);
     }
@@ -121,6 +125,7 @@ export function createImageWorker({ path, sha256, timeoutMs = 10_000, probeTimeo
     const proc = spawn(path, [], { stdio: ["pipe", "pipe", "pipe"] });
     let stdout = Buffer.alloc(0);
     let stderrBytes = 0;
+    lastStep = null;
     proc.stdout.on("data", (chunk) => {
       if (proc !== child) return;
       stdout = Buffer.concat([stdout, chunk]);
@@ -141,6 +146,9 @@ export function createImageWorker({ path, sha256, timeoutMs = 10_000, probeTimeo
     // Drained and capped, never parsed or forwarded: it may contain OCR text.
     proc.stderr.on("data", (chunk) => {
       stderrBytes += chunk.length;
+      // Only a fixed-vocabulary step tag is kept; everything else is dropped.
+      const tag = /^ocr_failed:([a-z_]{1,32})$/m.exec(chunk.toString("utf8"));
+      if (tag && proc === child) lastStep = tag[1];
       if (stderrBytes > STDERR_CAP && proc === child) {
         stop();
         settle(new ImageWorkerError("worker_protocol"));

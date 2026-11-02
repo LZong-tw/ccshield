@@ -17,6 +17,13 @@ let ocrLanguages = ["zh-Hant", "en-US"]
 
 struct Failure: Error { let code: String }
 
+// Which OCR step failed. A fixed tag on stderr only (never OCR text), so the
+// host can say which guard tripped without widening the stdout protocol.
+func ocrFailure(_ step: String) -> Failure {
+    FileHandle.standardError.write(Data("ocr_failed:\(step)\n".utf8))
+    return Failure(code: "ocr_failed")
+}
+
 func isInteger(_ value: Any?) -> NSNumber? {
     guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
           number.doubleValue.isFinite, number.doubleValue.rounded() == number.doubleValue else { return nil }
@@ -111,15 +118,15 @@ func supportedLanguages() -> [String] {
 
 func ocr(_ context: CGContext) throws -> [String: Any] {
     let width = context.width, height = context.height
-    guard let image = context.makeImage() else { throw Failure(code: "ocr_failed") }
+    guard let image = context.makeImage() else { throw ocrFailure("make_image") }
     let request = VNRecognizeTextRequest()
     request.recognitionLevel = .accurate
     request.usesLanguageCorrection = false
     request.minimumTextHeight = 0
     let available = supportedLanguages()
-    guard ocrLanguages.allSatisfy(available.contains) else { throw Failure(code: "ocr_failed") }
+    guard ocrLanguages.allSatisfy(available.contains) else { throw ocrFailure("languages") }
     request.recognitionLanguages = ocrLanguages
-    do { try VNImageRequestHandler(cgImage: image, orientation: .up).perform([request]) } catch { throw Failure(code: "ocr_failed") }
+    do { try VNImageRequestHandler(cgImage: image, orientation: .up).perform([request]) } catch { throw ocrFailure("vision") }
     var regions: [(y: Int, x: Int, value: [String: Any])] = []
     for observation in request.results ?? [] {
         guard let candidate = observation.topCandidates(1).first else { continue }
@@ -130,7 +137,9 @@ func ocr(_ context: CGContext) throws -> [String: Any] {
         let y = min(max(0, Int(floor((1 - box.maxY) * Double(height)))), height)
         let right = min(max(0, Int(ceil(box.maxX * Double(width)))), width)
         let bottom = min(max(0, Int(ceil((1 - box.minY) * Double(height)))), height)
-        guard right > x, bottom > y else { throw Failure(code: "ocr_failed") }
+        // A box Vision placed wholly past an edge clamps to zero area; it
+        // covers no visible pixels, so there is nothing in it to mask.
+        guard right > x, bottom > y else { continue }
         let text = candidate.string.components(separatedBy: .newlines).joined(separator: " ")
         let confidence = min(1, max(0, Double(candidate.confidence)))
         regions.append((y, x, ["text": text, "confidence": confidence, "rect": ["x": x, "y": y, "w": right - x, "h": bottom - y]]))
