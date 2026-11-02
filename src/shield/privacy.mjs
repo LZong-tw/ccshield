@@ -21,7 +21,9 @@ const MAX_TOTAL = 4_294_967_295;
 // A fixed key set keeps the diagnostics payload bounded; everything else lands in "other".
 const TOTAL_FAILURE_REASONS = ["admission_limit", "queue_timeout", "scan_timeout", "model_timeout", "model_error", "model_killed", "worker_unavailable"];
 const REQUEST_FAILURE = Symbol("privacy request failure");
-const GRAPH_REASONS = new Set(["invalid-protocol-graph", "protocol-id-limit"]);
+const GRAPH_REASONS = new Set(["invalid-protocol-graph", "protocol-id-limit", "protocol-control-mutation"]);
+// Structural name of the tripped control field, built by the adapter from fixed vocabularies.
+const CONTROL_DETAIL = /^control:[a-z]+:[a-z]+:(?:[a-z_]+|-)$/;
 const GRAPH_DETAILS = new Set(["orphan", "duplicate", "role", "id", "limit"]);
 const ADAPTER_UNKNOWN_REASONS = new Set([
   "invalid-prediction", "inconsistent-counts", "invalid-span", "unmapped-span", "cross-field-span",
@@ -441,7 +443,7 @@ function segmentCounts(reply) {
 // The adapter names which protocol-graph rule failed; only these values reach diagnostics.
 function graphDetail(reply, result) {
   const graphFailure = result.status === "unknown" && GRAPH_REASONS.has(result.reason);
-  return graphFailure && GRAPH_DETAILS.has(reply?.detail) ? reply.detail : null;
+  return graphFailure && (GRAPH_DETAILS.has(reply?.detail) || CONTROL_DETAIL.test(reply?.detail ?? "")) ? reply.detail : null;
 }
 
 function ownCopy(result) {

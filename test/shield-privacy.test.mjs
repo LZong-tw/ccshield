@@ -60,6 +60,8 @@ test("recent scans keep an allowlisted protocol-graph detail and drop any other"
     { status: "unknown", reason: "invalid-protocol-graph", detail: sentinel },
     { status: "unknown", reason: "model_timeout", detail: "orphan" },
     { status: "ok", findings: [], detail: "duplicate" },
+    { status: "unknown", reason: "protocol-control-mutation", detail: "control:key:request:tool_choice" },
+    { status: "unknown", reason: "protocol-control-mutation", detail: `control:key:request:${sentinel}` },
   ];
   let next = 0;
   const worker = fakeWorker((message, emit) => {
@@ -78,6 +80,8 @@ test("recent scans keep an allowlisted protocol-graph detail and drop any other"
     ["invalid-protocol-graph", undefined],
     ["model_timeout", undefined],
     [null, undefined],
+    ["protocol-control-mutation", "control:key:request:tool_choice"],
+    ["protocol-control-mutation", undefined],
   ]);
   assert.doesNotMatch(JSON.stringify(filter.recentScans()), new RegExp(sentinel));
 });
