@@ -74,6 +74,7 @@ function planLaunchdService({ paths, nodePath, daemonPath } = {}) {
     operations: [
       { op: "mkdir", path: dirname(paths.launchAgentPath), mode: 0o700 },
       { op: "writeFileAtomic", path: paths.launchAgentPath, mode: 0o600, content: plistXml },
+      { op: "bootout", target: paths.launchdTarget },
       { op: "bootstrap", domain: paths.launchdDomain, path: paths.launchAgentPath },
       { op: "kickstart", target: paths.launchdTarget, kill: true },
     ],
@@ -90,6 +91,10 @@ async function installLaunchdService({ write = false, io = defaultIo, runLaunchc
   await io.writeFile(temporaryPath, plan.plistXml, { mode: 0o600 });
   await io.chmod(temporaryPath, 0o600);
   await io.rename(temporaryPath, plan.plistPath);
+  // launchd caches a loaded job's definition: bootstrap on a loaded service is
+  // tolerated as "already loaded" and kickstart -k restarts the old program
+  // path. Unloading first makes the rewritten plist the one that runs.
+  await launch(runLaunchctl, ["bootout", plan.target], true);
   await launch(runLaunchctl, ["bootstrap", plan.domain, plan.plistPath], true);
   await launch(runLaunchctl, ["kickstart", "-k", plan.target], false);
   return { ...plan, written: true };
