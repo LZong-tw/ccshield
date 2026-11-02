@@ -176,6 +176,8 @@ export async function startShieldDaemon({
           imagePii = results.flatMap((result) => result.piiFindings);
           imageTransforms = results.reduce((total, result) => total + Math.max(1, result.maskCount), 0);
         }
+        // The audit row reports what the worker did, not the pre-scan default.
+        mediaFacts.mediaOutcome = imageSecrets > 0 ? "blocked_secret" : "scanned";
       }
       const facts = classifyShieldRequest({ body: scanBody, launcherContext });
       let secretScan;
@@ -225,6 +227,7 @@ export async function startShieldDaemon({
         action: decision.action === "allow" ? "redact" : decision.action,
         redactedBody: textTransforms > 0 ? privacyScan.redactedBody : scanBody,
         transformCount: textTransforms + imageTransforms,
+        imageTransformCount: imageTransforms,
       });
     };
 
