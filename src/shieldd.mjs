@@ -167,7 +167,7 @@ export async function startShieldDaemon({
         } catch (error) {
           const refused = { too_many_images: "media_image_limit_blocked", image_rejected: "media_image_rejected_blocked" }[error?.code];
           if (refused) return { ...shape({ action: "block", reasonCodes: [refused], transformCount: 0 }), mediaOutcome: mediaOutcomeFor([refused]) };
-          throw shieldFailure("image_scan", IMAGE_FAILURES.has(error?.code) ? error.code : "image_scan_unavailable", "shield image scan unavailable");
+          throw shieldFailure("image_scan", IMAGE_FAILURES.has(error?.code) ? error.code : "image_scan_unavailable", "shield image scan unavailable", { cause: error });
         }
         imageSecrets = results.filter((result) => result.status === "secret").length;
         if (imageSecrets === 0) {

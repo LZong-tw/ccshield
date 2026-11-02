@@ -315,6 +315,17 @@ test("diagnostics sanitize arbitrary metadata and separate redaction, audit and 
   }
 });
 
+test("diagnostics keep the underlying cause of a generic image scan failure", async (t) => {
+  const inner = new Error("privacy rescan is unavailable");
+  const wrapped = Object.assign(new Error("shield image inspection failed: image_scan_unavailable", { cause: inner }), { name: "ImageInspectError" });
+  const shield = await startShield(t, { targetOrigin: "http://127.0.0.1:1", decide: async () => { throw createShieldFailure("image_scan", "image_scan_unavailable", "shield image scan unavailable", { cause: wrapped }); } });
+  const response = await fetch(`${shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield": CAPABILITY }, body: "{}" });
+  assert.equal(response.status, 503);
+  const [failure] = (await readDiagnostics(shield)).failures;
+  assert.equal(failure.reason, "image_scan_unavailable");
+  assert.equal(failure.cause, "ImageInspectError: shield image inspection failed: image_scan_unavailable <- Error: privacy rescan is unavailable");
+});
+
 test("diagnostics record incomplete body reads without retaining partially received content", async (t) => {
   const upstream = await startFixture(t, async (_request, response) => { assert.fail("an incomplete body must never forward"); response.end(); });
   const shield = await startShield(t, { targetOrigin: upstream.origin, decide: async () => assert.fail("an incomplete body must never be evaluated") });
