@@ -900,6 +900,8 @@ test("a clean text request plus a PII image is redacted with the text unchanged 
   assert.deepEqual(sourceOf(decision.redactedBody), { type: "base64", media_type: "image/png", data: MASKED_PNG.toString("base64") });
   assert.equal(JSON.parse(decision.redactedBody.toString("utf8")).messages[0].content[0].text, "look");
   assert.equal(decision.transformCount, 2);
+  assert.equal(decision.mediaOutcome, "scanned");
+  assert.equal(decision.imageTransformCount, 2);
   assert.deepEqual(calls.policy[0].piiFindings, [{ category: "email", count: 1 }]);
   assert.deepEqual(sourceOf(calls.privacy[0]).data, MASKED_PNG.toString("base64"), "text scanners see the spliced body");
   assert.equal(calls.inspect[0][0].lastTurn, true);
@@ -913,6 +915,8 @@ test("an allowed clean image still leaves normalized, as a transform", async () 
   assert.equal(sourceOf(decision.redactedBody).data, MASKED_PNG.toString("base64"));
   assert.equal(decision.transformCount, 1);
   assert.equal(decision.noCache, true);
+  assert.equal(decision.mediaOutcome, "scanned");
+  assert.equal(decision.imageTransformCount, 1);
 });
 
 test("a secret image blocks through policy as a confirmed secret", async () => {
@@ -922,6 +926,7 @@ test("a secret image blocks through policy as a confirmed secret", async () => {
   assert.deepEqual(calls.policy[0].secretFindings, [{ category: "image-ocr-secret", count: 1 }]);
   assert.equal(calls.privacy.length, 0);
   assert.equal(Object.hasOwn(decision, "redactedBody"), false);
+  assert.equal(decision.mediaOutcome, "blocked_secret");
 });
 
 test("too many new images in the last turn is an audited block; other inspector failures are unavailable", async () => {

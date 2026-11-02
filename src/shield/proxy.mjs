@@ -466,7 +466,7 @@ async function cachedDecision({ decisionCache, decisionContext: contextSource, b
   };
 }
 
-const MEDIA_FIELDS = ["noCache", "imageCount", "documentCount", "mediaOutcome"];
+const MEDIA_FIELDS = ["noCache", "imageCount", "imageTransformCount", "documentCount", "mediaOutcome"];
 
 // Media facts ride along with the decision so the audit can record them; the audit validates their values.
 function mediaFields(decision) {
