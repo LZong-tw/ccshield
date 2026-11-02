@@ -1463,7 +1463,7 @@ class OPF:
         assert type(cache).__name__ == "ExactWindowLogitsCache"
         assert f"cpu:threads{expected_threads()}:" in cache._namespace and "ctx4096" in cache._namespace
         assert "adb9dd7d6f47e482ccb0925e621a1375461b997833dfa5be6dfc67b9d58b6f0e" in cache._namespace
-        assert "6cab80adb4f510613e446bb6cffa43a2c9f304fb57957b45dd5f873cd894a149" in cache._namespace
+        assert "510e4f58264781618c0be3a28d41c944282d1f00955ab8e87825462ad1e1d705" in cache._namespace
         self.calls += 1
         scan_number[0] = self.calls
         if self.calls == 1:
@@ -1766,6 +1766,21 @@ syncBuiltinESMExports();
       // Two windows of 0.75 budget each: after the first miss the second cannot fit, so it never runs.
       assert.deepEqual(parseReplies(result), [{ type: "scan", id: "projected", status: "unknown", reason: "model_timeout",
         retryAfterSeconds: Math.min(60, Math.ceil(0.75 * scan / 1000)), cache: { hits: 0, misses: 1, windows: 2 } }]);
+    });
+    for (const scan of [30_000, 240_000]) await t.test(`a ${scan}ms retry of a projected timeout resumes from the cached window`, () => {
+      const marker = join(temp, `projected-retry-${scan}`);
+      const input = ["projected", "retry"].map((id) => JSON.stringify({ protocol: "airkit-privacy-ndjson-v1", id, type: "scan",
+        body: body.toString("base64"), budgetMs: scan })).join("\n") + "\n";
+      const result = spawnSync(process.execPath, workerArgs({ startup: 30_000, scan }), { input, encoding: "utf8", timeout: runTimeout,
+        env: { ...process.env, CCSHIELD_TEST_COOPERATIVE_MODE: "windows", CCSHIELD_TEST_COOPERATIVE_MARKER: marker,
+          CCSHIELD_OPF_WARM_SECONDS: "0", CCSHIELD_TEST_TOKENS: "8192" } });
+      const [first, retry] = parseReplies(result);
+      assert.equal(first.reason, "model_timeout");
+      // Both windows cold would need 1.5 budgets, but window 1 is cached, so only window 2's 0.75 is projected.
+      assert.equal(retry.id, "retry");
+      assert.equal(retry.status, "ok", `the retry must not be refused for windows it already has: ${JSON.stringify(retry)}`);
+      assert.deepEqual(retry.cache, { hits: 1, misses: 1, windows: 2 });
+      assert.deepEqual(verifiedResult(body, retry), { content: "[redacted:private_email]" });
     });
     await t.test("a frame budget above the worker's scan budget is refused before Python sees it", () => {
       const frames = [() => ({ budgetMs: 30_001 }), () => ({ budgetMs: 0 }), () => ({ budgetMs: 1.5 }), () => ({ budgetMs: "100" })]

@@ -324,10 +324,19 @@ class ExactWindowLogitsCache:
             return None
         return int(max(0, self._total - self._done) * self._miss_median * 1000)
 
+    # Block hooks, Viterbi and the worker call this inside or after a window, so it enforces only the hard
+    # deadline: projecting there would count the running window again and abort work that still fits.
     def check_deadline(self):
+        self._check(project=False)
+
+    # The projection prices every unscanned window (total - done) as cold; it cannot tell which of them are
+    # cached. It runs only before a cold forward and right after one, so cache hits ahead of the first cold
+    # window pass unprojected. That rescues a retry only while its cached windows form a contiguous prefix:
+    # an uncached window ahead of cached ones is still projected as if every later window were cold.
+    def _check(self, project):
         if self._deadline is not None:
             now, remaining = self._clock(), self._remaining_ms()
-            if now >= self._deadline or (remaining is not None and now + remaining / 1000 > self._deadline):
+            if now >= self._deadline or (project and remaining is not None and now + remaining / 1000 > self._deadline):
                 timeout = CooperativeScanTimeout("scan budget exhausted")
                 timeout.remaining_ms = remaining
                 raise timeout
@@ -368,12 +377,16 @@ class ExactWindowLogitsCache:
             result = self._entries[key][0].clone()
             self.check_deadline()
             return result
-        self._misses += 1
         disk_key = stored = None
         if self._disk is not None and self._disk.enabled:
             disk_key = self._disk.key(self._namespace, tokens, attention_mask)
             stored = self._disk_call(self._disk.get, disk_key, tokens.shape[-1])
-        if stored is None:
+        computed = stored is None
+        if computed:
+            self._check(project=True)
+        # Counted after the projection: a window it refuses was never looked up for this scan's work.
+        self._misses += 1
+        if computed:
             started = self._clock()
             logits = self.original_forward(tokens, attention_mask=attention_mask)
             # Only budgeted work is sampled: the startup warm-up is a short, cold forward that would skew projections.
@@ -396,7 +409,7 @@ class ExactWindowLogitsCache:
                 self._evictions += 1
             self._entries[key] = (stored, size)
             self._bytes += size
-        self.check_deadline()
+        self._check(project=computed)
         result = stored.clone()
         self.check_deadline()
         return result
@@ -543,6 +556,68 @@ def self_test():
                     cache.forward(window)
                 cache.end_scan()
             self.assertEqual(now[0], 50.0)
+
+        def test_a_window_the_projection_refuses_is_not_counted_as_a_miss(self):
+            cache, now = self.projected(10.0)
+            windows = [torch.tensor([[n]], dtype=torch.int32) for n in range(3)]
+            with torch.inference_mode():
+                cache.begin_scan(100, total_windows=1)
+                cache.forward(windows[0])
+                cache.end_scan()
+                self.assertEqual(cache.snapshot()["misses"], 1)
+                # Two cold windows at a 10 s median cannot fit in 15 s, so windows[1] is refused before its forward.
+                cache.begin_scan(15, total_windows=2)
+                with self.assertRaises(CooperativeScanTimeout):
+                    cache.forward(windows[1])
+                cache.end_scan()
+            self.assertEqual(now[0], 10.0)
+            self.assertEqual(cache.snapshot()["misses"], 1)
+
+        def test_a_retry_projects_only_the_windows_it_still_has_to_compute(self):
+            cache, now = self.projected(10.0)
+            windows = [torch.tensor([[n]], dtype=torch.int32) for n in range(5)]
+            with torch.inference_mode():
+                cache.begin_scan(35, total_windows=5)
+                with self.assertRaises(CooperativeScanTimeout):
+                    cache.forward(windows[0])
+                cache.end_scan()
+                # Five cold windows would need 50 s, but one is cached, so the other four fit in 45 s.
+                cache.begin_scan(45, total_windows=5)
+                for window in windows:
+                    cache.forward(window)
+                cache.end_scan()
+                self.assertEqual(now[0], 50.0)
+                # A body that warming finished costs nothing, whatever the cold projection says.
+                cache.begin_scan(1, total_windows=5)
+                for window in windows:
+                    cache.forward(window)
+                cache.end_scan()
+            self.assertEqual(now[0], 50.0)
+            self.assertEqual(cache.snapshot()["hits"], 6)
+
+        def test_a_window_already_running_is_not_projected_twice(self):
+            now = [0.0]
+            model = Model().eval()
+            original = model.forward
+            def hooked(tokens, attention_mask=None):
+                # A block hook halfway through the window, as the worker's deadline hooks do.
+                now[0] += 5.0
+                cache.check_deadline()
+                now[0] += 5.0
+                return original(tokens, attention_mask)
+            model.forward = hooked
+            cache = ExactWindowLogitsCache(model, namespace="ns", clock=lambda: now[0])
+            with torch.inference_mode():
+                cache.begin_scan(1000, total_windows=1)
+                cache.forward(torch.tensor([[1]], dtype=torch.int32))
+                cache.end_scan()
+                # Two 10 s windows end at 30 s, inside the 32 s deadline; counting the running window
+                # again at its hook would project 35 s and throw away half a window of work.
+                cache.begin_scan(22, total_windows=2)
+                for n in [2, 3]:
+                    cache.forward(torch.tensor([[n]], dtype=torch.int32))
+                cache.end_scan()
+            self.assertEqual(now[0], 30.0)
 
         def test_without_a_window_total_only_the_hard_deadline_applies(self):
             cache, now = self.projected(10.0)
