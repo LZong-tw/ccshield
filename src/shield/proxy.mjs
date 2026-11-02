@@ -103,7 +103,7 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
 
 async function handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision, isReady, approvalChannels, imageOverrides, onImageOverrideChange, now, failures, scanStats, scanTotals }) {
   const startedAt = Date.now();
-  const fail = (stage, reason, bytes = 0) => recordFailure(failures, { stage, reason, bytes, elapsedMs: Date.now() - startedAt });
+  const fail = (stage, reason, bytes = 0, cause) => recordFailure(failures, { stage, reason, bytes, elapsedMs: Date.now() - startedAt, cause });
   request.url = canonicalControlPath(request.url);
   if (isDiagnosticsPath(request.url)) {
     request.resume();
@@ -290,7 +290,7 @@ async function handleShieldRequest({ request, response, capability, controlCapab
   } catch (error) {
     if (lifecycle.signal.aborted) return;
     const failure = error?.shieldFailure;
-    if (FAILURE_REASONS.get(failure?.stage)?.has(failure?.reason)) fail(failure.stage, failure.reason, inspection.bytes);
+    if (FAILURE_REASONS.get(failure?.stage)?.has(failure?.reason)) fail(failure.stage, failure.reason, inspection.bytes, failure.cause);
     else fail("evaluation", "evaluation_unavailable", inspection.bytes);
     await finish(response, { status: 503, code: "shield_unavailable", retryAfterSeconds: validRetryAfter(failure ?? {}), message: failure?.stage === "image_scan" ? IMAGE_MESSAGES[failure.reason] : undefined });
     return;
@@ -400,14 +400,25 @@ function shieldHeader(request, kind) {
   return current ?? legacy;
 }
 
-function recordFailure(failures, { stage, reason, bytes, elapsedMs }) {
+function recordFailure(failures, { stage, reason, bytes, elapsedMs, cause }) {
   if (!FAILURE_REASONS.get(stage)?.has(reason)) return;
   const bounded = (value, max) => Number.isFinite(value) ? Math.min(max, Math.max(0, Math.floor(value))) : 0;
-  failures.push({ stage, reason, bytes: bounded(bytes, INSPECTION_MAX_BYTES), elapsedMs: bounded(elapsedMs, 3_600_000) });
+  failures.push({ stage, reason, bytes: bounded(bytes, INSPECTION_MAX_BYTES), elapsedMs: bounded(elapsedMs, 3_600_000), ...(typeof cause === "string" && cause !== "" ? { cause } : {}) });
   if (failures.length > 16) failures.shift();
 }
 
-export function createShieldFailure(stage, reason, message, { retryAfterSeconds } = {}) {
+// Local diagnostics only: the error chain's class and message, bounded, so a
+// generic reason such as image_scan_unavailable still says what actually broke.
+export function describeFailureCause(error) {
+  const parts = [];
+  for (let current = error, depth = 0; current && depth < 4; current = current.cause, depth += 1) {
+    const text = current instanceof Error ? `${current.name}: ${current.message}` : String(current);
+    parts.push(text.replace(/\s+/g, " ").slice(0, 160));
+  }
+  return parts.join(" <- ").slice(0, 400);
+}
+
+export function createShieldFailure(stage, reason, message, { retryAfterSeconds, cause } = {}) {
   const defaults = {
     body_read: "body_read_failed", evaluation: "evaluation_unavailable", secret_scan: "scanner_unavailable",
     privacy_scan: "privacy_unavailable", image_scan: "image_scan_unavailable", policy: "policy_unavailable", redaction: "redaction_invalid",
@@ -417,7 +428,7 @@ export function createShieldFailure(stage, reason, message, { retryAfterSeconds 
   const safeReason = FAILURE_REASONS.get(safeStage).has(reason) ? reason : defaults[safeStage];
   const retryAfter = validRetryAfter({ stage: safeStage, reason: safeReason, retryAfterSeconds });
   return Object.assign(new Error(message), {
-    shieldFailure: { stage: safeStage, reason: safeReason, ...(retryAfter === undefined ? {} : { retryAfterSeconds: retryAfter }) },
+    shieldFailure: { stage: safeStage, reason: safeReason, ...(retryAfter === undefined ? {} : { retryAfterSeconds: retryAfter }), ...(cause === undefined ? {} : { cause: describeFailureCause(cause) }) },
   });
 }
 
