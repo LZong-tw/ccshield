@@ -493,10 +493,10 @@ function controlMutation(rule, context, key) {
 
 // pinned, when given, collects the typed control and selector scalars of `before`.
 function validateJsonShape(before, after, context = before.type === "object"
-  && before.children.some(({ key, value }) => key === "messages" && value.type === "array") ? "request" : "data", pinned) {
+  && before.children.some(({ key, value }) => key === "messages" && value.type === "array") ? "request" : "data", pinned, field = null) {
   const container = (node) => node.type === "object" || node.type === "array";
   const control = ["control", "thinking", "cache", "choice", "output"].includes(context);
-  if (control && (before.type !== after.type || !container(before) && before.value !== after.value)) throw controlMutation("value", context, null);
+  if (control && (before.type !== after.type || !container(before) && before.value !== after.value)) throw controlMutation("value", context, typeof field === "string" && /^[a-z_]+$/.test(field) ? field : null);
   if (container(before) !== container(after) || (container(before) && before.type !== after.type)) throw new Error("invalid JSON topology");
   if (!container(before)) return;
   if (before.children.length !== after.children.length) throw new Error("invalid JSON topology");
@@ -557,7 +557,7 @@ function validateJsonShape(before, after, context = before.type === "object"
       childContext = textSource && entry.key === "data" ? "data" : "control";
     }
     else if (context === "block" && fixed.block.includes(entry.key) && !["type", "id", "tool_use_id", "name", "text", "input"].includes(entry.key)) childContext = "control";
-    validateJsonShape(entry.value, candidate.value, childContext, pinned);
+    validateJsonShape(entry.value, candidate.value, childContext, pinned, before.type === "array" ? field : entry.key);
   }
 }
 

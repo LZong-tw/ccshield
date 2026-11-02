@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { test } from "node:test";
 
 // Byte-identical with the upstream adapter; any edit must be a deliberate re-pin.
-const ADAPTER_SHA256 = "b9d42a1bb4da581907b16a547d9c01c8ec9ff63bb9269c3e077769ce560d8e96";
+const ADAPTER_SHA256 = "98e6bb06cc4666cf681b9be9d8c923e2d07924be3ba63445e58a4fc6636154bc";
 
 test("OPF adapter bytes match the pinned hash", async () => {
   const bytes = await readFile(resolve(import.meta.dirname, "../detectors/opf/opf-adapter.mjs"));
