@@ -346,7 +346,7 @@ export function adaptOpfPrediction(original, scan, result) {
     const reason = error instanceof Error && !(error instanceof SyntaxError)
       ? UNKNOWN_REASONS.get(error.message) ?? "adapter-error" : "adapter-error";
     const detail = reason === "adapter-error" ? undefined : error.graphDefect;
-    return GRAPH_DEFECTS.has(detail) ? { status: "unknown", findings: [], reason, detail } : { status: "unknown", findings: [], reason };
+    return GRAPH_DEFECTS.has(detail) || /^control:[a-z_]+:[a-z_]+:[a-z_-]+$/.test(detail ?? "") ? { status: "unknown", findings: [], reason, detail } : { status: "unknown", findings: [], reason };
   }
 }
 
@@ -478,10 +478,17 @@ function validateAllValues(values, expected) {
   }
 }
 
-// Logs only structural names (rule, context, key) so a blocked request says which control field tripped.
+// Names which control field tripped, from fixed vocabularies only; anything else is reported as "other".
+export const CONTROL_RULES = ["value", "key", "type", "selector"];
+export const CONTROL_CONTEXTS = ["request", "messages", "message", "block", "tools", "tool", "content", "data", "control", "thinking", "cache", "choice", "output"];
+export const CONTROL_KEYS = ["model", "messages", "system", "tools", "tool_choice", "max_tokens", "stream", "metadata", "temperature", "top_p", "top_k",
+  "stop_sequences", "thinking", "output_config", "service_tier", "mcp_servers", "context_management", "container", "cache_control", "role", "content",
+  "type", "text", "id", "tool_use_id", "name", "input", "is_error", "source", "signature", "data", "citations", "transformations", "file_id",
+  "defer_loading", "strict", "max_uses", "budget_tokens", "ttl", "disable_parallel_tool_use", "effort"];
 function controlMutation(rule, context, key) {
-  try { process.stderr.write(`[opf-adapter] protocol control mutation rule=${rule} context=${context} key=${JSON.stringify(key ?? null)}\n`); } catch {}
-  return new Error("protocol control mutation");
+  const part = (value, allowed) => allowed.includes(value) ? value : "other";
+  const defect = `control:${part(rule, CONTROL_RULES)}:${part(context, CONTROL_CONTEXTS)}:${key === null ? "-" : part(key, CONTROL_KEYS)}`;
+  return Object.assign(new Error("protocol control mutation"), { graphDefect: defect });
 }
 
 // pinned, when given, collects the typed control and selector scalars of `before`.
@@ -521,7 +528,7 @@ function validateJsonShape(before, after, context = before.type === "object"
       if (required && [entry.value, candidate.value].some((node) => required === "number"
         ? node.type !== "literal" || !/^-?\d/.test(node.value) || !Number.isFinite(Number(node.value))
         : required === "boolean" ? node.type !== "literal" || !["true", "false"].includes(node.value)
-          : node.type !== required)) throw controlMutation(`type:${required}`, context, entry.key);
+          : node.type !== required)) throw controlMutation("type", context, entry.key);
       const selector = context === "request" && entry.key === "model"
         || context === "message" && entry.key === "role"
         || context === "block" && entry.key === "type"

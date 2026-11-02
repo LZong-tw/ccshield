@@ -70,6 +70,9 @@ function opaqueConversation(prefix = "Contact Alice today") {
   ] };
 }
 
+// Control-mutation results also name the tripped field; these checks compare everything else.
+const withoutDetail = ({ detail, ...rest }) => rest;
+
 test("OPF provider-issued opaque values stay out of the scan and survive byte for byte", () => {
   for (const prefix of ["Contact Alice today", "請在週一聯絡 Alice，謝謝"]) {
     const fixture = opaqueConversation(prefix);
@@ -707,6 +710,8 @@ test("OPF fixed Messages keys stay locked while spans wholly inside selector val
     const result = adaptOpfPrediction(original, scan, prediction(scan.text, "secret", value));
     assert.equal(result.status, "unknown", `unsafe protocol change for ${value}`);
     assert.equal(result.reason, "protocol-control-mutation");
+    assert.match(result.detail, /^control:(value|key|type|selector):[a-z]+:(?:[a-z_]+|-)$/);
+    assert.doesNotMatch(result.detail, /fixture|inspect/);
   }
   for (const value of ["claude-fixture", "fixture", "user", "text", "inspect"]) {
     const original = Buffer.from(JSON.stringify(fixture));
@@ -762,7 +767,7 @@ test("OPF spans crossing a control value boundary, malformed controls and thinki
   ]) {
     const original = Buffer.from(JSON.stringify(fixture));
     const scan = prepareOpfScan(original);
-    assert.deepEqual(adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", selected)),
+    assert.deepEqual(withoutDetail(adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", selected))),
       { status: "unknown", findings: [], reason }, selected);
   }
   // A dropped selector span must not mask the signed-block failure of another span.
@@ -797,7 +802,7 @@ test("OPF known scalar and nested control knobs remain protocol controls in thei
   for (const [fixture, selected, expected] of cases) {
     const original = Buffer.from(JSON.stringify(fixture));
     const scan = prepareOpfScan(original);
-    assert.deepEqual(adaptOpfPrediction(original, scan, prediction(scan.text, "secret", selected)), expected, selected);
+    assert.deepEqual(withoutDetail(adaptOpfPrediction(original, scan, prediction(scan.text, "secret", selected))), expected, selected);
   }
 });
 
@@ -834,7 +839,7 @@ test("OPF citation and document-source controls stay locked", () => {
     source({ type: "text", media_type: "Alice", data: "x" })]) {
     const original = Buffer.from(JSON.stringify(fixture));
     const scan = prepareOpfScan(original);
-    assert.deepEqual(adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice")),
+    assert.deepEqual(withoutDetail(adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice"))),
       { status: "unknown", findings: [], reason: "protocol-control-mutation" }, JSON.stringify(fixture));
   }
 });
@@ -843,7 +848,7 @@ test("OPF known primitive control types cannot be passed through as malformed Me
   for (const extra of [{ max_tokens: "4096" }, { stream: "true" }, { temperature: "0.5" }, { top_k: true }]) {
     const original = Buffer.from(JSON.stringify({ model: "claude-fixture", messages: [{ role: "user", content: "Alice" }], ...extra }));
     const scan = prepareOpfScan(original);
-    assert.deepEqual(adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice")),
+    assert.deepEqual(withoutDetail(adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice"))),
       { status: "unknown", findings: [], reason: "protocol-control-mutation" });
   }
 });
@@ -1552,6 +1557,7 @@ import childProcess from "node:child_process";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
+
 if (process.env.CCSHIELD_TEST_PARALLELISM) os.availableParallelism = () => Number(process.env.CCSHIELD_TEST_PARALLELISM);
 const note = (event) => fs.appendFileSync(process.env.CCSHIELD_TEST_SPY_LOG, event + " " + Date.now() + "\\n");
 const createReadStream = fs.createReadStream;
