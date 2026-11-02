@@ -149,9 +149,23 @@ test("shield install writes a private plist only with --write semantics", async 
     assert.deepEqual(await readShieldConfig({ paths }), config);
     assert.match(await readFile(paths.launchAgentPath, "utf8"), /<string>--config<\/string>/);
     assert.deepEqual(calls, [
+      ["bootout", paths.launchdTarget],
       ["bootstrap", paths.launchdDomain, paths.launchAgentPath],
       ["kickstart", "-k", paths.launchdTarget],
     ]);
+  } finally {
+    await rm(homeDir, { recursive: true, force: true });
+  }
+});
+
+test("shield install over a loaded service unloads it first so launchd picks up the new plist", async () => {
+  const homeDir = await mkdtemp(join(tmpdir(), "ccshield-service-"));
+  const { options } = fixture(homeDir);
+  const calls = [];
+  const notLoaded = { ok: false, stderr: "Boot-out failed: 3: No such process" };
+  try {
+    await installShieldService({ ...options, write: true, runLaunchctl: async (args) => { calls.push(args[0]); return args[0] === "bootout" ? notLoaded : { ok: true }; } });
+    assert.deepEqual(calls, ["bootout", "bootstrap", "kickstart"], "a first install with nothing loaded still succeeds");
   } finally {
     await rm(homeDir, { recursive: true, force: true });
   }
