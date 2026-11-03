@@ -20,7 +20,7 @@ const FAILURE_REASONS = new Map([
   ["privacy_scan", new Set([
     "privacy_unavailable", "worker_closed", "body_invalid", "admission_limit", "frame_limit", "queue_timeout",
     "scan_timeout", "worker_unavailable", "protocol_invalid", "assets_invalid", "reply_invalid", "findings_invalid", "redaction_invalid",
-    "invalid-prediction", "inconsistent-counts", "invalid-span", "unmapped-span", "cross-field-span",
+    "invalid-prediction", "prediction-span-limit", "inconsistent-counts", "invalid-span", "unmapped-span", "cross-field-span",
     "inconsistent-quoting", "unmapped-finding", "redaction-too-large", "value-survived",
     "invalid-protocol-graph", "protocol-id-collision", "conflicting-protocol-context", "protocol-id-limit", "adapter-error",
     "protocol-graph-mutation", "protocol-control-mutation", "signed-block-mutation",

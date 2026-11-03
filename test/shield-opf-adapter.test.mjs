@@ -120,7 +120,7 @@ test("OPF readable thinking text with a detected value fails closed as a signed 
 
 test("OPF adapter unknown reasons are all accepted by the OSS privacy filter", () => {
   // Mirror of OSS ADAPTER_UNKNOWN_REASONS (src/shield/privacy.mjs); a reason missing there degrades to privacy_unavailable.
-  const accepted = new Set(["invalid-prediction", "inconsistent-counts", "invalid-span", "unmapped-span", "cross-field-span",
+  const accepted = new Set(["invalid-prediction", "prediction-span-limit", "inconsistent-counts", "invalid-span", "unmapped-span", "cross-field-span",
     "inconsistent-quoting", "unmapped-finding", "redaction-too-large", "value-survived",
     "invalid-protocol-graph", "protocol-id-collision", "conflicting-protocol-context", "protocol-id-limit", "adapter-error",
     "protocol-graph-mutation", "protocol-control-mutation", "signed-block-mutation",
@@ -913,11 +913,11 @@ test("OPF duplicate cross-field predictions count distinct source coverage once"
   const original = Buffer.from('["Alice","Smith"]');
   const scan = prepareOpfScan(original);
   const result = adaptOpfPrediction(original, scan, multiplePredictions(scan.text,
-    Array(1024).fill(["private_person", scan.text])));
+    Array(8192).fill(["private_person", scan.text])));
   assert.deepEqual(verifiedResult(original, result), ["[redacted:private_person]", "[redacted:private_person]"]);
   assert.deepEqual(result.findings, [{ label: "private_person", count: 2 }]);
-  const excess = multiplePredictions(scan.text, Array(1025).fill(["private_person", scan.text]));
-  assert.deepEqual(adaptOpfPrediction(original, scan, excess), { status: "unknown", findings: [], reason: "invalid-prediction" });
+  const excess = multiplePredictions(scan.text, Array(8193).fill(["private_person", scan.text]));
+  assert.deepEqual(adaptOpfPrediction(original, scan, excess), { status: "unknown", findings: [], reason: "prediction-span-limit" });
 });
 
 function paddedBody(fixture, bytes = 549102) {
@@ -956,6 +956,53 @@ test("OPF 549102-byte single-field repeats preserve all batched proof through th
   assert.equal(result.redactions.flatMap(({ spans }) => spans).length, 1025);
   for (const { spans } of result.redactions) for (const { start, end } of spans) assert.equal(original.subarray(start, end).toString(), "Alice");
   await normalizedResult(original, result);
+});
+
+// One distinct name per turn, so the model reports one span per message (backlog #7: ~440 KB bodies
+// carried more than 1024 spans and were refused as invalid-prediction after the model had finished).
+function namedTranscript(names, bytes) {
+  const messages = names.map((name, index) => ({ role: index % 2 ? "assistant" : "user",
+    content: [{ type: "text", text: `Ticket ${index}: ${name} asked about the invoice.` }] }));
+  return paddedBody({ model: "claude-sonnet-5-5", max_tokens: 16, system: "You are a helpful assistant.", messages }, bytes);
+}
+
+function spansFor(text, names, label = "private_person") {
+  const spans = [];
+  let from = 0;
+  for (const name of names) {
+    const start = text.indexOf(name, from);
+    assert.notEqual(start, -1, name);
+    spans.push({ label, start, end: start + name.length, text: name, placeholder: "<PRIVATE>" });
+    from = start + name.length;
+  }
+  return { schema_version: 1, text, redacted_text: text,
+    summary: { output_mode: "typed", span_count: spans.length, by_label: { [label]: spans.length }, decoded_mismatch: false },
+    detected_spans: spans };
+}
+
+test("OPF adapts a 450 KB transcript whose prediction carries more than 1024 spans", async () => {
+  const names = Array.from({ length: 3000 }, (_, index) => `Person${String(index).padStart(5, "0")}`);
+  const original = namedTranscript(names, 450_000);
+  assert.ok(original.length >= 440_000);
+  const scan = prepareOpfScan(original);
+  const result = adaptOpfPrediction(original, scan, spansFor(scan.text, names));
+  assert.equal(result.status, "ok", result.reason);
+  assert.deepEqual(result.findings.map(({ count }) => count), [1024, 1024, 952]);
+  const body = verifiedResult(original, result);
+  assert.equal(JSON.stringify(body).includes("Person"), false);
+  await normalizedResult(original, result);
+});
+
+test("OPF prediction span limit sits at the projection bound: 8192 adapts, 8193 is refused by name", () => {
+  const names = Array.from({ length: 8193 }, (_, index) => `Person${String(index).padStart(5, "0")}`);
+  const original = Buffer.from(JSON.stringify({ content: names.join(" ") }));
+  const scan = prepareOpfScan(original);
+  const result = adaptOpfPrediction(original, scan, spansFor(scan.text, names.slice(0, 8192)));
+  assert.equal(result.status, "ok", result.reason);
+  assert.equal(result.redactions.reduce((count, { count: value }) => count + value, 0), 8192);
+  assert.equal(verifiedResult(original, result).content.endsWith(" Person08192"), true);
+  assert.deepEqual(adaptOpfPrediction(original, scan, spansFor(scan.text, names)),
+    { status: "unknown", findings: [], reason: "prediction-span-limit" });
 });
 
 test("OPF long decoded fields avoid call argument limits while preserving every repeated range", () => {

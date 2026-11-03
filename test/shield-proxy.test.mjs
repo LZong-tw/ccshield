@@ -117,7 +117,7 @@ test("diagnostics separate real daemon scan, policy and redaction failures while
     const reply = request.type === "health"
       ? { type: "health", id: request.id, protocol: request.protocol, version: "privacy-1" }
       : mode === "prediction" ? { type: "scan", id: request.id, status: "unknown", reason: "invalid-prediction", private: "prediction-secret" }
-        : ["model_timeout", "model_error", "model_killed", "protocol-graph-mutation", "protocol-control-mutation", "signed-block-mutation", "invalid-source-provenance", "json-key-collision", "invalid-json-topology", "redaction-projection-limit", "redaction-match-limit", "redaction-body-limit", "redaction-frame-limit", "segment-coverage", "segment-cache-invalid"].includes(mode) ? { type: "scan", id: request.id, status: "unknown", reason: mode, private: "worker-private-secret" }
+        : ["prediction-span-limit", "model_timeout", "model_error", "model_killed", "protocol-graph-mutation", "protocol-control-mutation", "signed-block-mutation", "invalid-source-provenance", "json-key-collision", "invalid-json-topology", "redaction-projection-limit", "redaction-match-limit", "redaction-body-limit", "redaction-frame-limit", "segment-coverage", "segment-cache-invalid"].includes(mode) ? { type: "scan", id: request.id, status: "unknown", reason: mode, private: "worker-private-secret" }
         : mode === "unknown" ? { type: "scan", id: request.id, status: "unknown", reason: "credential-secret" }
           : { type: "scan", id: request.id, status: "ok", findings: [] };
     worker.stdout.emit("data", `${JSON.stringify(reply)}\n`);
@@ -147,6 +147,7 @@ test("diagnostics separate real daemon scan, policy and redaction failures while
   t.after(() => daemon.shield.close());
   for (const [nextMode, stage, reason] of [
     ["prediction", "privacy_scan", "invalid-prediction"], ["unknown", "privacy_scan", "privacy_unavailable"],
+    ["prediction-span-limit", "privacy_scan", "prediction-span-limit"],
     ["model_timeout", "privacy_scan", "model_timeout"], ["model_error", "privacy_scan", "model_error"], ["model_killed", "privacy_scan", "model_killed"],
     ["protocol-graph-mutation", "privacy_scan", "protocol-graph-mutation"], ["protocol-control-mutation", "privacy_scan", "protocol-control-mutation"],
     ["signed-block-mutation", "privacy_scan", "signed-block-mutation"],

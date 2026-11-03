@@ -13,6 +13,7 @@ const PROTOCOL_ID = /^[a-zA-Z0-9_-]+$/;
 const OPAQUE_VALUE = /^[A-Za-z0-9+/=_-]{16,}$/;
 export const UNKNOWN_REASONS = new Map([
   ["invalid prediction", "invalid-prediction"],
+  ["prediction span limit", "prediction-span-limit"],
   ["inconsistent counts", "inconsistent-counts"],
   ["invalid span", "invalid-span"],
   ["unmapped span", "unmapped-span"],
@@ -155,7 +156,9 @@ export function adaptOpfPrediction(original, scan, result) {
   try {
     if (result?.schema_version !== 1 || result?.text !== scan.text || result.summary?.output_mode !== "typed"
       || result.summary?.decoded_mismatch !== false || !Array.isArray(result.detected_spans)
-      || result.detected_spans.length > 1024 || result.summary.span_count !== result.detected_spans.length) throw new Error("invalid prediction");
+      || result.summary.span_count !== result.detected_spans.length) throw new Error("invalid prediction");
+    // Same bound as the ranges the spans project into; it also caps the per-span work below.
+    if (result.detected_spans.length > MAX_PROJECTED_RANGES) throw new Error("prediction span limit");
     const reported = new Map();
     for (const span of result.detected_spans) reported.set(span.label, (reported.get(span.label) ?? 0) + 1);
     const byLabel = result.summary.by_label;
@@ -178,11 +181,14 @@ export function adaptOpfPrediction(original, scan, result) {
         || chars.slice(span.start, span.end).join("") !== span.text) throw new Error("invalid span");
       // A detector hit wholly inside a typed control or selector value (model, role, block type, tool name, ...)
       // is a false positive the API cannot accept altered; drop it. Spans reaching past that value stay fail-closed.
-      const home = scan.sources.findIndex((source) => source.start <= span.start && span.end <= source.end);
+      // Sources are ordered and disjoint (provenance-checked above), so overlaps start at the first one ending after the span starts.
+      const first = firstSourceEndingAfter(scan.sources, span.start);
+      const home = first < scan.sources.length && scan.sources[first].start <= span.start && span.end <= scan.sources[first].end ? first : -1;
       if (home >= 0 && pinned.has(canonical.sources[home].node)) continue;
       kept += 1;
       let projected = false;
-      for (const source of scan.sources) {
+      for (let index = first; index < scan.sources.length && scan.sources[index].start < span.end; index += 1) {
+        const source = scan.sources[index];
         const start = Math.max(source.start, span.start);
         const end = Math.min(source.end, span.end);
         if (end <= start) continue;
@@ -359,6 +365,17 @@ function collectKeyNodes(root) {
     else if (node.type === "array") for (const { value } of node.children) stack.push(value);
   }
   return keys;
+}
+
+function firstSourceEndingAfter(sources, offset) {
+  let low = 0;
+  let high = sources.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (sources[middle].end > offset) high = middle;
+    else low = middle + 1;
+  }
+  return low;
 }
 
 function containsFragment(value, fragment) {

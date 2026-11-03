@@ -26,7 +26,7 @@ const GRAPH_REASONS = new Set(["invalid-protocol-graph", "protocol-id-limit", "p
 const CONTROL_DETAIL = /^control:[a-z]+:[a-z]+:(?:[a-z_]+|-)$/;
 const GRAPH_DETAILS = new Set(["orphan", "duplicate", "role", "id", "limit"]);
 const ADAPTER_UNKNOWN_REASONS = new Set([
-  "invalid-prediction", "inconsistent-counts", "invalid-span", "unmapped-span", "cross-field-span",
+  "invalid-prediction", "prediction-span-limit", "inconsistent-counts", "invalid-span", "unmapped-span", "cross-field-span",
   "inconsistent-quoting", "unmapped-finding", "redaction-too-large", "value-survived",
   "invalid-protocol-graph", "protocol-id-collision", "conflicting-protocol-context", "protocol-id-limit", "adapter-error",
   "protocol-graph-mutation", "protocol-control-mutation", "signed-block-mutation",
