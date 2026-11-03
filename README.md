@@ -76,9 +76,9 @@ planned.
 When the daemon answers `503 shield_unavailable` (or blocks an oversized body),
 it appends one JSON line to `failures.jsonl` in the lane's state directory
 (`~/.local/share/ccshield/<lane>/`, mode 0600): `ts`, `stage`, `reason`,
-`bytes`, `elapsedMs`, `queuedMs` for a failed privacy scan that was admitted
-to the queue, and `launch`, a 12-character SHA-256 prefix of the launch id.
-Body text, redacted text and headers are never written. The file rotates to
+`bytes`, `elapsedMs`, `queuedMs` when the privacy worker queue failed a scan
+it had admitted (validation failures after a completed scan carry none), and
+`launch`, a 12-character SHA-256 prefix of the launch id. Body text, redacted text and headers are never written. The file rotates to
 `failures.jsonl.1` at 256 KiB, so at most two files exist. `ccshield doctor`
 prints the last 10 entries as `recentFailures`. The control-only diagnostics
 endpoint keeps the last 16 failures in memory with the same `ts` and `launch`,
@@ -89,9 +89,9 @@ fields.
 until it failed if it never did (a queue timeout or a lost worker). Two cases
 read differently from what the name suggests:
 
-- Refusals before admission (`admission_limit`, and `worker_closed` or
-  `body_invalid` from a closed filter or a bad body) never waited, so they have
-  no `queuedMs`.
+- `admission_limit`, and `body_invalid` or `worker_closed` returned before
+  admission, never waited and have no `queuedMs`. A `worker_closed` that
+  interrupted an already-queued or running scan does carry its wait.
 - Concurrent requests with an identical body share one scan, and every one of
   them receives the first requester's wait, not its own.
 
