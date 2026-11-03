@@ -10,7 +10,7 @@ import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 
-import { prepareOpfScan, adaptOpfPrediction, UNKNOWN_REASONS } from "../detectors/opf/opf-adapter.mjs";
+import { prepareOpfScan, adaptOpfPrediction, FragmentMatcher, UNKNOWN_REASONS } from "../detectors/opf/opf-adapter.mjs";
 import { buildOpfWorkerArgs } from "../src/shield/opf-args.mjs";
 import { createPrivacyFilter, isVerifiedRedaction } from "../src/shield/privacy.mjs";
 
@@ -1003,6 +1003,71 @@ test("OPF prediction span limit sits at the projection bound: 8192 adapts, 8193 
   assert.equal(verifiedResult(original, result).content.endsWith(" Person08192"), true);
   assert.deepEqual(adaptOpfPrediction(original, scan, spansFor(scan.text, names)),
     { status: "unknown", findings: [], reason: "prediction-span-limit" });
+});
+
+test("OPF fragment matcher reports exactly the occurrences a per-pattern indexOf finds", () => {
+  let seed = 20261103;
+  const random = (limit) => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % limit; };
+  const units = ["a", "b", "ab", "\u{1f600}", "\ud83d", "\ude00", "\n"];
+  const word = (length) => Array.from({ length }, () => units[random(units.length)]).join("");
+  const highSplit = (value, offset) => offset > 0 && /[\ud800-\udbff]/.test(value[offset - 1]) && /[\udc00-\udfff]/.test(value[offset] ?? "");
+  for (let round = 0; round < 500; round += 1) {
+    const patterns = [...new Set(Array.from({ length: 1 + random(6) }, () => word(1 + random(4))))];
+    const text = word(random(40));
+    const matcher = new FragmentMatcher(patterns);
+    const found = [];
+    matcher.scan(text, (pattern, end) => { found.push(`${end}:${pattern}`); });
+    const expected = [];
+    const whole = [];
+    patterns.forEach((pattern, index) => {
+      for (let at = text.indexOf(pattern); at >= 0; at = text.indexOf(pattern, at + 1)) {
+        expected.push(`${at + pattern.length}:${index}`);
+        if (!highSplit(text, at) && !highSplit(text, at + pattern.length)) whole.push(at);
+      }
+    });
+    assert.deepEqual(found.sort(), expected.sort(), JSON.stringify({ patterns, text }));
+    assert.equal(matcher.includesWhole(text), whole.length > 0, JSON.stringify({ patterns, text }));
+  }
+});
+
+test("OPF adapts 8192 spans over ~80k values in ~850 KB well inside the worker's adapter slack", () => {
+  // The worker adapts after the model has used its budget and the proxy allows only a few seconds more,
+  // so this guards the cost shape rather than benchmarking it: matching every fragment against every value
+  // took 14-30 s here, one pass over the values takes well under one.
+  const names = Array.from({ length: 8192 }, (_, index) => `Person${String(index).padStart(5, "0")}`);
+  const messages = [];
+  for (let next = 0, index = 0; index < 1900; index += 1) {
+    messages.push({ role: index % 2 ? "assistant" : "user", content: Array.from({ length: 10 }, () => ({
+      type: "text", text: next < names.length ? `T ${names[next++]} x` : "filler text here" })) });
+  }
+  const original = Buffer.from(JSON.stringify({ model: "claude-sonnet-5-5", max_tokens: 16, system: "s", messages }));
+  assert.ok(original.length > 800_000 && original.length < 900_000, String(original.length));
+  const scan = prepareOpfScan(original);
+  assert.ok(scan.allValues.length > 80_000);
+  const started = performance.now();
+  const result = adaptOpfPrediction(original, scan, spansFor(scan.text, names));
+  const elapsedMs = performance.now() - started;
+  assert.equal(result.status, "ok", result.reason);
+  assert.equal(result.redactions.reduce((count, { count: value }) => count + value, 0), 8192);
+  assert.ok(elapsedMs < 5000, `adapter took ${Math.round(elapsedMs)} ms`);
+  assert.equal(JSON.stringify(verifiedResult(original, result)).includes("Person"), false);
+});
+
+test("OPF refuses span sets whose text outgrows the body and hit counts past the match bound", () => {
+  const text = "a".repeat(200_000);
+  const original = Buffer.from(JSON.stringify({ content: text }));
+  const scan = prepareOpfScan(original);
+  const base = scan.text.indexOf(text);
+  const spans = (ranges) => ({ schema_version: 1, text: scan.text, redacted_text: scan.text,
+    summary: { output_mode: "typed", span_count: ranges.length, by_label: { private_person: ranges.length }, decoded_mismatch: false },
+    detected_spans: ranges.map(([start, end]) => ({ label: "private_person", start: base + start, end: base + end,
+      text: "a".repeat(end - start), placeholder: "<PRIVATE>" })) });
+  // Six whole-value spans repeat 1.2 M characters of a 200 KB body: refused before any of it is copied.
+  assert.deepEqual(adaptOpfPrediction(original, scan, spans(Array(6).fill([0, text.length]))),
+    { status: "unknown", findings: [], reason: "prediction-span-limit" });
+  // One short fragment that recurs 200k times stops at the hit bound instead of listing every occurrence.
+  assert.deepEqual(adaptOpfPrediction(original, scan, spans([[0, 1]])),
+    { status: "unknown", findings: [], reason: "redaction-match-limit" });
 });
 
 test("OPF long decoded fields avoid call argument limits while preserving every repeated range", () => {
