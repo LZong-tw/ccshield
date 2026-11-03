@@ -1202,6 +1202,51 @@ class CacheTests(unittest.TestCase):
         cache.end_scan()
         self.assertEqual(model.calls, 1)
 
+    # Backlog #9: the client resends the same body; the worker warms that text while idle and the retry
+    # interrupts it. Each retry must reuse every window cached before it, so the body converges.
+    def retry_until_complete(self, windows, cost, budget, gap):
+        clock, model, cache = self.make_cache()
+        model.cost = cost
+        windows = [Tensor(n) for n in range(windows)]
+        attempts = []
+        for _ in range(10):
+            before = cache.snapshot()
+            cache.begin_scan(budget, total_windows=len(windows))
+            try:
+                for window in windows: cache.forward(window)
+                completed = True
+            except helper.CooperativeScanTimeout:
+                completed = False
+            finally:
+                cache.end_scan()
+            after = cache.snapshot()
+            attempts.append((completed, after["hits"] - before["hits"], after["misses"] - before["misses"]))
+            if completed: break
+            retry_at = clock.value + gap
+            cache.begin_scan(600.0, interrupt=lambda: clock.value >= retry_at)
+            try:
+                for window in windows: cache.forward(window)
+            except helper.ScanInterrupted:
+                pass
+            finally:
+                cache.end_scan()
+        return attempts, model.calls
+
+    def test_same_body_retries_resume_from_cached_windows(self):
+        # ~250 KB: 16 windows at 4 s is 64 s cold against the 55 s cooperative share of a 60 s budget.
+        attempts, calls = self.retry_until_complete(16, 4.0, 55.0, 10.0)
+        self.assertEqual([completed for completed, _, _ in attempts], [False, True], attempts)
+        self.assertEqual(attempts[1][1], 4, attempts)
+        self.assertEqual(calls, 16)
+
+    def test_bodies_colder_than_the_budget_converge_through_warming(self):
+        # ~700 KB: 60 windows at 4.5 s is 270 s cold against the 240 s budget, retried every 30 s.
+        attempts, calls = self.retry_until_complete(60, 4.5, 240.0, 30.0)
+        self.assertTrue(attempts[-1][0], attempts)
+        self.assertLessEqual(len(attempts), 3, attempts)
+        for _, hits, _ in attempts[1:]: self.assertGreater(hits, 0, attempts)
+        self.assertEqual(calls, 60)
+
     def test_failed_compute_and_invalid_logits_are_not_cached(self):
         clock, model, cache = self.make_cache()
         cache.begin_scan(1.0)
