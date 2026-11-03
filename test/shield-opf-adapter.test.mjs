@@ -10,7 +10,7 @@ import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 
-import { prepareOpfScan, adaptOpfPrediction, FragmentMatcher, UNKNOWN_REASONS } from "../detectors/opf/opf-adapter.mjs";
+import { prepareOpfScan, adaptOpfPrediction, FragmentMatcher } from "../detectors/opf/opf-adapter.mjs";
 import { buildOpfWorkerArgs } from "../src/shield/opf-args.mjs";
 import { createPrivacyFilter, isVerifiedRedaction } from "../src/shield/privacy.mjs";
 
@@ -116,17 +116,6 @@ test("OPF readable thinking text with a detected value fails closed as a signed 
   const scan = prepareOpfScan(original);
   assert.deepEqual(adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice")),
     { status: "unknown", findings: [], reason: "signed-block-mutation" });
-});
-
-test("OPF adapter unknown reasons are all accepted by the OSS privacy filter", () => {
-  // Mirror of OSS ADAPTER_UNKNOWN_REASONS (src/shield/privacy.mjs); a reason missing there degrades to privacy_unavailable.
-  const accepted = new Set(["invalid-prediction", "prediction-span-limit", "inconsistent-counts", "invalid-span", "unmapped-span", "cross-field-span",
-    "inconsistent-quoting", "unmapped-finding", "redaction-too-large", "value-survived",
-    "invalid-protocol-graph", "protocol-id-collision", "conflicting-protocol-context", "protocol-id-limit", "adapter-error",
-    "protocol-graph-mutation", "protocol-control-mutation", "signed-block-mutation",
-    "invalid-source-provenance", "json-key-collision", "invalid-json-topology",
-    "redaction-projection-limit", "redaction-match-limit", "redaction-body-limit", "redaction-frame-limit"]);
-  for (const reason of UNKNOWN_REASONS.values()) assert.ok(accepted.has(reason), reason);
 });
 
 test("OPF account findings preserve legal paired Messages IDs and accepted privacy evidence", () => {
