@@ -12,6 +12,7 @@ import { readShieldPolicyProvision } from "./shield/policy-bundle.mjs";
 import { loadShieldPolicy } from "./shield/policy.mjs";
 import { openPrivacyDetector } from "./shield/privacy-detector.mjs";
 import { createPrivacyFilter, isVerifiedRedaction } from "./shield/privacy.mjs";
+import { createFailureLog } from "./shield/failure-log.mjs";
 import { createShieldFailure as shieldFailure, startShieldProxy } from "./shield/proxy.mjs";
 import { DOCUMENT_COVERAGE, extractMedia, mediaOutcomeFor, patchImages } from "./shield/media.mjs";
 import { createImageInspector } from "../shield-image/inspector.mjs";
@@ -231,6 +232,7 @@ export async function startShieldDaemon({
       });
     };
 
+    const failureLog = createFailureLog({ path: paths.failureLogPath });
     await writePolicyState({ paths, state: { version: policy.version, detectorVersions: policy.detectorVersions } });
     shield = await startProxy({
       capability: config.capability,
@@ -241,6 +243,7 @@ export async function startShieldDaemon({
       // Policy activation restarts this daemon after identity quiescence. This
       // cache is process-local, so no terminal decision survives that boundary.
       decisionCache: createCache(),
+      onFailure: failureLog.append,
       decisionContext: () => {
         privacy.refresh();
         return { lane: config.lane, destinationClass, policyVersion: policy.version, detectorVersions: privacy.detectorVersions() };

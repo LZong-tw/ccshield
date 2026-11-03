@@ -21,13 +21,15 @@ const CAPABILITY = "c".repeat(32);
 const CONTROL_CAPABILITY = "d".repeat(32);
 const LAUNCH_A = "1".repeat(32);
 const LAUNCH_B = "2".repeat(32);
-// Worst case is 16 failures, 32 recent scans with a graph detail and saturated totals with every field at its bound, disk counters included: 9,302 bytes.
-const DIAGNOSTICS_MAX_BYTES = 12_288;
+// Worst case is 16 failures, 32 recent scans with a graph detail and saturated totals with every field at its bound, disk counters
+// and each failure's ts, launch and 400-unit cause included: 48,774 bytes, nearly all of it escaped cause text.
+const DIAGNOSTICS_MAX_BYTES = 49_152;
 
 test("diagnostics size limit covers the worst-case payload", () => {
   const reason = "conflicting-protocol-context";
   const max = 4_294_967_295;
-  const failure = { stage: "privacy_scan", reason, bytes: 1_048_576, elapsedMs: 3_600_000 };
+  // describeFailureCause caps the cause at 400 UTF-16 units; control characters are the costliest to JSON-escape.
+  const failure = { ts: "2026-10-29T01:02:03.000Z", stage: "privacy_scan", reason, bytes: 1_048_576, elapsedMs: 3_600_000, launch: "a".repeat(12), cause: "\u0001".repeat(400) };
   const scan = { status: "unavailable", reason, detail: "duplicate", hits: 65_536, misses: 65_536, diskHits: 65_536, segmentHits: 65_536, segmentMisses: 65_536, attached: 8, elapsedMs: 3_600_000, queuedMs: 3_600_000 };
   const failuresByReason = Object.fromEntries(["admission_limit", "queue_timeout", "scan_timeout", "model_timeout", "model_error", "model_killed", "worker_unavailable", "other"].map((key) => [key, max]));
   const totals = { scans: max, ok: max, unknown: max, unavailable: max, coalesced: max, aborted: max,
@@ -77,7 +79,8 @@ test("diagnostics are control-only, nondestructive and never forward endpoint va
   assert.equal(diagnostics.failures.length, 16);
   assert.deepEqual(diagnostics.failures.map((failure) => failure.bytes), Array.from({ length: 16 }, (_, index) => index + 5));
   for (const failure of diagnostics.failures) {
-    assert.deepEqual(Object.keys(failure).sort(), ["bytes", "elapsedMs", "reason", "stage"]);
+    assert.deepEqual(Object.keys(failure).sort(), ["bytes", "elapsedMs", "reason", "stage", "ts"]);
+    assert.match(failure.ts, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
     assert.equal(failure.stage, "evaluation");
     assert.equal(failure.reason, "evaluation_unavailable");
     assert.equal(Number.isInteger(failure.elapsedMs) && failure.elapsedMs >= 0 && failure.elapsedMs <= 3_600_000, true);

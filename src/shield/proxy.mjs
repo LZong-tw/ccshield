@@ -60,7 +60,7 @@ const IMAGE_MESSAGES = Object.freeze({
 });
 const LAUNCH_ID = /^[a-f0-9]{32}$/;
 
-export async function startShieldProxy({ capability, controlCapability, targetOrigin, allowDestinationLeases = false, decide, decisionCache = null, decisionContext = null, approvalBroker = null, recordShieldDecision = null, onDecision = null, onImageOverrideChange = null, isReady = null, scanStats = null, scanTotals = null, now = Date.now, port = 0 } = {}) {
+export async function startShieldProxy({ capability, controlCapability, targetOrigin, allowDestinationLeases = false, decide, decisionCache = null, decisionContext = null, approvalBroker = null, recordShieldDecision = null, onDecision = null, onImageOverrideChange = null, isReady = null, scanStats = null, scanTotals = null, onFailure = null, now = Date.now, port = 0 } = {}) {
   assertCapability(capability);
   assertCapability(controlCapability);
   const target = targetOrigin === undefined && allowDestinationLeases ? null : assertFixedTarget(targetOrigin);
@@ -70,6 +70,7 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
     throw new TypeError("shield proxy approval broker is invalid");
   }
   if (isReady !== null && typeof isReady !== "function") throw new TypeError("shield proxy readiness function is invalid");
+  if (onFailure !== null && typeof onFailure !== "function") throw new TypeError("shield proxy failure listener is invalid");
   if (onImageOverrideChange !== null && typeof onImageOverrideChange !== "function") throw new TypeError("shield image override listener is invalid");
   if (typeof now !== "function") throw new TypeError("shield proxy clock is invalid");
   assertPort(port);
@@ -87,7 +88,7 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
   const imageOverrides = new Set();
   const failures = [];
   const server = createServer((request, response) => {
-    void handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision: record, isReady, approvalChannels, imageOverrides, onImageOverrideChange, now, failures, scanStats, scanTotals });
+    void handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision: record, isReady, approvalChannels, imageOverrides, onImageOverrideChange, now, failures, onFailure, scanStats, scanTotals });
   });
   await listenLoopback(server, port);
   const address = server.address();
@@ -101,9 +102,10 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
   };
 }
 
-async function handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision, isReady, approvalChannels, imageOverrides, onImageOverrideChange, now, failures, scanStats, scanTotals }) {
+async function handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision, isReady, approvalChannels, imageOverrides, onImageOverrideChange, now, failures, onFailure, scanStats, scanTotals }) {
   const startedAt = Date.now();
-  const fail = (stage, reason, bytes = 0, cause) => recordFailure(failures, { stage, reason, bytes, elapsedMs: Date.now() - startedAt, cause });
+  const fail = (stage, reason, bytes = 0, { cause, queuedMs } = {}) =>
+    recordFailure(failures, onFailure, { stage, reason, bytes, elapsedMs: Date.now() - startedAt, cause, queuedMs, launchId: shieldHeader(request, "launch") });
   request.url = canonicalControlPath(request.url);
   if (isDiagnosticsPath(request.url)) {
     request.resume();
@@ -290,7 +292,7 @@ async function handleShieldRequest({ request, response, capability, controlCapab
   } catch (error) {
     if (lifecycle.signal.aborted) return;
     const failure = error?.shieldFailure;
-    if (FAILURE_REASONS.get(failure?.stage)?.has(failure?.reason)) fail(failure.stage, failure.reason, inspection.bytes, failure.cause);
+    if (FAILURE_REASONS.get(failure?.stage)?.has(failure?.reason)) fail(failure.stage, failure.reason, inspection.bytes, { cause: failure.cause, queuedMs: failure.queuedMs });
     else fail("evaluation", "evaluation_unavailable", inspection.bytes);
     await finish(response, { status: 503, code: "shield_unavailable", retryAfterSeconds: validRetryAfter(failure ?? {}), message: failure?.stage === "image_scan" ? IMAGE_MESSAGES[failure.reason] : undefined });
     return;
@@ -400,11 +402,23 @@ function shieldHeader(request, kind) {
   return current ?? legacy;
 }
 
-function recordFailure(failures, { stage, reason, bytes, elapsedMs, cause }) {
+function recordFailure(failures, onFailure, { stage, reason, bytes, elapsedMs, cause, queuedMs, launchId }) {
   if (!FAILURE_REASONS.get(stage)?.has(reason)) return;
   const bounded = (value, max) => Number.isFinite(value) ? Math.min(max, Math.max(0, Math.floor(value))) : 0;
-  failures.push({ stage, reason, bytes: bounded(bytes, INSPECTION_MAX_BYTES), elapsedMs: bounded(elapsedMs, 3_600_000), ...(typeof cause === "string" && cause !== "" ? { cause } : {}) });
+  // The launch id is a correlation handle, not something to keep in the clear; a short digest is enough to group retries.
+  const launch = typeof launchId === "string" && launchId.length > 0 ? createHash("sha256").update(launchId).digest("hex").slice(0, 12) : undefined;
+  // ts and launch appear in both the ring and the persisted log so the two records of one failure can be matched.
+  const failure = {
+    ts: new Date().toISOString(), stage, reason, bytes: bounded(bytes, INSPECTION_MAX_BYTES), elapsedMs: bounded(elapsedMs, 3_600_000),
+    ...(launch ? { launch } : {}),
+  };
+  // The cause is error-message text and may echo request content, so it stays in the in-memory ring and never reaches onFailure.
+  failures.push({ ...failure, ...(typeof cause === "string" && cause !== "" ? { cause } : {}) });
   if (failures.length > 16) failures.shift();
+  if (onFailure === null) return;
+  try {
+    onFailure({ ...failure, ...(Number.isFinite(queuedMs) ? { queuedMs: bounded(queuedMs, 3_600_000) } : {}) });
+  } catch {}
 }
 
 // Local diagnostics only: the error chain's class and message, bounded, so a
@@ -418,7 +432,7 @@ export function describeFailureCause(error) {
   return parts.join(" <- ").slice(0, 400);
 }
 
-export function createShieldFailure(stage, reason, message, { retryAfterSeconds, cause } = {}) {
+export function createShieldFailure(stage, reason, message, { retryAfterSeconds, cause, queuedMs } = {}) {
   const defaults = {
     body_read: "body_read_failed", evaluation: "evaluation_unavailable", secret_scan: "scanner_unavailable",
     privacy_scan: "privacy_unavailable", image_scan: "image_scan_unavailable", policy: "policy_unavailable", redaction: "redaction_invalid",
@@ -428,7 +442,12 @@ export function createShieldFailure(stage, reason, message, { retryAfterSeconds,
   const safeReason = FAILURE_REASONS.get(safeStage).has(reason) ? reason : defaults[safeStage];
   const retryAfter = validRetryAfter({ stage: safeStage, reason: safeReason, retryAfterSeconds });
   return Object.assign(new Error(message), {
-    shieldFailure: { stage: safeStage, reason: safeReason, ...(retryAfter === undefined ? {} : { retryAfterSeconds: retryAfter }), ...(cause === undefined ? {} : { cause: describeFailureCause(cause) }) },
+    shieldFailure: {
+      stage: safeStage, reason: safeReason,
+      ...(retryAfter === undefined ? {} : { retryAfterSeconds: retryAfter }),
+      ...(cause === undefined ? {} : { cause: describeFailureCause(cause) }),
+      ...(Number.isFinite(queuedMs) ? { queuedMs } : {}),
+    },
   });
 }
 

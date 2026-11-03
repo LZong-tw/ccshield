@@ -33,6 +33,9 @@ export function shieldPaths({ env = process.env, homeDir = homeFromEnv(env), uid
     socketPath: childPath(socketPath ?? join(root, "shield.sock"), root, "socketPath"),
     auditDatabasePath: childPath(join(root, "audit.sqlite"), root, "auditDatabasePath"),
     windowCachePath: childPath(join(root, "opf-window-cache"), root, "windowCachePath"),
+    failureLogPath: childPath(join(root, "failures.jsonl"), root, "failureLogPath"),
+    stdoutLogPath: childPath(join(root, "daemon.out.log"), root, "stdoutLogPath"),
+    stderrLogPath: childPath(join(root, "daemon.err.log"), root, "stderrLogPath"),
     platform: linux ? "linux" : "darwin",
   };
   if (linux) {

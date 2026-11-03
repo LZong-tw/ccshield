@@ -71,6 +71,69 @@ time a new `node` binary reads it, macOS may show an access prompt; choose
 file with looser permissions is refused. Linux Secret Service support is
 planned.
 
+## Failure log
+
+When the daemon answers `503 shield_unavailable` (or blocks an oversized body),
+it appends one JSON line to `failures.jsonl` in the lane's state directory
+(`~/.local/share/ccshield/<lane>/`, mode 0600): `ts`, `stage`, `reason`,
+`bytes`, `elapsedMs`, `queuedMs` when the privacy worker queue failed a scan
+it had admitted (validation failures after a completed scan carry none), and
+`launch`, a 12-character SHA-256 prefix of the launch id. Body text, redacted text and headers are never written. The file rotates to
+`failures.jsonl.1` at 256 KiB, so at most two files exist. `ccshield doctor`
+prints the last 10 entries as `recentFailures`. The control-only diagnostics
+endpoint keeps the last 16 failures in memory with the same `ts` and `launch`,
+plus a bounded `cause` that is never written to disk; match the two on those
+fields.
+
+`queuedMs` is the wait from admission until the scan reached the worker, or
+until it failed if it never did (a queue timeout or a lost worker). Two cases
+read differently from what the name suggests:
+
+- `admission_limit`, and `body_invalid` or `worker_closed` returned before
+  admission, never waited and have no `queuedMs`. A `worker_closed` that
+  interrupted an already-queued or running scan does carry its wait.
+- Concurrent requests with an identical body share one scan, and every one of
+  them receives the first requester's wait, not its own.
+
+Each failure is written synchronously on the request path (`stat`, `append`,
+`chmod`). Failures are rare enough that this is accepted; a write error is
+swallowed and the `503` still goes out.
+
+On macOS the launchd job also sends the daemon's stdout and stderr to
+`daemon.out.log` and `daemon.err.log` in the same directory. Neither file is
+rotated or size-capped. The daemon itself writes only fixed strings there, but
+an uncaught exception lets Node print the error message and stack, which may
+quote request content and then stays on disk until removed by hand.
+
+### Upgrading an installed lane
+
+The plist now carries `StandardOutPath` and `StandardErrorPath`, so a plist
+written by an older release no longer matches what this release expects. Both
+`ccshield start` and `ccshield policy install --write` refuse a mismatched
+plist with `shield launch plist path drift detected`. The policy install is the
+dangerous one: it stops the running daemon before it tries to start the new
+one, so on a drifted plist the lane is left stopped (fail-closed: every request
+is refused) until the plist is rewritten.
+
+After upgrading, run `install --write` once before any `start` or
+`policy install`, but only for lanes that are actually installed and running.
+Skip a lane that has been disabled on purpose (for example a managed lane
+turned off with `launchctl disable`); installing it would bring it back.
+
+```bash
+# only for lanes that are installed and running, e.g.:
+ccshield install --lane subscription --write
+```
+
+`install --write` rewrites the plist and reloads the job. It also generates a
+fresh `capability`, `controlCapability` and `generation` for the lane, so
+anything holding the old values has to pick up the new ones.
+
+A successful `install --write` reports state `degraded` and exits with code 1.
+That is expected: install only writes and reloads the service, it does not
+prove the lane is healthy. Check it afterwards with `ccshield status`
+rather than treating the non-zero exit as a failure.
+
 ## Threat model: OPF window cache
 
 The OPF detector can keep model logits for complete 4096-token windows on disk,

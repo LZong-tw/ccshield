@@ -362,7 +362,11 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
           clearTimeout(entry.timer);
           entry.body = null;
           if (inflight.get(digest) === entry) inflight.delete(digest);
-          for (const waiter of entry.waiters) waiter.release(ownCopy(result));
+          // Every failure carries its queue wait so the daemon's failure log can tell queueing from model time.
+          // An entry that never left the queue (queue timeout, worker loss) waited until now. Coalesced waiters
+          // receive the first requester's wait.
+          const delivered = result.status === "ok" ? result : Object.freeze({ ...result, queuedMs: (entry.dispatchedAt ?? Date.now()) - entry.admittedAt });
+          for (const waiter of entry.waiters) waiter.release(ownCopy(delivered));
           entry.waiters.clear();
         },
       };

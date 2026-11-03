@@ -222,7 +222,9 @@ test("privacy unknown reasons preserve only the pinned worker and adapter's fixe
     const filter = await createPrivacyFilter({ provision, spawnWorker: () => worker, validateWorker });
     t.after(() => filter.close());
     const result = await filter.scan(Buffer.from(JSON.stringify({ content: sentinel })));
-    assert.deepEqual(result, { status: "unknown", findings: [], reason: allowed.includes(reason) ? reason : "privacy_unavailable" });
+    const { queuedMs, ...rest } = result;
+    assert.equal(Number.isInteger(queuedMs) && queuedMs >= 0, true);
+    assert.deepEqual(rest, { status: "unknown", findings: [], reason: allowed.includes(reason) ? reason : "privacy_unavailable" });
     assert.doesNotMatch(JSON.stringify(result), new RegExp(sentinel));
     if (["model_killed", "model_error", "model_timeout"].includes(reason)) {
       assert.equal(await filter.isReady(), false);
@@ -630,6 +632,40 @@ test("expired waiting scans never dispatch and each admitted scan gets its timeo
   assert.equal(worker.messages.filter((message) => message.type === "scan").length, 2);
 });
 
+test("every failed scan carries its queue wait, including queue timeouts and worker loss", async (t) => {
+  const worker = fakeWorker((message, emit) => {
+    if (message.type === "health") emit(health(message));
+  });
+  const filter = await createPrivacyFilter({ provision, spawnWorker: () => worker, validateWorker, timeoutMs: 100 });
+  t.after(() => filter.close());
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const first = filter.scan(Buffer.from('{"content":"first"}'));
+  const second = filter.scan(Buffer.from('{"content":"second"}'));
+  const expired = filter.scan(Buffer.from('{"content":"expired"}'));
+  await flushTasks();
+  t.mock.timers.tick(80);
+  emit(worker, { type: "scan", id: worker.messages.at(-1).id, status: "ok", findings: [] });
+  assert.equal("queuedMs" in await first, false);
+  await flushTasks();
+  const stranded = filter.scan(Buffer.from('{"content":"stranded"}'));
+  await flushTasks();
+  // Never dispatched: the queue timer fires at admission + 100.
+  t.mock.timers.tick(20);
+  await flushTasks();
+  const timedOut = await expired;
+  assert.equal(timedOut.reason, "queue_timeout");
+  assert.equal(timedOut.queuedMs, 100);
+  // Dispatched at 80 and lost to its scan timeout; the scan still queued behind it settles on the worker loss.
+  t.mock.timers.tick(80);
+  await flushTasks();
+  const lost = await second;
+  assert.equal(lost.status, "unavailable");
+  assert.equal(lost.queuedMs, 80);
+  const dropped = await stranded;
+  assert.equal(dropped.status, "unavailable");
+  assert.equal(dropped.queuedMs, 100);
+});
+
 test("identical concurrent bodies share one worker scan but each caller owns its result and buffer", async (t) => {
   const worker = fakeWorker((message, emit) => {
     if (message.type === "health") emit(health(message));
@@ -743,7 +779,10 @@ test("a failed shared scan hands every waiter the same unknown result", async (t
   await flushTasks();
   emit(worker, { type: "scan", id: worker.messages.at(-1).id, status: "unknown", reason: "model_error" });
   const results = await Promise.all(scans);
-  for (const result of results) assert.deepEqual(result, { status: "unknown", findings: [], reason: "model_error" });
+  for (const { queuedMs, ...result } of results) {
+    assert.equal(Number.isInteger(queuedMs), true);
+    assert.deepEqual(result, { status: "unknown", findings: [], reason: "model_error" });
+  }
   assert.equal(worker.messages.filter((message) => message.type === "scan").length, 1);
 });
 

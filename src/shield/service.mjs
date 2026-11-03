@@ -50,7 +50,7 @@ export async function inspectShieldService(options = {}) {
   return backendFor(options.paths).inspect(options);
 }
 
-function planLaunchdService({ paths, nodePath, daemonPath } = {}) {
+export function planLaunchdService({ paths, nodePath, daemonPath } = {}) {
   assertShieldPaths(paths);
   for (const [name, value] of Object.entries({ nodePath, daemonPath })) {
     if (typeof value !== "string" || !isAbsolute(value)) throw new Error(`${name} must be an absolute path`);
@@ -62,6 +62,8 @@ function planLaunchdService({ paths, nodePath, daemonPath } = {}) {
     RunAtLoad: true,
     KeepAlive: true,
     ProcessType: "Standard",
+    StandardOutPath: paths.stdoutLogPath,
+    StandardErrorPath: paths.stderrLogPath,
   };
   const plistXml = renderPlist(plist);
   return {
