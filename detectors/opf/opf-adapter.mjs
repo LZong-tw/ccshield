@@ -10,6 +10,11 @@ const MAX_SPAN_CHARS = MAX_BODY_BYTES;
 // A request that keeps its findings needs at most MAX_PROOF_RANGES usable matches; the slack covers
 // matches dropped for splitting a surrogate pair. Past this the outcome is already a limit failure.
 const MAX_MATCH_HITS = 4 * MAX_PROOF_RANGES;
+// A Map-backed trie is relatively expensive per code unit. Decoded fragments are already bounded by
+// MAX_SPAN_CHARS; original byte slices can overlap and add up to many times the body, so they use the
+// smaller bound and fall back to Buffer.indexOf without changing the survival check.
+const MAX_TRIE_UNITS = MAX_BODY_BYTES;
+const MAX_ORIGINAL_TRIE_BYTES = 256 * 1024;
 const MAX_PROOF_BATCH = 1024;
 const MAX_PROOF_ENTRIES = 128;
 const MAX_PROTOCOL_IDS = 4096;
@@ -283,10 +288,12 @@ export function adaptOpfPrediction(original, scan, result) {
         if (span.label === "secret" || (previous.label !== "secret" && span.label < previous.label)) previous.label = span.label;
       } else ranges.push({ ...span });
     }
-    // Latin-1 maps each byte to one code unit, so the same matcher searches the original JSON bytes.
-    const originalMatcher = new FragmentMatcher([...new Set(replacements.map(({ start, end }) => original.toString("latin1", start, end)))]);
+    // A bounded Latin-1 trie handles the usual case. Large overlapping original slices would make a
+    // trie much larger than the request itself, so OriginalBytesMatcher keeps Buffer views and uses
+    // native indexOf instead; both paths perform the same byte-survival check.
+    const originalMatcher = new OriginalBytesMatcher(original, replacements);
     const safeReplacement = (value) => !matcher.includesWhole(value)
-      && !originalMatcher.scan(Buffer.from(JSON.stringify(value)).toString("latin1"), () => true);
+      && !originalMatcher.includes(Buffer.from(JSON.stringify(value)));
     const markers = new Map();
     const markerFor = (label) => {
       if (markers.has(label)) return markers.get(label);
@@ -350,10 +357,7 @@ export function adaptOpfPrediction(original, scan, result) {
     const candidate = prepareOpfScan(redacted);
     validateOpaqueValues(canonical.opaque, candidate.opaque);
     const opaqueRanges = candidate.opaque.entries.map(({ node }) => ({ start: node.map[0].start - 1, end: node.map.at(-1).end + 1 }));
-    if (originalMatcher.scan(redacted.toString("latin1"), (pattern, end) => {
-      const start = end - originalMatcher.lengths[pattern];
-      return !opaqueRanges.some((range) => start >= range.start && end <= range.end);
-    })) throw new Error("value survived");
+    if (originalMatcher.includesOutside(redacted, opaqueRanges)) throw new Error("value survived");
     if (hasDecodedResidual(candidate.root, matcher, candidate.opaque.nodes)) throw new Error("value survived");
     validateProtocolIds(canonical.protocolIds, candidate.protocolIds);
     validateJsonShape(canonical.root, candidate.root);
@@ -400,12 +404,55 @@ function firstSourceEndingAfter(sources, offset) {
   return low;
 }
 
+class OriginalBytesMatcher {
+  constructor(original, replacements) {
+    const unique = new Set();
+    const patterns = [];
+    let units = 0;
+    for (const { start, end } of replacements) {
+      const pattern = original.toString("latin1", start, end);
+      if (unique.has(pattern)) continue;
+      if (units + pattern.length > MAX_ORIGINAL_TRIE_BYTES) {
+        this.buffers = replacements.map((range) => original.subarray(range.start, range.end));
+        return;
+      }
+      unique.add(pattern);
+      patterns.push(pattern);
+      units += pattern.length;
+    }
+    this.matcher = new FragmentMatcher(patterns, MAX_ORIGINAL_TRIE_BYTES);
+  }
+
+  includes(bytes) {
+    if (this.matcher) return this.matcher.scan(bytes.toString("latin1"), () => true);
+    return this.buffers.some((pattern) => bytes.indexOf(pattern) >= 0);
+  }
+
+  includesOutside(bytes, opaqueRanges) {
+    const outside = (start, end) => !opaqueRanges.some((range) => start >= range.start && end <= range.end);
+    if (this.matcher) return this.matcher.scan(bytes.toString("latin1"), (pattern, end) => {
+      return outside(end - this.matcher.lengths[pattern], end);
+    });
+    for (const pattern of this.buffers) {
+      for (let at = bytes.indexOf(pattern); at >= 0; at = bytes.indexOf(pattern, at + 1)) {
+        if (outside(at, at + pattern.length)) return true;
+      }
+    }
+    return false;
+  }
+}
+
 // Aho-Corasick over UTF-16 code units: one pass over a value reports every occurrence of every pattern,
 // so scanning costs the value length plus the hits rather than patterns x values.
 export class FragmentMatcher {
-  constructor(patterns) {
+  constructor(patterns, maxUnits = MAX_TRIE_UNITS) {
+    let units = 0;
+    for (const pattern of patterns) {
+      if (typeof pattern !== "string" || pattern.length === 0 || pattern.length > maxUnits - units) throw new Error("matcher pattern limit");
+      units += pattern.length;
+    }
     this.lengths = patterns.map((pattern) => pattern.length);
-    const size = 1 + patterns.reduce((total, pattern) => total + pattern.length, 0);
+    const size = 1 + units;
     this.edges = new Map();
     this.output = new Int32Array(size).fill(-1);
     this.fail = new Int32Array(size);

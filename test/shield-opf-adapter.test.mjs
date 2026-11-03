@@ -1019,8 +1019,62 @@ test("OPF fragment matcher reports exactly the occurrences a per-pattern indexOf
   }
 });
 
+function mixedEscapeValue(decoded, escapedAt) {
+  const pieces = [];
+  for (let index = 0; index < decoded.length; index += 1) pieces.push(decoded[index] === "a" && escapedAt(index) ? "\\u0061" : decoded[index]);
+  return pieces.join("");
+}
+
+function oneSpan(scan, start, end) {
+  const text = Array.from(scan.text).slice(start, end).join("");
+  return { schema_version: 1, text: scan.text, redacted_text: scan.text,
+    summary: { output_mode: "typed", span_count: 1, by_label: { private_person: 1 }, decoded_mismatch: false },
+    detected_spans: [{ label: "private_person", start, end, text, placeholder: "<PRIVATE>" }] };
+}
+
+test("OPF bounds original-byte matching for a small periodic mixed-escape value", () => {
+  // Thousands of decoded-equivalent overlapping matches have distinct original byte slices. Building one
+  // trie from all slices previously exhausted V8's Map after allocating about 1 GB.
+  const decoded = "ab".repeat(6000);
+  const encoded = mixedEscapeValue(decoded, (index) => ((index * 1103515245 + 12345) >>> 16) % 3 === 0);
+  const original = Buffer.from(`{"content":"${encoded}"}`);
+  assert.ok(original.length > 21_000 && original.length < 36_000, String(original.length));
+  const scan = prepareOpfScan(original);
+  const start = scan.text.indexOf(decoded);
+  const started = performance.now();
+  const result = adaptOpfPrediction(original, scan, oneSpan(scan, start, start + 1000));
+  const elapsedMs = performance.now() - started;
+  assert.equal(result.status, "ok", result.reason);
+  assert.notEqual(result.reason, "adapter-error");
+  assert.ok(elapsedMs < 5000, `adapter took ${Math.round(elapsedMs)} ms`);
+  assert.equal(verifiedResult(original, result).content, "[redacted:private_person]");
+});
+
+test("OPF bounds original-byte matching for six long suffix spans in a normal near-limit body", () => {
+  const encoded = Array.from({ length: 6 }, (_, field) => mixedEscapeValue(
+    `${field}-${"ab".repeat(22_500)}`, (index) => index % 2 === 0));
+  const original = Buffer.from(`{${encoded.map((value, index) => `"field${index}":"${value}"`).join(",")}}`);
+  assert.ok(original.length > 900_000 && original.length < 1_000_000, String(original.length));
+  const scan = prepareOpfScan(original);
+  const spans = encoded.map((unused, index) => {
+    const text = `${index}-${"ab".repeat(22_500)}`;
+    const start = scan.text.indexOf(text);
+    return { label: "private_person", start, end: start + text.length, text, placeholder: "<PRIVATE>" };
+  });
+  const prediction = { schema_version: 1, text: scan.text, redacted_text: scan.text,
+    summary: { output_mode: "typed", span_count: spans.length, by_label: { private_person: spans.length }, decoded_mismatch: false },
+    detected_spans: spans };
+  const started = performance.now();
+  const result = adaptOpfPrediction(original, scan, prediction);
+  const elapsedMs = performance.now() - started;
+  assert.equal(result.status, "ok", result.reason);
+  assert.notEqual(result.reason, "adapter-error");
+  assert.ok(elapsedMs < 6000, `adapter took ${Math.round(elapsedMs)} ms`);
+  assert.deepEqual(Object.values(verifiedResult(original, result)), Array(6).fill("[redacted:private_person]"));
+});
+
 test("OPF adapts 8192 spans over ~80k values in ~850 KB well inside the worker's adapter slack", () => {
-  // The worker adapts after the model has used its budget and the proxy allows only a few seconds more,
+  // The worker adapts after the model has used its budget and src/shield/privacy.mjs:285 allows budgetMs + 6_000,
   // so this guards the cost shape rather than benchmarking it: matching every fragment against every value
   // took 14-30 s here, one pass over the values takes well under one.
   const names = Array.from({ length: 8192 }, (_, index) => `Person${String(index).padStart(5, "0")}`);
