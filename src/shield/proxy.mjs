@@ -405,15 +405,19 @@ function shieldHeader(request, kind) {
 function recordFailure(failures, onFailure, { stage, reason, bytes, elapsedMs, cause, queuedMs, launchId }) {
   if (!FAILURE_REASONS.get(stage)?.has(reason)) return;
   const bounded = (value, max) => Number.isFinite(value) ? Math.min(max, Math.max(0, Math.floor(value))) : 0;
-  const failure = { stage, reason, bytes: bounded(bytes, INSPECTION_MAX_BYTES), elapsedMs: bounded(elapsedMs, 3_600_000) };
+  // The launch id is a correlation handle, not something to keep in the clear; a short digest is enough to group retries.
+  const launch = typeof launchId === "string" && launchId.length > 0 ? createHash("sha256").update(launchId).digest("hex").slice(0, 12) : undefined;
+  // ts and launch appear in both the ring and the persisted log so the two records of one failure can be matched.
+  const failure = {
+    ts: new Date().toISOString(), stage, reason, bytes: bounded(bytes, INSPECTION_MAX_BYTES), elapsedMs: bounded(elapsedMs, 3_600_000),
+    ...(launch ? { launch } : {}),
+  };
   // The cause is error-message text and may echo request content, so it stays in the in-memory ring and never reaches onFailure.
   failures.push({ ...failure, ...(typeof cause === "string" && cause !== "" ? { cause } : {}) });
   if (failures.length > 16) failures.shift();
   if (onFailure === null) return;
-  // The launch id is a correlation handle, not something to keep in the clear; a short digest is enough to group retries.
-  const launch = typeof launchId === "string" && launchId.length > 0 ? createHash("sha256").update(launchId).digest("hex").slice(0, 12) : undefined;
   try {
-    onFailure({ ts: new Date().toISOString(), ...failure, ...(Number.isFinite(queuedMs) ? { queuedMs: bounded(queuedMs, 3_600_000) } : {}), ...(launch ? { launch } : {}) });
+    onFailure({ ...failure, ...(Number.isFinite(queuedMs) ? { queuedMs: bounded(queuedMs, 3_600_000) } : {}) });
   } catch {}
 }
 

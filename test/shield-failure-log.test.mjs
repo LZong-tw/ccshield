@@ -101,6 +101,51 @@ test("the failure cause stays in the diagnostics ring and never reaches the pers
   assert.equal(failure.cause, "SyntaxError: Unexpected token near private body text");
 });
 
+test("an unavailable privacy scan reaches the log with its queue wait, as shieldd forwards it", async (t) => {
+  const seen = [];
+  // shieldd passes the scan result itself as the failure options.
+  const scan = { status: "unavailable", findings: [], reason: "queue_timeout", retryAfterSeconds: 4, queuedMs: 90_000 };
+  const shield = await startShieldProxy({
+    capability: "c".repeat(32), controlCapability: "d".repeat(32), targetOrigin: "http://127.0.0.1:9",
+    decide: async () => { throw createShieldFailure("privacy_scan", scan.reason, "shield privacy worker unavailable", scan); },
+    onFailure: (entry) => seen.push(entry),
+  });
+  t.after(() => shield.close());
+  const response = await fetch(`${shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield": "c".repeat(32) }, body: "{}" });
+  assert.equal(response.status, 503);
+  await response.arrayBuffer();
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].reason, "queue_timeout");
+  assert.equal(seen[0].queuedMs, 90_000);
+});
+
+test("the diagnostics ring and the persisted log share ts and launch for one failure", async (t) => {
+  const seen = [];
+  const shield = await startShieldProxy({
+    capability: "c".repeat(32), controlCapability: "d".repeat(32), targetOrigin: "http://127.0.0.1:9",
+    decide: async () => { throw createShieldFailure("privacy_scan", "model_timeout", "timeout", { queuedMs: 5, cause: new Error("boom") }); },
+    onFailure: (entry) => seen.push(entry),
+  });
+  t.after(() => shield.close());
+  for (const launch of ["1".repeat(32), undefined]) {
+    const headers = { "x-airkit-shield": "c".repeat(32), ...(launch ? { "x-ccshield-launch": launch } : {}) };
+    const response = await fetch(`${shield.origin}/v1/messages`, { method: "POST", headers, body: "{}" });
+    assert.equal(response.status, 503);
+    await response.arrayBuffer();
+  }
+  const diagnostics = await fetch(`${shield.origin}/_airkit/shield/diagnostics`, { headers: { "x-airkit-shield-control": "d".repeat(32) } });
+  const { failures } = await diagnostics.json();
+  assert.equal(failures.length, 2);
+  for (const [index, failure] of failures.entries()) {
+    assert.equal(failure.ts, seen[index].ts);
+    assert.equal(failure.launch, seen[index].launch);
+    assert.equal("queuedMs" in failure, false);
+  }
+  assert.match(failures[0].launch, /^[0-9a-f]{12}$/);
+  assert.equal("launch" in failures[1], false);
+  assert.doesNotMatch(JSON.stringify(failures), /1111/);
+});
+
 test("launchd plist sends daemon stdout and stderr into the lane state dir", () => {
   const paths = shieldPaths({ env: {}, homeDir: "/Users/test", uid: 501, platform: "darwin" });
   const plan = planLaunchdService({ paths, nodePath: "/usr/bin/node", daemonPath: "/opt/ccshield/src/shieldd.mjs" });
