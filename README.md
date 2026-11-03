@@ -115,15 +115,24 @@ dangerous one: it stops the running daemon before it tries to start the new
 one, so on a drifted plist the lane is left stopped (fail-closed: every request
 is refused) until the plist is rewritten.
 
-After upgrading, run this once per installed lane before any `start` or
-`policy install`:
+After upgrading, run `install --write` once before any `start` or
+`policy install`, but only for lanes that are actually installed and running.
+Skip a lane that has been disabled on purpose (for example a managed lane
+turned off with `launchctl disable`); installing it would bring it back.
 
 ```bash
+# only for lanes that are installed and running, e.g.:
 ccshield install --lane subscription --write
-ccshield install --lane managed --write
 ```
 
-`install --write` rewrites the plist and reloads the job.
+`install --write` rewrites the plist and reloads the job. It also generates a
+fresh `capability`, `controlCapability` and `generation` for the lane, so
+anything holding the old values has to pick up the new ones.
+
+A successful `install --write` reports state `degraded` and exits with code 1.
+That is expected: install only writes and reloads the service, it does not
+prove the lane is healthy. Check it afterwards with `ccshield status`
+rather than treating the non-zero exit as a failure.
 
 ## Threat model: OPF window cache
 
