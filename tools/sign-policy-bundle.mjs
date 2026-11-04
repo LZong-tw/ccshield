@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // Build and sign a ccshield policy bundle.
 //
-//   node tools/shield/sign-policy-bundle.mjs keygen --out <dir>
-//   node tools/shield/sign-policy-bundle.mjs sign \
+//   node tools/sign-policy-bundle.mjs keygen --out <dir>
+//   node tools/sign-policy-bundle.mjs sign \
 //     --wasm <policy.wasm> --private-key <dir>/policy-signing.key \
 //     --version <id> --gitleaks-version <x.y.z> --privacy-version <id> \
+//     [--image-version <image-xxxxxxxxxxxx>] \
 //     [--privacy-fallback-version <id>] --out <dir>/policy-bundle.json
 //
 // The private key never belongs in a repository, in Shield state, or in this
@@ -61,6 +62,9 @@ function signBundle() {
       // own version. The daemon refuses to start on any mismatch.
       gitleaks: required("gitleaks-version"),
       privacy: required("privacy-version"),
+      // Once an image worker is provisioned, the daemon only boots a bundle
+      // that names that worker's exact version.
+      ...(args.has("image-version") ? { image: required("image-version") } : {}),
     },
     // The detector the daemon may scan with until the Privacy model is
     // verified, e.g. regex-v1. Without it, a missing model fails closed.
@@ -107,7 +111,10 @@ function parseArgs(argv) {
   const parsed = new Map();
   for (let index = 0; index < argv.length; index += 1) {
     if (!argv[index].startsWith("--")) continue;
-    parsed.set(argv[index].slice(2), argv[index + 1]);
+    // A flag-like value means the option's own value is missing, so
+    // required() refuses it instead of signing "--out" as a version.
+    const value = argv[index + 1];
+    parsed.set(argv[index].slice(2), value?.startsWith("--") ? undefined : value);
     index += 1;
   }
   return parsed;
