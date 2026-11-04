@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { UNKNOWN_REASONS as ADAPTER_REASONS } from "../detectors/opf/opf-adapter.mjs";
 import { buildOpfWorkerArgs } from "../src/shield/opf-args.mjs";
 import { shieldPaths } from "../src/shield/paths.mjs";
 import { attestShieldCheckpoint } from "../src/shield/checkpoint.mjs";
@@ -213,7 +214,9 @@ test("Privacy Filter labels retain their original categories across the worker b
 });
 
 test("privacy unknown reasons preserve only the pinned worker and adapter's fixed codes", async (t) => {
-  const allowed = ["invalid-prediction", "inconsistent-counts", "invalid-span", "unmapped-span", "cross-field-span", "inconsistent-quoting", "unmapped-finding", "redaction-too-large", "value-survived", "invalid-protocol-graph", "protocol-id-collision", "conflicting-protocol-context", "protocol-id-limit", "adapter-error", "model_timeout", "model_error", "model_killed", "protocol-graph-mutation", "protocol-control-mutation", "signed-block-mutation", "invalid-source-provenance", "json-key-collision", "invalid-json-topology", "redaction-projection-limit", "redaction-match-limit", "redaction-body-limit", "redaction-frame-limit"];
+  // Adapter codes come from the adapter itself; the rest are the worker's own fixed codes.
+  const allowed = [...new Set([...ADAPTER_REASONS.values(), "adapter-error", "model_timeout", "model_error", "model_killed",
+    "redaction-too-large", "redaction-frame-limit"])];
   for (const reason of [...allowed, sentinel, null, {}, 42, "scan_timeout", undefined]) {
     const worker = fakeWorker((message, emit) => {
       if (message.type === "health") emit(health(message));
@@ -235,13 +238,7 @@ test("privacy unknown reasons preserve only the pinned worker and adapter's fixe
 });
 
 test("every reason the pinned OPF adapter and worker emit survives the privacy boundary", async (t) => {
-  const adapterReasons = [
-    "invalid-prediction", "inconsistent-counts", "invalid-span", "unmapped-span", "cross-field-span", "inconsistent-quoting",
-    "unmapped-finding", "redaction-projection-limit", "redaction-match-limit", "redaction-body-limit", "value-survived",
-    "invalid-protocol-graph", "protocol-id-collision", "conflicting-protocol-context", "protocol-id-limit",
-    "invalid-source-provenance", "json-key-collision", "invalid-json-topology",
-    "protocol-graph-mutation", "protocol-control-mutation", "signed-block-mutation",
-  ];
+  const adapterReasons = [...ADAPTER_REASONS.values()];
   const workerReasons = ["adapter-error", "model_timeout", "model_error", "model_killed"];
   let reason;
   const worker = fakeWorker((message, emit) => {

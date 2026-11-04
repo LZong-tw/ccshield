@@ -5,6 +5,18 @@ const LABELS = new Set([
 const MAX_BODY_BYTES = 1_048_576;
 const MAX_PROJECTED_RANGES = 8192;
 const MAX_PROOF_RANGES = 8192;
+// Overlapping spans could repeat the same text thousands of times; disjoint spans never exceed the body.
+// Counted in UTF-16 units, the unit FragmentMatcher is bounded in (MAX_TRIE_UNITS), so this limit trips first.
+const MAX_SPAN_CHARS = MAX_BODY_BYTES;
+// A request that keeps its findings needs at most MAX_PROOF_RANGES usable matches; the slack covers
+// matches dropped for splitting a surrogate pair. Unsigned hits past this are not kept: the replay still
+// runs on the ones kept, then the request fails as a match limit.
+const MAX_MATCH_HITS = 4 * MAX_PROOF_RANGES;
+// A Map-backed trie is relatively expensive per code unit. Decoded fragments are already bounded by
+// MAX_SPAN_CHARS; original byte slices can overlap and add up to many times the body, so they use the
+// smaller bound and fall back to Buffer.indexOf without changing the survival check.
+const MAX_TRIE_UNITS = MAX_BODY_BYTES;
+const MAX_ORIGINAL_TRIE_BYTES = 256 * 1024;
 const MAX_PROOF_BATCH = 1024;
 const MAX_PROOF_ENTRIES = 128;
 const MAX_PROTOCOL_IDS = 4096;
@@ -13,6 +25,8 @@ const PROTOCOL_ID = /^[a-zA-Z0-9_-]+$/;
 const OPAQUE_VALUE = /^[A-Za-z0-9+/=_-]{16,}$/;
 export const UNKNOWN_REASONS = new Map([
   ["invalid prediction", "invalid-prediction"],
+  ["prediction span limit", "prediction-span-limit"],
+  ["matcher pattern limit", "prediction-span-limit"],
   ["inconsistent counts", "inconsistent-counts"],
   ["invalid span", "invalid-span"],
   ["unmapped span", "unmapped-span"],
@@ -155,7 +169,9 @@ export function adaptOpfPrediction(original, scan, result) {
   try {
     if (result?.schema_version !== 1 || result?.text !== scan.text || result.summary?.output_mode !== "typed"
       || result.summary?.decoded_mismatch !== false || !Array.isArray(result.detected_spans)
-      || result.detected_spans.length > 1024 || result.summary.span_count !== result.detected_spans.length) throw new Error("invalid prediction");
+      || result.summary.span_count !== result.detected_spans.length) throw new Error("invalid prediction");
+    // Same bound as the ranges the spans project into; it also caps the per-span work below.
+    if (result.detected_spans.length > MAX_PROJECTED_RANGES) throw new Error("prediction span limit");
     const reported = new Map();
     for (const span of result.detected_spans) reported.set(span.label, (reported.get(span.label) ?? 0) + 1);
     const byLabel = result.summary.by_label;
@@ -171,18 +187,26 @@ export function adaptOpfPrediction(original, scan, result) {
     const replacementsByRange = new Map();
     const fragments = new Map();
     const projectedRanges = new Set();
+    const unitAt = new Int32Array(chars.length + 1);
+    for (let index = 0; index < chars.length; index += 1) unitAt[index + 1] = unitAt[index] + chars[index].length;
     let kept = 0;
+    let spanChars = 0;
     for (const span of result.detected_spans) {
       if (!LABELS.has(span.label) || !Number.isInteger(span.start) || !Number.isInteger(span.end)
-        || span.start < 0 || span.end <= span.start || span.end > chars.length
-        || chars.slice(span.start, span.end).join("") !== span.text) throw new Error("invalid span");
+        || span.start < 0 || span.end <= span.start || span.end > chars.length) throw new Error("invalid span");
+      spanChars += unitAt[span.end] - unitAt[span.start];
+      if (spanChars > MAX_SPAN_CHARS) throw new Error("prediction span limit");
+      if (chars.slice(span.start, span.end).join("") !== span.text) throw new Error("invalid span");
       // A detector hit wholly inside a typed control or selector value (model, role, block type, tool name, ...)
       // is a false positive the API cannot accept altered; drop it. Spans reaching past that value stay fail-closed.
-      const home = scan.sources.findIndex((source) => source.start <= span.start && span.end <= source.end);
+      // Sources are ordered and disjoint (provenance-checked above), so overlaps start at the first one ending after the span starts.
+      const first = firstSourceEndingAfter(scan.sources, span.start);
+      const home = first < scan.sources.length && scan.sources[first].start <= span.start && span.end <= scan.sources[first].end ? first : -1;
       if (home >= 0 && pinned.has(canonical.sources[home].node)) continue;
       kept += 1;
       let projected = false;
-      for (const source of scan.sources) {
+      for (let index = first; index < scan.sources.length && scan.sources[index].start < span.end; index += 1) {
+        const source = scan.sources[index];
         const start = Math.max(source.start, span.start);
         const end = Math.min(source.end, span.end);
         if (end <= start) continue;
@@ -201,11 +225,41 @@ export function adaptOpfPrediction(original, scan, result) {
     const projectedIds = new Set();
     const keyNodes = collectKeyNodes(canonical.root);
     const characterOffsets = new WeakMap();
+    // One pass finds the occurrences of every fragment; the replay below walks them fragment by fragment,
+    // value by value, offset by offset, as a per-fragment search of every value would, without its
+    // fragments x values cost on large bodies. Below MAX_MATCH_HITS that gives the same first failure and
+    // kept replacements. Past it, unsigned hits are dropped but each fragment's first signed hit is still
+    // kept, so a fragment that reaches a signed block fails as signed-block-mutation, as it would without
+    // the bound. The replay may then report a later failure, or the match limit, where the unbounded
+    // search would have failed first on a dropped hit.
+    const decodedFragments = [...new Set([...fragments.values()].map(({ text }) => text))];
+    const matcher = new FragmentMatcher(decodedFragments);
+    const hits = decodedFragments.map(() => []);
+    // Later signed hits are never reached: the replay fails on the first.
+    const signedSeen = new Uint8Array(decodedFragments.length);
+    let hitCount = 0;
+    let overflow = false;
+    canonical.allValues.forEach((node, nodeIndex) => {
+      if (canonical.opaque.nodes.has(node)) return;
+      const signed = canonical.opaque.signedText.has(node);
+      matcher.scan(node.value, (pattern, end) => {
+        if (signed) {
+          if (signedSeen[pattern]) return false;
+          signedSeen[pattern] = 1;
+        } else if (hitCount >= MAX_MATCH_HITS) {
+          overflow = true;
+          return false;
+        } else hitCount += 1;
+        hits[pattern].push(nodeIndex, end - decodedFragments[pattern].length);
+        return false;
+      });
+    });
+    const patternOf = new Map(decodedFragments.map((text, index) => [text, index]));
     for (const fragment of fragments.values()) {
-      for (const node of canonical.allValues) {
-        if (canonical.opaque.nodes.has(node)) continue;
-        let match = node.value.indexOf(fragment.text);
-        if (match < 0) continue;
+      const found = hits[patternOf.get(fragment.text)];
+      for (let hit = 0; hit < found.length; hit += 2) {
+        const node = canonical.allValues[found[hit]];
+        const match = found[hit + 1];
         if (canonical.opaque.signedText.has(node)) throw new Error("signed block mutation");
         if (!characterOffsets.has(node)) {
           const offsets = [];
@@ -218,22 +272,21 @@ export function adaptOpfPrediction(original, scan, result) {
           characterOffsets.set(node, offsets);
         }
         const offsets = characterOffsets.get(node);
-        for (; match >= 0; match = node.value.indexOf(fragment.text, match + 1)) {
-          const at = offsets[match];
-          const end = offsets[match + fragment.text.length];
-          if (at === undefined || end === undefined) continue;
-          const replacement = { label: fragment.label, start: node.map[at].start, end: node.map[end - 1].end,
-            quote: node.type === "literal", protocolId: node.protocolId, inKey: keyNodes.has(node) };
-          const key = `${replacement.label}:${replacement.start}:${replacement.end}`;
-          if (replacementsByRange.has(key) && replacementsByRange.get(key).quote !== replacement.quote) throw new Error("inconsistent quoting");
-          if (replacementsByRange.has(key) && replacementsByRange.get(key).protocolId !== replacement.protocolId) throw new Error("conflicting protocol context");
-          if (replacement.protocolId !== undefined) projectedIds.add(replacement.protocolId);
-          if (projectedIds.size > MAX_ID_ALIASES) throw new Error("protocol id limit");
-          if (replacementsByRange.size >= MAX_PROOF_RANGES && !replacementsByRange.has(key)) throw new Error("redaction match limit");
-          replacementsByRange.set(key, replacement);
-        }
+        const at = offsets[match];
+        const end = offsets[match + fragment.text.length];
+        if (at === undefined || end === undefined) continue;
+        const replacement = { label: fragment.label, start: node.map[at].start, end: node.map[end - 1].end,
+          quote: node.type === "literal", protocolId: node.protocolId, inKey: keyNodes.has(node) };
+        const key = `${replacement.label}:${replacement.start}:${replacement.end}`;
+        if (replacementsByRange.has(key) && replacementsByRange.get(key).quote !== replacement.quote) throw new Error("inconsistent quoting");
+        if (replacementsByRange.has(key) && replacementsByRange.get(key).protocolId !== replacement.protocolId) throw new Error("conflicting protocol context");
+        if (replacement.protocolId !== undefined) projectedIds.add(replacement.protocolId);
+        if (projectedIds.size > MAX_ID_ALIASES) throw new Error("protocol id limit");
+        if (replacementsByRange.size >= MAX_PROOF_RANGES && !replacementsByRange.has(key)) throw new Error("redaction match limit");
+        replacementsByRange.set(key, replacement);
       }
     }
+    if (overflow) throw new Error("redaction match limit");
     const replacements = [...replacementsByRange.values()].sort((a, b) => a.start - b.start || a.end - b.end);
     if (kept && !replacements.length) throw new Error("unmapped finding");
     if (!replacements.length) return { status: "ok", findings: [] };
@@ -250,16 +303,12 @@ export function adaptOpfPrediction(original, scan, result) {
         if (span.label === "secret" || (previous.label !== "secret" && span.label < previous.label)) previous.label = span.label;
       } else ranges.push({ ...span });
     }
-    const decodedFragments = [...new Set([...fragments.values()].map(({ text }) => text))];
-    const originalFragments = [...new Map(replacements.map(({ start, end }) => {
-      const bytes = original.subarray(start, end);
-      return [bytes.toString("base64"), bytes];
-    })).values()];
-    const safeReplacement = (value) => {
-      if (decodedFragments.some((text) => containsFragment(value, text))) return false;
-      const bytes = Buffer.from(JSON.stringify(value));
-      return !originalFragments.some((fragment) => bytes.includes(fragment));
-    };
+    // A bounded Latin-1 trie handles the usual case. Large overlapping original slices would make a
+    // trie much larger than the request itself, so OriginalBytesMatcher keeps Buffer views and uses
+    // native indexOf instead; both paths perform the same byte-survival check.
+    const originalMatcher = new OriginalBytesMatcher(original, replacements);
+    const safeReplacement = (value) => !matcher.includesWhole(value)
+      && !originalMatcher.includes(Buffer.from(JSON.stringify(value)));
     const markers = new Map();
     const markerFor = (label) => {
       if (markers.has(label)) return markers.get(label);
@@ -323,10 +372,8 @@ export function adaptOpfPrediction(original, scan, result) {
     const candidate = prepareOpfScan(redacted);
     validateOpaqueValues(canonical.opaque, candidate.opaque);
     const opaqueRanges = candidate.opaque.entries.map(({ node }) => ({ start: node.map[0].start - 1, end: node.map.at(-1).end + 1 }));
-    for (const span of replacements) {
-      if (includesOutside(redacted, original.subarray(span.start, span.end), opaqueRanges)) throw new Error("value survived");
-    }
-    if (hasDecodedResidual(candidate.root, decodedFragments, candidate.opaque.nodes)) throw new Error("value survived");
+    if (originalMatcher.includesOutside(redacted, opaqueRanges)) throw new Error("value survived");
+    if (hasDecodedResidual(candidate.root, matcher, candidate.opaque.nodes)) throw new Error("value survived");
     validateProtocolIds(canonical.protocolIds, candidate.protocolIds);
     validateJsonShape(canonical.root, candidate.root);
     const redactions = [];
@@ -361,27 +408,133 @@ function collectKeyNodes(root) {
   return keys;
 }
 
-function containsFragment(value, fragment) {
-  const boundary = (offset) => !(offset > 0 && value.charCodeAt(offset - 1) >= 0xd800
-    && value.charCodeAt(offset - 1) <= 0xdbff && value.charCodeAt(offset) >= 0xdc00 && value.charCodeAt(offset) <= 0xdfff);
-  for (let at = value.indexOf(fragment); at >= 0; at = value.indexOf(fragment, at + 1)) {
-    if (boundary(at) && boundary(at + fragment.length)) return true;
+function firstSourceEndingAfter(sources, offset) {
+  let low = 0;
+  let high = sources.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (sources[middle].end > offset) high = middle;
+    else low = middle + 1;
   }
-  return false;
+  return low;
 }
 
-function hasDecodedResidual(node, fragments, opaque) {
+class OriginalBytesMatcher {
+  constructor(original, replacements) {
+    const unique = new Set();
+    const patterns = [];
+    let units = 0;
+    for (const { start, end } of replacements) {
+      const pattern = original.toString("latin1", start, end);
+      if (unique.has(pattern)) continue;
+      if (units + pattern.length > MAX_ORIGINAL_TRIE_BYTES) {
+        this.buffers = replacements.map((range) => original.subarray(range.start, range.end));
+        return;
+      }
+      unique.add(pattern);
+      patterns.push(pattern);
+      units += pattern.length;
+    }
+    this.matcher = new FragmentMatcher(patterns, MAX_ORIGINAL_TRIE_BYTES);
+  }
+
+  includes(bytes) {
+    if (this.matcher) return this.matcher.scan(bytes.toString("latin1"), () => true);
+    return this.buffers.some((pattern) => bytes.indexOf(pattern) >= 0);
+  }
+
+  includesOutside(bytes, opaqueRanges) {
+    const outside = (start, end) => !opaqueRanges.some((range) => start >= range.start && end <= range.end);
+    if (this.matcher) return this.matcher.scan(bytes.toString("latin1"), (pattern, end) => {
+      return outside(end - this.matcher.lengths[pattern], end);
+    });
+    for (const pattern of this.buffers) {
+      for (let at = bytes.indexOf(pattern); at >= 0; at = bytes.indexOf(pattern, at + 1)) {
+        if (outside(at, at + pattern.length)) return true;
+      }
+    }
+    return false;
+  }
+}
+
+// Aho-Corasick over UTF-16 code units: one pass over a value reports every occurrence of every pattern,
+// so scanning costs the value length plus the hits rather than patterns x values.
+export class FragmentMatcher {
+  constructor(patterns, maxUnits = MAX_TRIE_UNITS) {
+    let units = 0;
+    for (const pattern of patterns) {
+      if (typeof pattern !== "string" || pattern.length === 0 || pattern.length > maxUnits - units) throw new Error("matcher pattern limit");
+      units += pattern.length;
+    }
+    this.lengths = patterns.map((pattern) => pattern.length);
+    const size = 1 + units;
+    this.edges = new Map();
+    this.output = new Int32Array(size).fill(-1);
+    this.fail = new Int32Array(size);
+    this.next = new Int32Array(size);
+    const parent = new Int32Array(size);
+    const code = new Uint16Array(size);
+    const depth = new Int32Array(size);
+    let states = 1;
+    patterns.forEach((pattern, index) => {
+      let state = 0;
+      for (let at = 0; at < pattern.length; at += 1) {
+        const edge = state * 0x10000 + pattern.charCodeAt(at);
+        let child = this.edges.get(edge);
+        if (child === undefined) {
+          child = states++;
+          this.edges.set(edge, child);
+          parent[child] = state;
+          code[child] = pattern.charCodeAt(at);
+          depth[child] = depth[state] + 1;
+        }
+        state = child;
+      }
+      this.output[state] = index;
+    });
+    const order = Array.from({ length: states - 1 }, (_, index) => index + 1).sort((a, b) => depth[a] - depth[b]);
+    for (const state of order) {
+      if (parent[state] === 0) continue;
+      this.fail[state] = this.step(this.fail[parent[state]], code[state]);
+      const fail = this.fail[state];
+      this.next[state] = this.output[fail] >= 0 ? fail : this.next[fail];
+    }
+  }
+
+  step(state, unit) {
+    for (;;) {
+      const child = this.edges.get(state * 0x10000 + unit);
+      if (child !== undefined) return child;
+      if (state === 0) return 0;
+      state = this.fail[state];
+    }
+  }
+
+  // Calls visit(pattern, end) for each occurrence in end order; a truthy return stops the scan.
+  scan(text, visit) {
+    let state = 0;
+    for (let at = 0; at < text.length; at += 1) {
+      state = this.step(state, text.charCodeAt(at));
+      for (let hit = this.output[state] >= 0 ? state : this.next[state]; hit; hit = this.next[hit]) {
+        if (visit(this.output[hit], at + 1)) return true;
+      }
+    }
+    return false;
+  }
+
+  // An occurrence counts only if it does not split a surrogate pair at either edge.
+  includesWhole(value) {
+    const boundary = (offset) => !(offset > 0 && value.charCodeAt(offset - 1) >= 0xd800
+      && value.charCodeAt(offset - 1) <= 0xdbff && value.charCodeAt(offset) >= 0xdc00 && value.charCodeAt(offset) <= 0xdfff);
+    return this.scan(value, (pattern, end) => boundary(end - this.lengths[pattern]) && boundary(end));
+  }
+}
+
+function hasDecodedResidual(node, matcher, opaque) {
   if (opaque.has(node)) return false;
-  if (node.type === "string" || node.type === "literal") return fragments.some((text) => containsFragment(node.value, text));
-  return node.children.some(({ keyNode, value }) => keyNode && hasDecodedResidual(keyNode, fragments, opaque)
-    || hasDecodedResidual(value, fragments, opaque));
-}
-
-function includesOutside(buffer, needle, ranges) {
-  for (let at = buffer.indexOf(needle); at >= 0; at = buffer.indexOf(needle, at + 1)) {
-    if (!ranges.some(({ start, end }) => at >= start && at + needle.length <= end)) return true;
-  }
-  return false;
+  if (node.type === "string" || node.type === "literal") return matcher.includesWhole(node.value);
+  return node.children.some(({ keyNode, value }) => keyNode && hasDecodedResidual(keyNode, matcher, opaque)
+    || hasDecodedResidual(value, matcher, opaque));
 }
 
 // Provider-issued values the API verifies byte for byte. Only these exact structural paths qualify, and a
