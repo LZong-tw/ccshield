@@ -1190,6 +1190,36 @@ test("OPF exact propagation preserves overlapping surrogate pairs and distinct l
   }
 });
 
+test("OPF match limit ignores hits that split a surrogate pair in emoji-heavy text", () => {
+  // 40k emoji hold 40k half-pair hits for a lone surrogate, past MAX_MATCH_HITS, yet none is an occurrence.
+  const emoji = "😀".repeat(40_000);
+  for (const value of ["\ud83d", "\ude00"]) {
+    const original = Buffer.from(JSON.stringify([emoji, value]));
+    const scan = prepareOpfScan(original);
+    const expected = prediction(scan.text, "secret", value);
+    const start = Array.from(scan.text).lastIndexOf(value);
+    expected.detected_spans[0] = { ...expected.detected_spans[0], start, end: start + 1 };
+    const result = adaptOpfPrediction(original, scan, expected);
+    const body = verifiedResult(original, result);
+    assert.deepEqual(body, [emoji, "[redacted:secret]"]);
+    assert.deepEqual(result.findings, [{ label: "secret", count: 1 }]);
+  }
+
+  // Whole emoji occurrences still count, so the same body over the bound stays fail-closed.
+  const original = Buffer.from(JSON.stringify([emoji]));
+  const scan = prepareOpfScan(original);
+  assert.deepEqual(adaptOpfPrediction(original, scan, prediction(scan.text, "secret", "😀")),
+    { status: "unknown", findings: [], reason: "redaction-match-limit" });
+});
+
+test("OPF a lone surrogate never reaches a signed block through one half of a surrogate pair", () => {
+  const result = signedThenUserPrediction("😀 thinking", "\ud83d", ["\ud83d"]);
+  assert.equal(result.status, "ok");
+  const body = JSON.parse(Buffer.from(result.redactedBody, "base64"));
+  assert.equal(body.messages[0].content[0].thinking, "😀 thinking");
+  assert.equal(body.messages[1].content[0].text, "[redacted:private_person]");
+});
+
 test("OPF batched propagation removes every occurrence from excluded client contexts", async () => {
   const original = paddedBody({ system: Array(1025).fill("Alice"), tools: [{ description: "Alice" }],
     messages: [{ content: [{ type: "text", text: "<system-reminder>Alice</system-reminder>" }, { type: "text", text: "Alice" }] }] });

@@ -8,9 +8,9 @@ const MAX_PROOF_RANGES = 8192;
 // Overlapping spans could repeat the same text thousands of times; disjoint spans never exceed the body.
 // Counted in UTF-16 units, the unit FragmentMatcher is bounded in (MAX_TRIE_UNITS), so this limit trips first.
 const MAX_SPAN_CHARS = MAX_BODY_BYTES;
-// A request that keeps its findings needs at most MAX_PROOF_RANGES usable matches; the slack covers
-// matches dropped for splitting a surrogate pair. Unsigned hits past this are not kept: the replay still
-// runs on the ones kept, then the request fails as a match limit.
+// A request that keeps its findings needs at most MAX_PROOF_RANGES usable matches. Hits that split a
+// surrogate pair are not occurrences and are skipped before they are counted. Unsigned hits past this are
+// not kept: the replay still runs on the ones kept, then the request fails as a match limit.
 const MAX_MATCH_HITS = 4 * MAX_PROOF_RANGES;
 // A Map-backed trie is relatively expensive per code unit. Decoded fragments are already bounded by
 // MAX_SPAN_CHARS; original byte slices can overlap and add up to many times the body, so they use the
@@ -242,7 +242,8 @@ export function adaptOpfPrediction(original, scan, result) {
     canonical.allValues.forEach((node, nodeIndex) => {
       if (canonical.opaque.nodes.has(node)) return;
       const signed = canonical.opaque.signedText.has(node);
-      matcher.scan(node.value, (pattern, end) => {
+      // A hit that splits a surrogate pair is not an occurrence, so it never counts toward the bound.
+      matcher.scanWhole(node.value, (pattern, end) => {
         if (signed) {
           if (signedSeen[pattern]) return false;
           signedSeen[pattern] = 1;
@@ -522,11 +523,15 @@ export class FragmentMatcher {
     return false;
   }
 
-  // An occurrence counts only if it does not split a surrogate pair at either edge.
+  // Like scan, but skips occurrences that split a surrogate pair at either edge.
+  scanWhole(text, visit) {
+    const boundary = (offset) => !(offset > 0 && text.charCodeAt(offset - 1) >= 0xd800
+      && text.charCodeAt(offset - 1) <= 0xdbff && text.charCodeAt(offset) >= 0xdc00 && text.charCodeAt(offset) <= 0xdfff);
+    return this.scan(text, (pattern, end) => boundary(end - this.lengths[pattern]) && boundary(end) && visit(pattern, end));
+  }
+
   includesWhole(value) {
-    const boundary = (offset) => !(offset > 0 && value.charCodeAt(offset - 1) >= 0xd800
-      && value.charCodeAt(offset - 1) <= 0xdbff && value.charCodeAt(offset) >= 0xdc00 && value.charCodeAt(offset) <= 0xdfff);
-    return this.scan(value, (pattern, end) => boundary(end - this.lengths[pattern]) && boundary(end));
+    return this.scanWhole(value, () => true);
   }
 }
 
