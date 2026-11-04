@@ -1212,6 +1212,14 @@ test("OPF match limit ignores hits that split a surrogate pair in emoji-heavy te
     { status: "unknown", findings: [], reason: "redaction-match-limit" });
 });
 
+test("OPF a lone surrogate never reaches a signed block through one half of a surrogate pair", () => {
+  const result = signedThenUserPrediction("😀 thinking", "\ud83d", ["\ud83d"]);
+  assert.equal(result.status, "ok");
+  const body = JSON.parse(Buffer.from(result.redactedBody, "base64"));
+  assert.equal(body.messages[0].content[0].thinking, "😀 thinking");
+  assert.equal(body.messages[1].content[0].text, "[redacted:private_person]");
+});
+
 test("OPF batched propagation removes every occurrence from excluded client contexts", async () => {
   const original = paddedBody({ system: Array(1025).fill("Alice"), tools: [{ description: "Alice" }],
     messages: [{ content: [{ type: "text", text: "<system-reminder>Alice</system-reminder>" }, { type: "text", text: "Alice" }] }] });
