@@ -10,7 +10,7 @@ import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 
-import { prepareOpfScan, adaptOpfPrediction, FragmentMatcher } from "../detectors/opf/opf-adapter.mjs";
+import { prepareOpfScan, adaptOpfPrediction, FragmentMatcher, UNKNOWN_REASONS } from "../detectors/opf/opf-adapter.mjs";
 import { buildOpfWorkerArgs } from "../src/shield/opf-args.mjs";
 import { createPrivacyFilter, isVerifiedRedaction } from "../src/shield/privacy.mjs";
 
@@ -1110,6 +1110,50 @@ test("OPF refuses span sets whose text outgrows the body and hit counts past the
     { status: "unknown", findings: [], reason: "prediction-span-limit" });
   // One short fragment that recurs 200k times stops at the hit bound instead of listing every occurrence.
   assert.deepEqual(adaptOpfPrediction(original, scan, spans([[0, 1]])),
+    { status: "unknown", findings: [], reason: "redaction-match-limit" });
+});
+
+test("OPF span limit counts UTF-16 units, the unit the fragment matcher is bounded in", () => {
+  const text = "\u{1f600}".repeat(200_000);
+  const original = Buffer.from(JSON.stringify({ content: text }));
+  const scan = prepareOpfScan(original);
+  const base = Array.from(scan.text.slice(0, scan.text.indexOf(text))).length;
+  const spans = [[0, 200_000], [1, 200_000], [2, 200_000]].map(([start, end]) => ({ label: "private_person",
+    start: base + start, end: base + end, text: "\u{1f600}".repeat(end - start), placeholder: "<PRIVATE>" }));
+  const result = adaptOpfPrediction(original, scan, { schema_version: 1, text: scan.text, redacted_text: scan.text,
+    summary: { output_mode: "typed", span_count: 3, by_label: { private_person: 3 }, decoded_mismatch: false },
+    detected_spans: spans });
+  // ~600k code points but ~1.2M UTF-16 units: over the matcher's 1 MiB pattern bound, so the span limit names it.
+  assert.deepEqual(result, { status: "unknown", findings: [], reason: "prediction-span-limit" });
+  // Should the matcher bound ever be reached another way, it still reads as the span limit, not an adapter error.
+  assert.throws(() => new FragmentMatcher(["a".repeat(1_048_577)]), /matcher pattern limit/);
+  assert.equal(UNKNOWN_REASONS.get("matcher pattern limit"), "prediction-span-limit");
+});
+
+function signedThenUserPrediction(thinking, userText, values) {
+  const original = Buffer.from(JSON.stringify({ model: "claude-fixture", messages: [
+    { role: "assistant", content: [{ type: "thinking", thinking, signature: `${OPAQUE}sig` }] },
+    { role: "user", content: [{ type: "text", text: userText }] },
+  ] }));
+  const scan = prepareOpfScan(original);
+  const spans = values.map((value) => {
+    const start = Array.from(scan.text.slice(0, scan.text.lastIndexOf(value))).length;
+    return { label: "private_person", start, end: start + Array.from(value).length, text: value, placeholder: "<PRIVATE>" };
+  });
+  return adaptOpfPrediction(original, scan, { schema_version: 1, text: scan.text, redacted_text: scan.text,
+    summary: { output_mode: "typed", span_count: spans.length, by_label: { private_person: spans.length }, decoded_mismatch: false },
+    detected_spans: spans });
+}
+
+test("OPF a fragment reaching a signed block fails as signed-block mutation even past the match-hit bound", () => {
+  // 40k user-text hits exceed the scan's hit bound, but the fragment's first value is signed thinking.
+  assert.deepEqual(signedThenUserPrediction("Alice asked", "Alice ".repeat(40_000), ["Alice"]),
+    { status: "unknown", findings: [], reason: "signed-block-mutation" });
+});
+
+test("OPF an earlier fragment's range limit wins over a later fragment's signed-block hit", () => {
+  // Fragment order decides the first failure: Alice exhausts the proof ranges before Bob reaches signed thinking.
+  assert.deepEqual(signedThenUserPrediction("Bob said hi", `Carol ${"Alice ".repeat(8193)}Bob`, ["Alice", "Bob"]),
     { status: "unknown", findings: [], reason: "redaction-match-limit" });
 });
 

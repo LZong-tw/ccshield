@@ -6,9 +6,11 @@ const MAX_BODY_BYTES = 1_048_576;
 const MAX_PROJECTED_RANGES = 8192;
 const MAX_PROOF_RANGES = 8192;
 // Overlapping spans could repeat the same text thousands of times; disjoint spans never exceed the body.
+// Counted in UTF-16 units, the unit FragmentMatcher is bounded in (MAX_TRIE_UNITS), so this limit trips first.
 const MAX_SPAN_CHARS = MAX_BODY_BYTES;
 // A request that keeps its findings needs at most MAX_PROOF_RANGES usable matches; the slack covers
-// matches dropped for splitting a surrogate pair. Past this the outcome is already a limit failure.
+// matches dropped for splitting a surrogate pair. Unsigned hits past this are not kept: the replay still
+// runs on the ones kept, then the request fails as a match limit.
 const MAX_MATCH_HITS = 4 * MAX_PROOF_RANGES;
 // A Map-backed trie is relatively expensive per code unit. Decoded fragments are already bounded by
 // MAX_SPAN_CHARS; original byte slices can overlap and add up to many times the body, so they use the
@@ -24,6 +26,7 @@ const OPAQUE_VALUE = /^[A-Za-z0-9+/=_-]{16,}$/;
 export const UNKNOWN_REASONS = new Map([
   ["invalid prediction", "invalid-prediction"],
   ["prediction span limit", "prediction-span-limit"],
+  ["matcher pattern limit", "prediction-span-limit"],
   ["inconsistent counts", "inconsistent-counts"],
   ["invalid span", "invalid-span"],
   ["unmapped span", "unmapped-span"],
@@ -184,12 +187,14 @@ export function adaptOpfPrediction(original, scan, result) {
     const replacementsByRange = new Map();
     const fragments = new Map();
     const projectedRanges = new Set();
+    const unitAt = new Int32Array(chars.length + 1);
+    for (let index = 0; index < chars.length; index += 1) unitAt[index + 1] = unitAt[index] + chars[index].length;
     let kept = 0;
     let spanChars = 0;
     for (const span of result.detected_spans) {
       if (!LABELS.has(span.label) || !Number.isInteger(span.start) || !Number.isInteger(span.end)
         || span.start < 0 || span.end <= span.start || span.end > chars.length) throw new Error("invalid span");
-      spanChars += span.end - span.start;
+      spanChars += unitAt[span.end] - unitAt[span.start];
       if (spanChars > MAX_SPAN_CHARS) throw new Error("prediction span limit");
       if (chars.slice(span.start, span.end).join("") !== span.text) throw new Error("invalid span");
       // A detector hit wholly inside a typed control or selector value (model, role, block type, tool name, ...)
@@ -220,22 +225,31 @@ export function adaptOpfPrediction(original, scan, result) {
     const projectedIds = new Set();
     const keyNodes = collectKeyNodes(canonical.root);
     const characterOffsets = new WeakMap();
-    // One pass finds every occurrence of every fragment; the replay below walks them fragment by fragment,
-    // value by value, offset by offset, so the first failure and the kept replacements are what a per-fragment
-    // search of every value would give, without its fragments x values cost on large bodies.
+    // One pass finds the occurrences of every fragment; the replay below walks them fragment by fragment,
+    // value by value, offset by offset, as a per-fragment search of every value would, without its
+    // fragments x values cost on large bodies. Below MAX_MATCH_HITS that gives the same first failure and
+    // kept replacements. Past it, unsigned hits are dropped but each fragment's first signed hit is still
+    // kept, so a fragment that reaches a signed block fails as signed-block-mutation, as it would without
+    // the bound. The replay may then report a later failure, or the match limit, where the unbounded
+    // search would have failed first on a dropped hit.
     const decodedFragments = [...new Set([...fragments.values()].map(({ text }) => text))];
     const matcher = new FragmentMatcher(decodedFragments);
     const hits = decodedFragments.map(() => []);
-    const lastNode = new Int32Array(decodedFragments.length).fill(-1);
+    // Later signed hits are never reached: the replay fails on the first.
+    const signedSeen = new Uint8Array(decodedFragments.length);
     let hitCount = 0;
+    let overflow = false;
     canonical.allValues.forEach((node, nodeIndex) => {
       if (canonical.opaque.nodes.has(node)) return;
-      // A signed value fails on its first hit, so later hits in it are never needed.
       const signed = canonical.opaque.signedText.has(node);
       matcher.scan(node.value, (pattern, end) => {
-        if (signed && lastNode[pattern] === nodeIndex) return false;
-        lastNode[pattern] = nodeIndex;
-        if (++hitCount > MAX_MATCH_HITS) throw new Error("redaction match limit");
+        if (signed) {
+          if (signedSeen[pattern]) return false;
+          signedSeen[pattern] = 1;
+        } else if (hitCount >= MAX_MATCH_HITS) {
+          overflow = true;
+          return false;
+        } else hitCount += 1;
         hits[pattern].push(nodeIndex, end - decodedFragments[pattern].length);
         return false;
       });
@@ -272,6 +286,7 @@ export function adaptOpfPrediction(original, scan, result) {
         replacementsByRange.set(key, replacement);
       }
     }
+    if (overflow) throw new Error("redaction match limit");
     const replacements = [...replacementsByRange.values()].sort((a, b) => a.start - b.start || a.end - b.end);
     if (kept && !replacements.length) throw new Error("unmapped finding");
     if (!replacements.length) return { status: "ok", findings: [] };
