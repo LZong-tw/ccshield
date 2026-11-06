@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 
 // Failure reasons outlive the in-memory diagnostics ring only if they reach disk. Each line carries
 // counts, timings and allowlisted codes; body text, redactions and headers never get here.
-const FIELDS = ["ts", "stage", "reason", "bytes", "elapsedMs", "queuedMs", "launch"];
+const FIELDS = ["ts", "stage", "reason", "detail", "bytes", "elapsedMs", "queuedMs", "launch"];
 const DEFAULT_MAX_BYTES = 256 * 1024;
 
 export function createFailureLog({ path, maxBytes = DEFAULT_MAX_BYTES }) {

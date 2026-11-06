@@ -119,6 +119,32 @@ test("an unavailable privacy scan reaches the log with its queue wait, as shield
   assert.equal(seen[0].queuedMs, 90_000);
 });
 
+test("a protocol-graph refusal reaches the log with its structural detail, and free text never does", async (t) => {
+  const path = join(await tempDir(t), "failures.jsonl");
+  const log = createFailureLog({ path });
+  const scans = [
+    { status: "unknown", findings: [], reason: "protocol-control-mutation", detail: "control:value:schema:enum", queuedMs: 0 },
+    { status: "unknown", findings: [], reason: "protocol-control-mutation", detail: "control:value:Alice Smith:enum", queuedMs: 0 },
+  ];
+  let next = 0;
+  const shield = await startShieldProxy({
+    capability: "c".repeat(32), controlCapability: "d".repeat(32), targetOrigin: "http://127.0.0.1:9",
+    decide: async () => { const scan = scans[next++]; throw createShieldFailure("privacy_scan", scan.reason, "shield privacy worker unavailable", scan); },
+    onFailure: (entry) => log.append(entry),
+  });
+  t.after(() => shield.close());
+  for (const _ of scans) {
+    const response = await fetch(`${shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield": "c".repeat(32) }, body: "{}" });
+    assert.equal(response.status, 503);
+    await response.arrayBuffer();
+  }
+  const [logged, forged] = await readFailureLog(path);
+  assert.equal(logged.reason, "protocol-control-mutation");
+  assert.equal(logged.detail, "control:value:schema:enum");
+  assert.equal("detail" in forged, false);
+  assert.doesNotMatch(await readFile(path, "utf8"), /Alice/);
+});
+
 test("the diagnostics ring and the persisted log share ts and launch for one failure", async (t) => {
   const seen = [];
   const shield = await startShieldProxy({

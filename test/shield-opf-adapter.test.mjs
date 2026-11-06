@@ -2562,3 +2562,42 @@ syncBuiltinESMExports();
     await rm(temp, { recursive: true, force: true });
   }
 });
+
+// A finding in user text is replayed over every value, including the tool schemas the scan never sees.
+// Schema prose (description, title) is accepted back altered; the rest of input_schema stays locked.
+function schemaTool(property) {
+  return { name: "lookup", description: "Find people like Alice", input_schema: { type: "object", title: "Lookup Alice",
+    properties: { query: { type: "string", description: "Name, e.g. Alice", ...property },
+      description: { type: "string", description: "Ask Alice" } }, required: ["query"] } };
+}
+
+function managedRequest(tool) {
+  return { model: "claude-fixture", max_tokens: 4096, system: [{ type: "text", text: "You are a fixture." }],
+    tools: [tool], messages: [{ role: "user", content: [{ type: "text", text: "Alice wrote" }] }] };
+}
+
+test("OPF redacts tool schema prose that repeats a finding instead of failing closed", () => {
+  const fixture = managedRequest(schemaTool({}));
+  const original = Buffer.from(JSON.stringify(fixture));
+  const scan = prepareOpfScan(original);
+  assert.equal(scan.text.includes("Ask"), false);
+  const body = verifiedResult(original, adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice")));
+  assert.equal(JSON.stringify(body).includes("Alice"), false);
+  assert.equal(body.messages[0].content[0].text, "[redacted:private_person] wrote");
+  const schema = body.tools[0].input_schema;
+  assert.equal(body.tools[0].description, "Find people like [redacted:private_person]");
+  assert.equal(schema.title, "Lookup [redacted:private_person]");
+  assert.equal(schema.properties.query.description, "Name, e.g. [redacted:private_person]");
+  assert.equal(schema.properties.description.description, "Ask [redacted:private_person]");
+  const prose = (key, value) => ["description", "title"].includes(key) && typeof value === "string" ? undefined : value;
+  assert.equal(JSON.stringify(body, prose).replace(/\[redacted:private_person\]/g, "Alice"), JSON.stringify(fixture, prose));
+});
+
+test("OPF tool schema constraints that repeat a finding stay locked with a named control", () => {
+  for (const [property, key] of [[{ enum: ["Alice"] }, "enum"], [{ default: "Alice" }, "default"], [{ pattern: "Alice" }, "pattern"]]) {
+    const original = Buffer.from(JSON.stringify(managedRequest(schemaTool(property))));
+    const scan = prepareOpfScan(original);
+    assert.deepEqual(adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice")),
+      { status: "unknown", findings: [], reason: "protocol-control-mutation", detail: `control:value:schema:${key}` });
+  }
+});
