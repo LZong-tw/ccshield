@@ -128,6 +128,11 @@ class DiskTier:
             str(tokens.dtype).encode(), repr(tuple(tokens.shape)).encode(),
             tokens.detach().contiguous().numpy().tobytes(), *mask)).digest()
 
+    # Presence by index only, for the scan projection: get() still validates the file before trusting it.
+    def has(self, key):
+        entry = self._index.get(key.hex()) if self.enabled else None
+        return entry is not None and self._now() - entry[0] <= self.ttl_seconds
+
     def storable(self, tokens, attention_mask):
         return tokens.shape[-1] == self.full_window and (
             attention_mask is None or bool(attention_mask.all()))
@@ -292,8 +297,9 @@ class ExactWindowLogitsCache:
         self._entries = OrderedDict()
         self._bytes = self._hits = self._misses = self._evictions = 0
         self._clock, self._deadline, self._interrupt = clock, None, None
-        self._started = self._total = None
-        self._done = 0
+        self._started = self._total = self._cold = None
+        self._done = self._computed = 0
+        self._computing = False
         # Recent cold-forward seconds; hits are excluded so they cannot mask slow windows.
         self._miss_seconds, self._miss_median = deque(maxlen=32), None
         if disk is not None and not isinstance(disk, DiskTier):
@@ -301,7 +307,7 @@ class ExactWindowLogitsCache:
         self._disk, self._disk_errors = disk, 0
         self.set_namespace(namespace)
 
-    def begin_scan(self, budget_seconds, interrupt=None, total_windows=None):
+    def begin_scan(self, budget_seconds, interrupt=None, total_windows=None, cold_windows=None):
         if not isinstance(budget_seconds, (int, float)) or isinstance(budget_seconds, bool) \
                 or not isfinite(budget_seconds) or budget_seconds <= 0:
             raise ValueError("scan budget must be finite and positive")
@@ -310,37 +316,67 @@ class ExactWindowLogitsCache:
         if total_windows is not None and (not isinstance(total_windows, int)
                                           or isinstance(total_windows, bool) or total_windows <= 0):
             raise ValueError("scan window total must be a positive integer")
+        if cold_windows is not None and (total_windows is None or not isinstance(cold_windows, int)
+                                         or isinstance(cold_windows, bool) or not 0 <= cold_windows <= total_windows):
+            raise ValueError("scan cold window count must be an integer within the window total")
         if self._deadline is not None:
             raise RuntimeError("scan budget is already active")
         self._started = self._clock()
         self._deadline = self._started + budget_seconds
         self._interrupt, self._total, self._done = interrupt, total_windows, 0
+        self._cold, self._computed = cold_windows, 0
 
     def end_scan(self):
-        self._deadline = self._interrupt = self._started = self._total = None
+        self._deadline = self._interrupt = self._started = self._total = self._cold = None
 
+    # Every unscanned window (total - done) is priced as cold unless cold_windows() planned fewer still to
+    # compute; the smaller count wins, so a plan that missed a cached window never prices above that bound.
+    # A planned-cached window that turns out cold (evicted mid-scan) is underpriced; the hard deadline
+    # still bounds it.
     def _remaining_ms(self):
         if self._total is None or self._miss_median is None:
             return None
-        return int(max(0, self._total - self._done) * self._miss_median * 1000)
+        windows = self._total - self._done
+        if self._cold is not None:
+            windows = min(windows, self._cold - self._computed)
+        return int(max(0, windows) * self._miss_median * 1000)
+
+    def cold_windows(self, windows):
+        """Count (tokens, attention_mask) windows that neither tier holds for the current namespace."""
+        cold = 0
+        for tokens, attention_mask in windows:
+            mask_key = None if attention_mask is None else self._tensor_key(attention_mask)
+            if (self._namespace, self._tensor_key(tokens), mask_key) in self._entries:
+                continue
+            if self._disk is not None and self._disk.enabled and self._disk.has(
+                    self._disk.key(self._namespace, tokens, attention_mask)):
+                continue
+            cold += 1
+        return cold
 
     # Block hooks, Viterbi and the worker call this inside or after a window, so it enforces only the hard
     # deadline: projecting there would count the running window again and abort work that still fits.
     def check_deadline(self):
         self._check(project=False)
 
-    # The projection prices every unscanned window (total - done) as cold; it cannot tell which of them are
-    # cached. It runs only before a cold forward and right after one, so cache hits ahead of the first cold
-    # window pass unprojected. That rescues a retry only while its cached windows form a contiguous prefix:
-    # an uncached window ahead of cached ones is still projected as if every later window were cold.
+    # The projection runs only before a cold forward and right after one, so cache hits pass unprojected.
+    # Before a scan's first cold window it asks only whether that one window fits: refusing on the whole
+    # remainder would leave a retry exactly where the last attempt stopped, so a body whose projection
+    # never fits would time out on every retry without caching anything. A window that cannot fit is still
+    # refused, since the hard deadline would discard it half-done. The reply reports the whole remainder.
+    # The interrupt is honoured only between windows: dropping a half-computed window would let a stream of
+    # requests keep warming from ever storing one.
     def _check(self, project):
         if self._deadline is not None:
             now, remaining = self._clock(), self._remaining_ms()
-            if now >= self._deadline or (project and remaining is not None and now + remaining / 1000 > self._deadline):
+            priced = remaining
+            if remaining is not None and not self._computed:
+                priced = min(remaining, int(self._miss_median * 1000))
+            if now >= self._deadline or (project and priced is not None and now + priced / 1000 > self._deadline):
                 timeout = CooperativeScanTimeout("scan budget exhausted")
                 timeout.remaining_ms = remaining
                 raise timeout
-        if self._interrupt is not None and self._interrupt():
+        if not self._computing and self._interrupt is not None and self._interrupt():
             raise ScanInterrupted("scan interrupted")
 
     @staticmethod
@@ -388,7 +424,12 @@ class ExactWindowLogitsCache:
         self._misses += 1
         if computed:
             started = self._clock()
-            logits = self.original_forward(tokens, attention_mask=attention_mask)
+            self._computing = True
+            try:
+                logits = self.original_forward(tokens, attention_mask=attention_mask)
+            finally:
+                self._computing = False
+            self._computed += 1
             # Only budgeted work is sampled: the startup warm-up is a short, cold forward that would skew projections.
             if self._deadline is not None:
                 self._miss_seconds.append(self._clock() - started)
@@ -565,13 +606,16 @@ def self_test():
                 cache.forward(windows[0])
                 cache.end_scan()
                 self.assertEqual(cache.snapshot()["misses"], 1)
-                # Two cold windows at a 10 s median cannot fit in 15 s, so windows[1] is refused before its forward.
-                cache.begin_scan(15, total_windows=2)
+                # The first cold window of a scan always runs; 10 s later the last window no longer fits
+                # before the 35 s deadline, so windows[2] is refused before its forward.
+                cache.begin_scan(25, total_windows=2)
+                cache.forward(windows[1])
+                now[0] += 10.0
                 with self.assertRaises(CooperativeScanTimeout):
-                    cache.forward(windows[1])
+                    cache.forward(windows[2])
                 cache.end_scan()
-            self.assertEqual(now[0], 10.0)
-            self.assertEqual(cache.snapshot()["misses"], 1)
+            self.assertEqual(now[0], 30.0)
+            self.assertEqual(cache.snapshot()["misses"], 2)
 
         def test_a_retry_projects_only_the_windows_it_still_has_to_compute(self):
             cache, now = self.projected(10.0)
@@ -642,13 +686,108 @@ def self_test():
                 for _ in range(3):
                     cache.forward(hot)
                 cache.end_scan()
-                # Zero-cost hits must not drag the 10 s median down and hide five slow windows.
+                # Zero-cost hits must not drag the 10 s median down and hide four more slow windows.
                 cache.begin_scan(25, total_windows=5)
                 with self.assertRaises(CooperativeScanTimeout) as raised:
                     cache.forward(torch.tensor([[2]], dtype=torch.int32))
                 cache.end_scan()
+            self.assertEqual(now[0], 20.0)
+            self.assertEqual(raised.exception.remaining_ms, 40_000)
+
+        def test_a_first_cold_window_that_cannot_fit_is_refused_before_its_forward(self):
+            cache, now = self.projected(10.0)
+            with torch.inference_mode():
+                cache.begin_scan(100, total_windows=1)
+                cache.forward(torch.tensor([[99]], dtype=torch.int32))
+                cache.end_scan()
+                cache.begin_scan(5, total_windows=5)
+                with self.assertRaises(CooperativeScanTimeout) as raised:
+                    cache.forward(torch.tensor([[1]], dtype=torch.int32))
+                cache.end_scan()
             self.assertEqual(now[0], 10.0)
+            self.assertEqual(cache.model.calls, 1)
             self.assertEqual(raised.exception.remaining_ms, 50_000)
+
+        # The 2026-11-05 incident: a retry whose cached prefix ended at a cold window was refused before
+        # that window, in under a second, every time, so the body never converged without warming.
+        def test_a_retry_never_times_out_without_computing_a_window(self):
+            cache, now = self.projected(10.0)
+            windows = [torch.tensor([[n]], dtype=torch.int32) for n in range(5)]
+            with torch.inference_mode():
+                cache.begin_scan(100, total_windows=1)
+                cache.forward(torch.tensor([[99]], dtype=torch.int32))
+                cache.end_scan()
+                attempts = []
+                for _ in range(5):
+                    started = now[0]
+                    cache.begin_scan(25, total_windows=5)
+                    try:
+                        for window in windows:
+                            cache.forward(window)
+                        attempts.append(None)
+                        break
+                    except CooperativeScanTimeout:
+                        attempts.append(now[0] - started)
+                    finally:
+                        cache.end_scan()
+            self.assertIsNone(attempts[-1], attempts)
+            self.assertTrue(all(spent >= 10.0 for spent in attempts[:-1]), attempts)
+
+        def test_the_projection_prices_only_the_windows_planned_cold(self):
+            cache, now = self.projected(10.0)
+            windows = [torch.tensor([[n]], dtype=torch.int32) for n in range(5)]
+            with torch.inference_mode():
+                for n in [0, 2, 4]:
+                    cache.forward(windows[n])
+                self.assertEqual(cache.cold_windows((w, None) for w in windows), 2)
+                cache.begin_scan(100, total_windows=1)
+                cache.forward(torch.tensor([[99]], dtype=torch.int32))
+                cache.end_scan()
+                started = now[0]
+                # Cached windows 0, 2 and 4 around cold 1 and 3: pricing every unscanned window as cold
+                # projects 10 + 3 x 10 s after window 1, which a 25 s budget refuses.
+                cache.begin_scan(25, total_windows=5)
+                with self.assertRaises(CooperativeScanTimeout):
+                    for window in windows:
+                        cache.forward(window)
+                cache.end_scan()
+                cache.begin_scan(25, total_windows=5, cold_windows=1)
+                for window in windows:
+                    cache.forward(window)
+                cache.end_scan()
+            self.assertEqual(now[0] - started, 20.0)
+            self.assertEqual(cache.cold_windows((w, None) for w in windows), 0)
+            for bad in [-1, 6, True, 1.0]:
+                with self.assertRaises(ValueError):
+                    cache.begin_scan(5, total_windows=5, cold_windows=bad)
+            with self.assertRaises(ValueError):
+                cache.begin_scan(5, cold_windows=0)
+
+        def test_an_interrupt_waits_for_the_running_window(self):
+            now = [0.0]
+            model = Model().eval()
+            original = model.forward
+            stop = []
+            def hooked(tokens, attention_mask=None):
+                stop.append(True)
+                cache.check_deadline()
+                return original(tokens, attention_mask)
+            model.forward = hooked
+            cache = ExactWindowLogitsCache(model, namespace="ns", clock=lambda: now[0])
+            windows = [torch.tensor([[n]], dtype=torch.int32) for n in range(2)]
+            with torch.inference_mode():
+                cache.begin_scan(100, interrupt=lambda: bool(stop))
+                with self.assertRaises(ScanInterrupted):
+                    for window in windows:
+                        cache.forward(window)
+                cache.end_scan()
+                # The window that saw the request arrive was finished and kept; the next one never started.
+                self.assertEqual(model.calls, 1)
+                self.assertEqual(cache.cold_windows((w, None) for w in windows), 1)
+                cache.begin_scan(100, interrupt=lambda: True)
+                with self.assertRaises(ScanInterrupted):
+                    cache.check_deadline()
+                cache.end_scan()
 
         def test_unbudgeted_forwards_do_not_enter_the_miss_median(self):
             cache, now = self.projected(10.0)
@@ -736,6 +875,30 @@ def self_test():
             model, cache = self.cache(None)
             with torch.inference_mode():
                 return cache.forward(self.tokens if tokens is None else tokens)
+
+        def test_cold_windows_sees_both_tiers_with_predict_text_shaped_keys(self):
+            # The worker plans with the tensors predict_text builds: int32 (1, n) tokens and an all-true mask.
+            def planned(ids):
+                tokens = torch.tensor([list(ids)], device="cpu", dtype=torch.int32)
+                return tokens, torch.ones_like(tokens, dtype=torch.bool)
+            full, tail = [1, 2], [3]
+            tier = self.tier()
+            _, writer = self.cache(tier)
+            with torch.inference_mode():
+                writer.forward(torch.tensor([full], dtype=torch.int32), attention_mask=torch.ones((1, 2), dtype=torch.bool))
+                writer.forward(torch.tensor([tail], dtype=torch.int32), attention_mask=torch.ones((1, 1), dtype=torch.bool))
+            self.assertEqual(writer.cold_windows([planned(full), planned(tail)]), 0)
+            # A new process keeps only complete windows on disk; the tail lived in memory alone.
+            _, reader = self.cache(self.tier())
+            self.assertEqual(reader.cold_windows([planned(full), planned(tail)]), 1)
+            self.assertEqual(reader.cold_windows([planned([2, 1])]), 1)
+            _, other = self.cache(self.tier(), namespace="ns-v2")
+            self.assertEqual(other.cold_windows([planned(full)]), 1)
+            # An entry past its TTL is priced cold even though its file has not been swept yet.
+            _, fresh = self.cache(tier)
+            self.assertEqual(fresh.cold_windows([planned(full)]), 0)
+            self.now[0] += 8 * 24 * 3600
+            self.assertEqual(fresh.cold_windows([planned(full)]), 1)
 
         def test_cold_result_survives_a_new_process_byte_equal(self):
             import subprocess

@@ -1429,6 +1429,93 @@ class CacheTests(unittest.TestCase):
         for _, hits, _ in attempts[1:]: self.assertGreater(hits, 0, attempts)
         self.assertEqual(calls, 60)
 
+    # 2026-11-05: a 346,706-byte body timed out five times with under 3.5 s of model time each. Its retry hit
+    # the cached prefix, reached a cold window and was refused before computing it, so with warming starved
+    # by back-to-back requests no retry ever cached anything. Every timed-out retry must now compute a window.
+    def test_a_retry_without_warming_never_times_out_instantly(self):
+        clock, model, cache = self.make_cache()
+        model.cost = 10.0
+        cache.begin_scan(100.0, total_windows=1)
+        cache.forward(Tensor(99))
+        cache.end_scan()
+        windows = [Tensor(n) for n in range(5)]
+        attempts = []
+        for _ in range(5):
+            started, calls = clock.value, model.calls
+            cache.begin_scan(25.0, total_windows=len(windows))
+            try:
+                for window in windows: cache.forward(window)
+                attempts.append(None)
+                break
+            except helper.CooperativeScanTimeout:
+                attempts.append((clock.value - started, model.calls - calls))
+            finally:
+                cache.end_scan()
+        self.assertIsNone(attempts[-1], attempts)
+        for spent, computed in attempts[:-1]:
+            self.assertGreaterEqual(spent, 10.0, attempts)
+            self.assertGreaterEqual(computed, 1, attempts)
+
+    # A first cold window that cannot fit is still refused before its forward: the hard deadline would
+    # discard it half-done, which is no progress either.
+    def test_a_first_cold_window_that_cannot_fit_is_refused_before_its_forward(self):
+        clock, model, cache = self.make_cache()
+        model.cost = 10.0
+        cache.begin_scan(100.0, total_windows=1)
+        cache.forward(Tensor(99))
+        cache.end_scan()
+        cache.begin_scan(5.0, total_windows=5)
+        with self.assertRaises(helper.CooperativeScanTimeout) as raised: cache.forward(Tensor(1))
+        cache.end_scan()
+        self.assertEqual((clock.value, model.calls), (10.0, 1))
+        self.assertEqual(raised.exception.remaining_ms, 50_000)
+
+    def test_a_cached_window_after_a_cold_one_is_not_priced(self):
+        clock, model, cache = self.make_cache()
+        model.cost = 10.0
+        windows = [Tensor(n) for n in range(5)]
+        cache.begin_scan(100.0, total_windows=1)
+        cache.forward(Tensor(99))
+        cache.end_scan()
+        for n in [0, 2, 4]: cache.forward(windows[n])
+        cold = cache.cold_windows((window, None) for window in windows)
+        self.assertEqual(cold, 2)
+        cache.begin_scan(25.0, total_windows=5)
+        with self.assertRaises(helper.CooperativeScanTimeout):
+            for window in windows: cache.forward(window)
+        cache.end_scan()
+        self.assertEqual(cache.cold_windows((window, None) for window in windows), 1)
+        cache.begin_scan(25.0, total_windows=5, cold_windows=1)
+        for window in windows: cache.forward(window)
+        cache.end_scan()
+        self.assertEqual(cache.cold_windows((window, None) for window in windows), 0)
+        # A plan that misses a cached window is capped by the unscanned windows, as before plans existed.
+        cache.begin_scan(1.0, total_windows=5, cold_windows=5)
+        for window in windows: cache.forward(window)
+        cache.end_scan()
+
+    def test_warming_keeps_the_window_running_when_a_request_arrives(self):
+        clock, model, cache = self.make_cache()
+        inbox = []
+        hook = lambda: cache.check_deadline()
+        def forward(tokens, attention_mask=None):
+            model.calls += 1
+            inbox.append("request")
+            hook()
+            return Tensor(tokens.value)
+        model.forward = forward
+        cache = helper.ExactWindowLogitsCache(model, namespace="synthetic", clock=clock)
+        cache.begin_scan(600.0, interrupt=lambda: bool(inbox))
+        with self.assertRaises(helper.ScanInterrupted):
+            for value in range(3): cache.forward(Tensor(value))
+        cache.end_scan()
+        self.assertEqual(model.calls, 1)
+        self.assertEqual(cache.snapshot()["entries"], 1)
+        # Outside a window, such as in Viterbi, the interrupt still applies at once.
+        cache.begin_scan(600.0, interrupt=lambda: True)
+        with self.assertRaises(helper.ScanInterrupted): cache.check_deadline()
+        cache.end_scan()
+
     def test_failed_compute_and_invalid_logits_are_not_cached(self):
         clock, model, cache = self.make_cache()
         cache.begin_scan(1.0)
@@ -1684,6 +1771,10 @@ decoding.ViterbiCRFDecoder = ViterbiCRFDecoder
 class EmptyScores:
     ndim, shape = 2, (0, 33)
 torch.empty = lambda shape, dtype: types.SimpleNamespace(element_size=lambda: {"bfloat16": 2, "float16": 2, "float32": 4}[dtype])
+# The worker plans cold windows from the token tensors predict_text would build. Fixture tokens count up from 0, so
+# the window starting at token 4096 * (n - 1) is the fixture's Tensor(n), and its forwards pass no mask.
+torch.tensor = lambda data, device=None, dtype=None: Tensor(1 + data[0][0] // 4096)
+torch.ones_like = lambda tensor, dtype=None: None
 for name, module in {"torch": torch, "torch.nn": torch.nn,
         "torch.nn.functional": torch.nn.functional, "opf._common": types.ModuleType("opf._common"),
         "opf._common.env": env_module, "opf._model": types.ModuleType("opf._model"),
@@ -1729,7 +1820,7 @@ class OPF:
         self.calls = 0
         def encode(text, allowed_special=None):
             assert allowed_special == "all"
-            return [0] * int(os.getenv("CCSHIELD_TEST_TOKENS", len(text)))
+            return list(range(int(os.getenv("CCSHIELD_TEST_TOKENS", len(text)))))
         self.runtime = types.SimpleNamespace(model=Transformer(), n_ctx=4096, encoding=types.SimpleNamespace(encode=encode))
         self.decoder = ViterbiCRFDecoder()
     def get_runtime(self):
@@ -1742,7 +1833,7 @@ class OPF:
         assert type(cache).__name__ == "ExactWindowLogitsCache"
         assert f"cpu:threads{expected_threads()}:" in cache._namespace and "ctx4096" in cache._namespace
         assert "adb9dd7d6f47e482ccb0925e621a1375461b997833dfa5be6dfc67b9d58b6f0e" in cache._namespace
-        assert "510e4f58264781618c0be3a28d41c944282d1f00955ab8e87825462ad1e1d705" in cache._namespace
+        assert "7a13a6da135e96504ce61da003132c720d43ee7e1724b491d7cd4668ed1b1102" in cache._namespace
         self.calls += 1
         scan_number[0] = self.calls
         if self.calls == 1:
@@ -1763,7 +1854,10 @@ class OPF:
             marker = os.getenv("CCSHIELD_TEST_COOPERATIVE_MARKER")
             try:
                 if cooperative_mode == "preprocess" and self.calls == 2: clock[0] += 1.25 * budget
-                for value in [1, 2]: cache.forward(Tensor(value))
+                # CCSHIELD_TEST_SCAN_WINDOWS lists each scan's windows, "a,b;c" from the first scan on.
+                plan = os.getenv("CCSHIELD_TEST_SCAN_WINDOWS")
+                for value in [1, 2] if not plan else map(int, plan.split(";")[self.calls - 2].split(",")):
+                    cache.forward(Tensor(value))
                 if cooperative_mode == "postprocess" and self.calls == 2: clock[0] += 1.25 * budget
                 return Result(text)
             finally:
@@ -2059,6 +2153,21 @@ syncBuiltinESMExports();
       // Both windows cold would need 1.5 budgets, but window 1 is cached, so only window 2's 0.75 is projected.
       assert.equal(retry.id, "retry");
       assert.equal(retry.status, "ok", `the retry must not be refused for windows it already has: ${JSON.stringify(retry)}`);
+      assert.deepEqual(retry.cache, { hits: 1, misses: 1, windows: 2 });
+      assert.deepEqual(verifiedResult(body, retry), { content: "[redacted:private_email]" });
+    });
+    for (const scan of [30_000, 240_000]) await t.test(`a ${scan}ms retry prices only the windows it has not cached`, () => {
+      const marker = join(temp, `planned-retry-${scan}`);
+      const input = ["tail", "retry"].map((id) => JSON.stringify({ protocol: "airkit-privacy-ndjson-v1", id, type: "scan",
+        body: body.toString("base64"), budgetMs: scan })).join("\n") + "\n";
+      const result = spawnSync(process.execPath, workerArgs({ startup: 30_000, scan }), { input, encoding: "utf8", timeout: runTimeout,
+        env: { ...process.env, CCSHIELD_TEST_COOPERATIVE_MODE: "windows", CCSHIELD_TEST_COOPERATIVE_MARKER: marker,
+          CCSHIELD_OPF_WARM_SECONDS: "0", CCSHIELD_TEST_TOKENS: "8192", CCSHIELD_TEST_SCAN_WINDOWS: "2;1,2" } });
+      const [tail, retry] = parseReplies(result);
+      assert.equal(tail.reason, "model_timeout");
+      // Window 2 is cached and window 1 is not. Pricing every unscanned window as cold would refuse the retry
+      // after window 1 (0.75 + 0.75 budgets); the plan knows window 2 costs nothing.
+      assert.equal(retry.status, "ok", `the retry must not be priced for windows it already has: ${JSON.stringify(retry)}`);
       assert.deepEqual(retry.cache, { hits: 1, misses: 1, windows: 2 });
       assert.deepEqual(verifiedResult(body, retry), { content: "[redacted:private_email]" });
     });
