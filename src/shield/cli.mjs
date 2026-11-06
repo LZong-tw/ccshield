@@ -227,20 +227,32 @@ async function createDefaultShieldDependencies(dependencies) {
           leaseTimer = null;
         }
       };
+      let leaseReleased = false;
+      let renewal = null;
+      // A refused renewal means the shield no longer holds the lease: it lapsed while the timer
+      // could not fire (machine asleep past the TTL) or the daemon restarted. Every request then
+      // fails 401 until the lease exists again, so register the same capability afresh.
+      const keepLease = async () => {
+        const renewed = await renewLease({ ready, targetOrigin, paths: lanePaths, io: dependencies.io }).catch(() => false);
+        if (renewed || leaseReleased) return;
+        await createLease({ ready, targetOrigin, capability: ready.capability, paths: lanePaths, io: dependencies.io }).catch(() => null);
+      };
       if (targetOrigin) {
         const schedule = dependencies.shieldLeaseSetInterval ?? setInterval;
         leaseTimer = schedule(() => {
-          void renewLease({ ready, targetOrigin, paths: lanePaths, io: dependencies.io }).catch(() => {});
+          renewal ??= keepLease().finally(() => { renewal = null; });
+          return renewal;
         }, 15_000);
         leaseTimer.unref?.();
       }
       let outcome;
       let leaseRetained = false;
-      let leaseReleased = false;
       const releaseLease = async () => {
         if (leaseReleased) return;
         leaseReleased = true;
         stopLeaseTimer();
+        // A re-registration still in flight must land before the revoke, or it would outlive it.
+        await renewal;
         await revokeLease({ ready, paths: lanePaths, io: dependencies.io }).catch(() => {});
         await hop?.close();
       };

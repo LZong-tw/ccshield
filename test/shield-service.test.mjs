@@ -9,6 +9,7 @@ import test from "node:test";
 
 import { runShieldCli } from "../src/shield/cli.mjs";
 import {
+  createShieldDestinationLease,
   ensureShieldReady,
   inspectShieldService,
   installShieldService,
@@ -131,9 +132,9 @@ test("shield policy status renders only active metadata", async () => {
 test("shield install writes a private plist only with --write semantics", async () => {
   const homeDir = await mkdtemp(join(tmpdir(), "ccshield-service-"));
   const { options, paths } = fixture(homeDir);
-  const calls = [];
   try {
-    await installShieldService({ ...options, write: true, runLaunchctl: async (args) => { calls.push(args); return { ok: true }; } });
+    const launchd = fakeLaunchd();
+    await installShieldService({ ...options, write: true, runLaunchctl: launchd.run, sleep: async () => {} });
     assert.equal((await stat(paths.launchAgentPath)).mode & 0o777, 0o600);
     assert.equal(await stat(paths.configPath).then(() => true, () => false), true);
     assert.equal((await stat(paths.configPath)).mode & 0o777, 0o600);
@@ -148,49 +149,173 @@ test("shield install writes a private plist only with --write semantics", async 
     });
     assert.deepEqual(await readShieldConfig({ paths }), config);
     assert.match(await readFile(paths.launchAgentPath, "utf8"), /<string>--config<\/string>/);
-    assert.deepEqual(calls, [
-      ["bootout", paths.launchdTarget],
+    assert.deepEqual(launchd.calls, [
+      ["print", paths.launchdTarget],
       ["bootstrap", paths.launchdDomain, paths.launchAgentPath],
-      ["kickstart", "-k", paths.launchdTarget],
-    ]);
+      ["print", paths.launchdTarget],
+    ], "nothing loaded: no bootout, and no kickstart -k to kill the RunAtLoad process");
   } finally {
     await rm(homeDir, { recursive: true, force: true });
   }
 });
 
-test("shield install over a loaded service unloads it first so launchd picks up the new plist", async () => {
+// A launchd that knows one job. bootout leaves it loaded for `drainPolls` more prints, the way the
+// real one keeps a job until its process has exited; bootstrap on a loaded job fails with error 5.
+function fakeLaunchd({ loaded = false, drainPolls = 0, bootstrap } = {}) {
+  const calls = [];
+  let draining = -1;
+  const notFound = { ok: false, status: 113, stdout: "", stderr: "" };
+  return {
+    calls,
+    get loaded() { return loaded; },
+    markLoaded() { loaded = true; },
+    async run(args) {
+      calls.push(args);
+      switch (args[0]) {
+        case "print":
+          if (draining > 0) { draining -= 1; return { ok: true, status: 0, stdout: "state = running\n", stderr: "" }; }
+          if (draining === 0) { draining = -1; loaded = false; }
+          return loaded ? { ok: true, status: 0, stdout: "state = running\npid = 4242\n", stderr: "" } : notFound;
+        case "bootout":
+          if (!loaded) return { ok: false, status: 3, stdout: "", stderr: "Boot-out failed: 3: No such process\n" };
+          if (drainPolls === 0) loaded = false; else draining = drainPolls;
+          return { ok: true, status: 0, stdout: "", stderr: "" };
+        case "bootstrap":
+          if (bootstrap) return bootstrap();
+          if (loaded) return { ok: false, status: 5, stdout: "", stderr: "Bootstrap failed: 5: Input/output error\n" };
+          loaded = true;
+          return { ok: true, status: 0, stdout: "", stderr: "" };
+        case "kickstart":
+          return loaded ? { ok: true, status: 0, stdout: "", stderr: "" } : notFound;
+        default:
+          throw new Error(`unexpected launchctl ${args[0]}`);
+      }
+    },
+  };
+}
+
+test("shield install over a loaded service waits for launchd to unload it before bootstrapping", async () => {
   const homeDir = await mkdtemp(join(tmpdir(), "ccshield-service-"));
   const { options } = fixture(homeDir);
-  const calls = [];
-  const notLoaded = { ok: false, stderr: "Boot-out failed: 3: No such process" };
+  const sleeps = [];
   try {
-    await installShieldService({ ...options, write: true, runLaunchctl: async (args) => { calls.push(args[0]); return args[0] === "bootout" ? notLoaded : { ok: true }; } });
-    assert.deepEqual(calls, ["bootout", "bootstrap", "kickstart"], "a first install with nothing loaded still succeeds");
+    const launchd = fakeLaunchd({ loaded: true, drainPolls: 3 });
+    await installShieldService({ ...options, write: true, runLaunchctl: launchd.run, sleep: async (ms) => { sleeps.push(ms); } });
+    assert.deepEqual(launchd.calls.map((args) => args[0]), ["print", "bootout", "print", "print", "print", "print", "bootstrap", "print"]);
+    assert.equal(sleeps.length, 3);
+    assert.equal(launchd.loaded, true);
   } finally {
     await rm(homeDir, { recursive: true, force: true });
   }
 });
 
-test("shield start tolerates a service install already bootstrapped but still requires a live kickstart", async () => {
-  const homeDir = await mkdtemp(join(tmpdir(), "ccshield-restart-"));
+test("shield install gives up with a named error when the old job never unloads", async () => {
+  const homeDir = await mkdtemp(join(tmpdir(), "ccshield-service-"));
   const { options, paths } = fixture(homeDir);
   try {
-    await installShieldService({ ...options, write: true, runLaunchctl: async () => ({ ok: true }) });
-    const alreadyLoaded = { ok: false, status: 5, stdout: "", stderr: "Bootstrap failed: 5: Input/output error\n" };
-    const calls = [];
-    await startShieldService({
-      ...options,
-      runLaunchctl: async (args) => { calls.push(args[0]); return args[0] === "bootstrap" ? alreadyLoaded : { ok: true }; },
-    });
-    assert.deepEqual(calls, ["bootstrap", "kickstart"]);
+    const launchd = fakeLaunchd({ loaded: true, drainPolls: Number.POSITIVE_INFINITY });
     await assert.rejects(
-      startShieldService({ ...options, runLaunchctl: async () => alreadyLoaded }),
-      /launchctl kickstart failed/i,
+      installShieldService({ ...options, write: true, runLaunchctl: launchd.run, sleep: async () => {}, unloadTimeoutMs: 500 }),
+      new RegExp(`launchd is still unloading ${paths.launchdTarget.replaceAll(".", "\\.")} after 500 ms`),
     );
-    assert.ok(paths.launchAgentPath);
+    assert.equal(launchd.calls.some((args) => args[0] === "bootstrap"), false, "never bootstraps over a job still loaded");
   } finally {
     await rm(homeDir, { recursive: true, force: true });
   }
+});
+
+test("shield install does not swallow bootstrap error 5 and reports launchctl's own words", async () => {
+  const homeDir = await mkdtemp(join(tmpdir(), "ccshield-service-"));
+  const { options } = fixture(homeDir);
+  try {
+    const failing = fakeLaunchd({ bootstrap: () => ({ ok: false, status: 5, stdout: "", stderr: "Bootstrap failed: 5: Input/output error\n" }) });
+    await assert.rejects(
+      installShieldService({ ...options, write: true, runLaunchctl: failing.run, sleep: async () => {}, unloadTimeoutMs: 300 }),
+      /^Error: launchctl bootstrap failed: Bootstrap failed: 5: Input\/output error \(exit 5\)$/,
+    );
+    assert.equal(failing.calls.filter((args) => args[0] === "bootstrap").length, 4, "error 5 is retried only within the unload budget");
+    // execFile reports an empty stderr as "", not undefined; the message must still say something.
+    const stdoutOnly = fakeLaunchd({ bootstrap: () => ({ ok: false, status: 113, stdout: "Could not find service\n", stderr: "" }) });
+    await assert.rejects(
+      installShieldService({ ...options, write: true, runLaunchctl: stdoutOnly.run, sleep: async () => {} }),
+      /^Error: launchctl bootstrap failed: Could not find service \(exit 113\)$/,
+    );
+    const silent = fakeLaunchd({ bootstrap: () => ({ ok: false, status: 37, stdout: "", stderr: "", message: "Command failed: launchctl bootstrap" }) });
+    await assert.rejects(
+      installShieldService({ ...options, write: true, runLaunchctl: silent.run, sleep: async () => {} }),
+      /^Error: launchctl bootstrap failed: Command failed: launchctl bootstrap \(exit 37\)$/,
+    );
+  } finally {
+    await rm(homeDir, { recursive: true, force: true });
+  }
+});
+
+test("shield install retries a bootstrap that launchd answers with error 5 while it finishes the unload", async () => {
+  const homeDir = await mkdtemp(join(tmpdir(), "ccshield-service-"));
+  const { options } = fixture(homeDir);
+  try {
+    let busy = 2;
+    const launchd = fakeLaunchd({
+      loaded: true,
+      bootstrap: () => {
+        if (busy-- > 0) return { ok: false, status: 5, stdout: "", stderr: "Bootstrap failed: 5: Input/output error\n" };
+        launchd.markLoaded();
+        return { ok: true, status: 0, stdout: "", stderr: "" };
+      },
+    });
+    await installShieldService({ ...options, write: true, runLaunchctl: launchd.run, sleep: async () => {} });
+    assert.deepEqual(launchd.calls.map((args) => args[0]), ["print", "bootout", "print", "bootstrap", "bootstrap", "bootstrap", "print"]);
+    assert.equal(launchd.loaded, true);
+  } finally {
+    await rm(homeDir, { recursive: true, force: true });
+  }
+});
+
+test("shield install refuses to report success when bootstrap leaves nothing loaded", async () => {
+  const homeDir = await mkdtemp(join(tmpdir(), "ccshield-service-"));
+  const { options } = fixture(homeDir);
+  try {
+    const launchd = fakeLaunchd({ bootstrap: () => ({ ok: true, status: 0, stdout: "", stderr: "" }) });
+    await assert.rejects(
+      installShieldService({ ...options, write: true, runLaunchctl: launchd.run, sleep: async () => {} }),
+      /bootstrap reported success but .* is not loaded/,
+    );
+  } finally {
+    await rm(homeDir, { recursive: true, force: true });
+  }
+});
+
+test("shield start kickstarts a loaded service and bootstraps an unloaded one", async () => {
+  const homeDir = await mkdtemp(join(tmpdir(), "ccshield-restart-"));
+  const { options } = fixture(homeDir);
+  try {
+    await installShieldService({ ...options, write: true, runLaunchctl: fakeLaunchd().run, sleep: async () => {} });
+    const loaded = fakeLaunchd({ loaded: true });
+    await startShieldService({ ...options, runLaunchctl: loaded.run });
+    assert.deepEqual(loaded.calls.map((args) => args[0]), ["print", "kickstart"]);
+    const unloaded = fakeLaunchd();
+    await startShieldService({ ...options, runLaunchctl: unloaded.run });
+    assert.deepEqual(unloaded.calls.map((args) => args[0]), ["print", "bootstrap"]);
+    assert.equal(unloaded.loaded, true);
+    await assert.rejects(
+      startShieldService({ ...options, runLaunchctl: fakeLaunchd({ bootstrap: () => ({ ok: false, status: 5, stdout: "", stderr: "Bootstrap failed: 5: Input/output error\n" }) }).run }),
+      /launchctl bootstrap failed: Bootstrap failed: 5/,
+      "a bootstrap that fails on an unloaded job is a real failure",
+    );
+  } finally {
+    await rm(homeDir, { recursive: true, force: true });
+  }
+});
+
+test("shield inspect treats exit 113 with no output as not loaded", async () => {
+  const { paths } = fixture();
+  const result = await inspectShieldService({
+    paths,
+    io: { async readFile() { return ""; } },
+    runLaunchctl: async () => ({ ok: false, status: 113, stdout: "", stderr: "" }),
+  });
+  assert.equal(result.loaded, false);
+  assert.equal(result.active, false);
 });
 
 test("shield start refuses an uninstalled service without provisioning state", async () => {
@@ -1019,6 +1144,77 @@ test("subscription target launch renews its lease until its foreground child exi
     `revoke:${"b".repeat(32)}`,
   ]);
   assert.deepEqual(cleared, [intervals[0].timer]);
+});
+
+test("a refused lease renewal re-registers the same capability instead of leaving the child on 401s", async () => {
+  for (const refusal of [async () => false, async () => { throw new Error("renew failed"); }]) {
+    const intervals = [];
+    const events = [];
+    await runShieldCli(["launch", "--lane", "subscription", "--target", "http://127.0.0.1:8804", "--", "echo", "ok"], {
+      stdout: capture().stdout,
+      ensureShieldReady: async () => ({ origin: "http://127.0.0.1:8811", capability: "a".repeat(32), lane: "subscription", targetClass: "subscription" }),
+      ensureOpfJob: async () => ({ started: false }),
+      createShieldDestinationLease: async ({ ready, targetOrigin, capability }) => {
+        events.push(`create:${targetOrigin}:${capability ?? "fresh"}`);
+        return { ...ready, capability: capability ?? "b".repeat(32) };
+      },
+      renewShieldDestinationLease: async (options) => { events.push(`renew:${options.ready.capability}`); return refusal(); },
+      revokeShieldDestinationLease: async ({ ready }) => events.push(`revoke:${ready.capability}`),
+      shieldLeaseSetInterval: (callback) => { const timer = { unref() {} }; intervals.push(callback); return timer; },
+      shieldLeaseClearInterval: () => {},
+      launchShieldChild: async () => {
+        await intervals[0]();
+        events.push("child-exit");
+        return { code: 0 };
+      },
+    });
+    assert.deepEqual(events, [
+      "create:http://127.0.0.1:8804:fresh",
+      `renew:${"b".repeat(32)}`,
+      `create:http://127.0.0.1:8804:${"b".repeat(32)}`,
+      "child-exit",
+      `revoke:${"b".repeat(32)}`,
+    ]);
+  }
+});
+
+test("a renewal still in flight when the child exits never re-registers after the revoke", async () => {
+  const intervals = [];
+  const events = [];
+  let refuse;
+  await runShieldCli(["launch", "--lane", "subscription", "--target", "http://127.0.0.1:8804", "--", "echo", "ok"], {
+    stdout: capture().stdout,
+    ensureShieldReady: async () => ({ origin: "http://127.0.0.1:8811", capability: "a".repeat(32), lane: "subscription", targetClass: "subscription" }),
+    ensureOpfJob: async () => ({ started: false }),
+    createShieldDestinationLease: async ({ ready, capability }) => { events.push(capability ? "re-register" : "create"); return { ...ready, capability: "b".repeat(32) }; },
+    renewShieldDestinationLease: () => new Promise((resolve) => { events.push("renew"); refuse = () => resolve(false); }),
+    revokeShieldDestinationLease: async () => events.push("revoke"),
+    shieldLeaseSetInterval: (callback) => { intervals.push(callback); return { unref() {} }; },
+    shieldLeaseClearInterval: () => {},
+    launchShieldChild: async () => {
+      void intervals[0]();
+      assert.equal(intervals[0](), intervals[0](), "an overlapping tick joins the renewal in flight");
+      setImmediate(() => refuse());
+      return { code: 0 };
+    },
+  });
+  assert.deepEqual(events, ["create", "renew", "revoke"]);
+});
+
+test("a destination lease can be registered under a caller-chosen capability", async (t) => {
+  const homeDir = await mkdtemp(join(tmpdir(), "ccshield-lease-"));
+  t.after(() => rm(homeDir, { recursive: true, force: true }));
+  const { paths } = fixture(homeDir);
+  await writeShieldConfig({ paths, config: { capability, controlCapability: "d".repeat(32), targetOrigin: "https://api.anthropic.com", lane: "subscription", generation } });
+  const ready = { origin: "http://127.0.0.1:8811", capability, lane: "subscription", targetClass: "subscription" };
+  const bodies = [];
+  const fetchImpl = async (_url, init) => { bodies.push(JSON.parse(init.body)); return { status: 204 }; };
+  const leased = await createShieldDestinationLease({ ready, targetOrigin: "http://127.0.0.1:8804", capability: "e".repeat(32), paths, fetchImpl });
+  assert.equal(leased.capability, "e".repeat(32));
+  assert.equal(bodies[0].capability, "e".repeat(32));
+  assert.equal(bodies[0].renew, undefined, "a re-registration is a plain create, which the shield accepts once the old lease is gone");
+  await assert.rejects(createShieldDestinationLease({ ready, targetOrigin: "http://127.0.0.1:8804", capability: "short", paths, fetchImpl }), /capability is invalid/);
+  assert.equal(bodies.length, 1);
 });
 
 test("subscription target launch retains its lease while a matching background host remains", async () => {

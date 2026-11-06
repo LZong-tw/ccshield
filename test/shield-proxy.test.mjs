@@ -1419,6 +1419,65 @@ test("expired destination leases are removed before they can forward without ren
   assert.equal(reusedAfterExpiry.status, 204, "expiry cleanup permits a fresh session registration");
 });
 
+test("every refusal before evaluation leaves a failure row, and a lapsed lease recovers by re-registering", async (t) => {
+  let now = 1_000_000;
+  let calls = 0;
+  const logged = [];
+  const upstream = await startFixture(t, async (_request, response) => { calls += 1; response.end("ok"); });
+  const lease = "e".repeat(32);
+  const shield = await startShield(t, {
+    targetOrigin: undefined,
+    allowDestinationLeases: true,
+    now: () => now,
+    onFailure: (entry) => logged.push(entry),
+    decide: async () => ({ action: "allow", reasonCodes: ["policy_allow"], lane: "managed", destinationClass: "managed", bundleVersion: "policy-1", detectorVersions: { gitleaks: "8", privacy: "1" } }),
+  });
+  const control = { "x-airkit-shield-control": CONTROL_CAPABILITY, "content-type": "application/json" };
+  const leaseRequest = (body, headers = control, method = "POST") => fetch(`${shield.origin}/_airkit/shield/destination-lease`, { method, headers, body: JSON.stringify(body) });
+  const message = (headers) => fetch(`${shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield-launch": "launch-1", ...headers }, body: "{}" });
+  const reasons = () => logged.splice(0).map((entry) => `${entry.stage}/${entry.reason}`);
+
+  assert.equal((await leaseRequest({ capability: lease, targetOrigin: upstream.origin, expiresAt: now + 30_000 })).status, 204);
+  assert.equal((await message({ "x-airkit-shield": lease })).status, 200);
+  assert.deepEqual(reasons(), []);
+
+  // The machine sleeps past the lease's lifetime: the child keeps sending it and every request is refused.
+  now += 30_001;
+  for (let attempt = 0; attempt < 3; attempt += 1) assert.equal((await message({ "x-airkit-shield": lease })).status, 401);
+  assert.deepEqual(reasons(), ["auth/lease_expired", "auth/lease_expired", "auth/lease_expired"]);
+  assert.equal((await leaseRequest({ capability: lease, targetOrigin: upstream.origin, expiresAt: now + 30_000, renew: true })).status, 403);
+  assert.deepEqual(reasons(), ["auth/lease_renew_rejected"]);
+
+  // The launcher re-registers the same capability; the child's next request goes through again.
+  assert.equal((await leaseRequest({ capability: lease, targetOrigin: upstream.origin, expiresAt: now + 30_000 })).status, 204);
+  assert.equal((await message({ "x-airkit-shield": lease })).status, 200);
+  assert.equal((await leaseRequest({ capability: lease, targetOrigin: upstream.origin, expiresAt: now + 30_000 })).status, 403);
+  assert.deepEqual(reasons(), ["auth/lease_conflict"], "a live lease still cannot be registered twice");
+
+  assert.equal((await leaseRequest({ capability: lease }, control, "DELETE")).status, 204);
+  assert.equal((await message({ "x-airkit-shield": lease })).status, 401);
+  assert.equal((await message({ "x-airkit-shield": "f".repeat(32) })).status, 401);
+  assert.equal((await leaseRequest({ capability: lease }, { ...control, "x-airkit-shield-control": "wrong" })).status, 401);
+  assert.equal((await leaseRequest({ capability: "short" })).status, 403);
+  assert.equal((await fetch(`${shield.origin}/v1/other`, { method: "POST", headers: { "x-airkit-shield": CAPABILITY }, body: "{}" })).status, 403);
+  assert.equal((await fetch(`${shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield": CAPABILITY, "content-encoding": "gzip" }, body: "{}" })).status, 403);
+  assert.deepEqual(reasons(), [
+    "auth/capability_rejected",
+    "auth/capability_rejected",
+    "auth/control_rejected",
+    "auth/lease_invalid",
+    "request/path_blocked",
+    "request/encoding_blocked",
+  ]);
+  assert.equal(calls, 2);
+
+  // Logged rows carry the launch digest for correlation and never the capability itself.
+  assert.equal((await message({ "x-airkit-shield": lease })).status, 401);
+  const [row] = logged;
+  assert.equal(row.launch.length, 12);
+  assert.doesNotMatch(JSON.stringify(row), new RegExp(`${lease}|${CONTROL_CAPABILITY}|launch-1`));
+});
+
 test("lease renewal cannot revive a capability after control revocation", async (t) => {
   const upstream = await startFixture(t, async (_request, response) => response.end("ok"));
   const lease = "f".repeat(32);

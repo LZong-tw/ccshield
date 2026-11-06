@@ -34,7 +34,12 @@ const FAILURE_REASONS = new Map([
   ["redaction", new Set(["redaction_invalid"])],
   ["audit", new Set(["audit_unavailable"])],
   ["upstream", new Set(["target_unavailable", "transport_unavailable", "redirect_blocked"])],
+  // Refusals that happen before a request is evaluated or audited. Without a row here a launch whose
+  // lease lapsed fails every request with nothing on disk to say why.
+  ["auth", new Set(["capability_rejected", "lease_expired", "control_rejected", "lease_invalid", "lease_renew_rejected", "lease_conflict", "control_invalid"])],
+  ["request", new Set(["path_blocked", "encoding_blocked"])],
 ]);
+const MAX_EXPIRED_LEASES = 64;
 const INTERNAL_HEADERS = new Set([
   "connection",
   "content-length",
@@ -86,11 +91,12 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
   }
   const approvalChannels = new Map();
   const destinationLeases = new Map();
+  const expiredLeases = new Set();
   const imageOverrides = new Set();
   const failures = [];
   const readiness = { reason: null };
   const server = createServer((request, response) => {
-    void handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision: record, isReady, approvalChannels, imageOverrides, onImageOverrideChange, now, failures, readiness, onFailure, scanStats, scanTotals });
+    void handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, expiredLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision: record, isReady, approvalChannels, imageOverrides, onImageOverrideChange, now, failures, readiness, onFailure, scanStats, scanTotals });
   });
   await listenLoopback(server, port);
   const address = server.address();
@@ -104,7 +110,7 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
   };
 }
 
-async function handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision, isReady, approvalChannels, imageOverrides, onImageOverrideChange, now, failures, readiness, onFailure, scanStats, scanTotals }) {
+async function handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, expiredLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision, isReady, approvalChannels, imageOverrides, onImageOverrideChange, now, failures, readiness, onFailure, scanStats, scanTotals }) {
   const startedAt = Date.now();
   const fail = (stage, reason, bytes = 0, { cause, queuedMs } = {}) =>
     recordFailure(failures, onFailure, { stage, reason, bytes, elapsedMs: Date.now() - startedAt, cause, queuedMs, launchId: shieldHeader(request, "launch") });
@@ -126,11 +132,13 @@ async function handleShieldRequest({ request, response, capability, controlCapab
   if (request.url === "/_airkit/shield/image-override" && (request.method === "POST" || request.method === "DELETE")) {
     if (!capabilityMatches(shieldHeader(request, "control"), controlCapability)) {
       request.resume();
+      fail("auth", "control_rejected");
       await finish(response, { status: 401, code: "shield_unauthorized" });
       return;
     }
     const launchId = await readApprovalUnregistration(request);
     if (launchId === null || (request.method === "POST" && (imageOverrides.has(launchId) || imageOverrides.size >= MAX_IMAGE_OVERRIDES))) {
+      fail("auth", "control_invalid");
       await finish(response, { status: 403, code: "shield_blocked" });
       return;
     }
@@ -142,15 +150,26 @@ async function handleShieldRequest({ request, response, capability, controlCapab
   }
   const isLeaseRequest = request.url === "/_airkit/shield/destination-lease" && (request.method === "POST" || request.method === "DELETE");
   if (isLeaseRequest) {
-    if (!allowDestinationLeases || !capabilityMatches(shieldHeader(request, "control"), controlCapability)) { request.resume(); await finish(response, { status: 401, code: "shield_unauthorized" }); return; }
+    if (!allowDestinationLeases || !capabilityMatches(shieldHeader(request, "control"), controlCapability)) {
+      request.resume();
+      fail("auth", "control_rejected");
+      await finish(response, { status: 401, code: "shield_unauthorized" });
+      return;
+    }
     const lease = await readDestinationLease(request, request.method === "POST", now);
     const current = request.method === "POST" ? destinationLeases.get(lease?.capability) ?? null : null;
-    if (current !== null && current.expiresAt <= now()) destinationLeases.delete(lease.capability);
-    if (
-      lease === null
-      || (request.method === "POST" && lease.renew && (current === null || current.expiresAt <= now()))
-      || (request.method === "POST" && !lease.renew && current !== null && current.expiresAt > now())
-    ) { await finish(response, { status: 403, code: "shield_blocked" }); return; }
+    if (current !== null && current.expiresAt <= now()) expireLease(destinationLeases, expiredLeases, lease.capability);
+    const refusal = lease === null ? "lease_invalid"
+      : request.method !== "POST" ? null
+        : lease.renew && (current === null || current.expiresAt <= now()) ? "lease_renew_rejected"
+          : !lease.renew && current !== null && current.expiresAt > now() ? "lease_conflict"
+            : null;
+    if (refusal !== null) {
+      fail("auth", refusal);
+      await finish(response, { status: 403, code: "shield_blocked" });
+      return;
+    }
+    expiredLeases.delete(lease.capability);
     if (request.method === "POST") destinationLeases.set(lease.capability, {
       target: lease.target,
       expiresAt: lease.expiresAt,
@@ -161,10 +180,11 @@ async function handleShieldRequest({ request, response, capability, controlCapab
   }
   const requestCapability = shieldHeader(request, "capability");
   const lease = allowDestinationLeases ? destinationLeases.get(String(requestCapability ?? "")) ?? null : null;
-  if (lease !== null && lease.expiresAt <= now()) destinationLeases.delete(String(requestCapability ?? ""));
+  if (lease !== null && lease.expiresAt <= now()) expireLease(destinationLeases, expiredLeases, String(requestCapability ?? ""));
   const leaseTarget = lease !== null && lease.expiresAt > now() ? lease.target : null;
   if (!isApprovalRegistration && !capabilityMatches(requestCapability, capability) && leaseTarget === null) {
     request.resume();
+    fail("auth", expiredLeases.has(String(requestCapability ?? "")) ? "lease_expired" : "capability_rejected");
     await finish(response, { status: 401, code: "shield_unauthorized" });
     return;
   }
@@ -235,12 +255,14 @@ async function handleShieldRequest({ request, response, capability, controlCapab
   if (isApprovalRegistration) {
     if (!capabilityMatches(shieldHeader(request, "control"), controlCapability)) {
       request.resume();
+      fail("auth", "control_rejected");
       await finish(response, { status: 401, code: "shield_unauthorized" });
       return;
     }
     if (request.method === "DELETE") {
       const launchId = await readApprovalUnregistration(request);
       if (launchId === null) {
+        fail("auth", "control_invalid");
         await finish(response, { status: 403, code: "shield_blocked" });
         return;
       }
@@ -251,6 +273,7 @@ async function handleShieldRequest({ request, response, capability, controlCapab
     }
     const registration = await readApprovalRegistration(request);
     if (registration === null || approvalChannels.has(registration.launchId) || approvalChannels.size >= MAX_APPROVAL_CHANNELS) {
+      fail("auth", "control_invalid");
       await finish(response, { status: 403, code: "shield_blocked" });
       return;
     }
@@ -263,11 +286,13 @@ async function handleShieldRequest({ request, response, capability, controlCapab
   const path = safeMessagesPath(request.url);
   if (path === null) {
     request.resume();
+    fail("request", "path_blocked");
     await finish(response, { status: 403, code: "shield_blocked" });
     return;
   }
   if (!hasIdentityContentEncoding(request.headers["content-encoding"])) {
     request.resume();
+    fail("request", "encoding_blocked");
     await finish(response, { status: 403, code: "shield_blocked" });
     return;
   }
@@ -547,6 +572,14 @@ async function readSmallJson(request) {
   } catch {
     return null;
   }
+}
+
+// A lease that lapsed is remembered for a while, so every request still carrying it is logged as
+// lease_expired rather than as an unknown capability.
+function expireLease(destinationLeases, expiredLeases, capability) {
+  destinationLeases.delete(capability);
+  expiredLeases.add(capability);
+  if (expiredLeases.size > MAX_EXPIRED_LEASES) expiredLeases.delete(expiredLeases.values().next().value);
 }
 
 async function readDestinationLease(request, needsTarget, now = Date.now) {

@@ -76,14 +76,13 @@ export function planLaunchdService({ paths, nodePath, daemonPath } = {}) {
     operations: [
       { op: "mkdir", path: dirname(paths.launchAgentPath), mode: 0o700 },
       { op: "writeFileAtomic", path: paths.launchAgentPath, mode: 0o600, content: plistXml },
-      { op: "bootout", target: paths.launchdTarget },
+      { op: "bootout", target: paths.launchdTarget, ifLoaded: true, waitForUnload: true },
       { op: "bootstrap", domain: paths.launchdDomain, path: paths.launchAgentPath },
-      { op: "kickstart", target: paths.launchdTarget, kill: true },
     ],
   };
 }
 
-async function installLaunchdService({ write = false, io = defaultIo, runLaunchctl = defaultLaunchctl, ...options } = {}) {
+async function installLaunchdService({ write = false, io = defaultIo, runLaunchctl = defaultLaunchctl, sleep = defaultSleep, unloadTimeoutMs = LAUNCHD_UNLOAD_TIMEOUT_MS, ...options } = {}) {
   const plan = planLaunchdService(options);
   if (!write) return plan;
   const config = createShieldConfig(options.config);
@@ -93,12 +92,16 @@ async function installLaunchdService({ write = false, io = defaultIo, runLaunchc
   await io.writeFile(temporaryPath, plan.plistXml, { mode: 0o600 });
   await io.chmod(temporaryPath, 0o600);
   await io.rename(temporaryPath, plan.plistPath);
-  // launchd caches a loaded job's definition: bootstrap on a loaded service is
-  // tolerated as "already loaded" and kickstart -k restarts the old program
-  // path. Unloading first makes the rewritten plist the one that runs.
-  await launch(runLaunchctl, ["bootout", plan.target], true);
-  await launch(runLaunchctl, ["bootstrap", plan.domain, plan.plistPath], true);
-  await launch(runLaunchctl, ["kickstart", "-k", plan.target], false);
+  // launchd caches a loaded job's definition, so the old job has to be gone before the
+  // rewritten plist is bootstrapped. bootout returns while the old daemon is still draining
+  // its streams; bootstrapping then fails with "Bootstrap failed: 5", so wait until launchd
+  // no longer knows the job. RunAtLoad starts the new one; a kickstart -k here would only
+  // kill that fresh process again.
+  await unloadLaunchdJob(runLaunchctl, plan.target, { sleep, unloadTimeoutMs });
+  await bootstrapAfterUnload(runLaunchctl, plan, { sleep, unloadTimeoutMs });
+  if (!(await isLaunchdJobLoaded(runLaunchctl, plan.target))) {
+    throw new Error(`launchctl bootstrap reported success but ${plan.target} is not loaded`);
+  }
   return { ...plan, written: true };
 }
 
@@ -145,8 +148,8 @@ async function startLaunchdService(options = {}) {
     throw new Error("shield service is not installed; run 'ccshield install --write' before start");
   }
   await ensurePathDrift(plan, io);
-  await launch(runLaunchctl, ["bootstrap", plan.domain, plan.plistPath], true);
-  await launch(runLaunchctl, ["kickstart", "-k", plan.target], false);
+  if (await isLaunchdJobLoaded(runLaunchctl, plan.target)) await launch(runLaunchctl, ["kickstart", "-k", plan.target], false);
+  else await launch(runLaunchctl, ["bootstrap", plan.domain, plan.plistPath], false);
   return { ...plan, started: true };
 }
 
@@ -440,11 +443,14 @@ async function postImageOverride({ method, ready, launchId, paths, io, fetchImpl
   return response?.status === 204;
 }
 
-export async function createShieldDestinationLease({ ready, targetOrigin, launcherContext, paths, io, fetchImpl = fetch } = {}) {
+// Passing a capability re-registers a lease the shield has already dropped (it lapsed while the
+// machine slept, or the daemon restarted). The child's environment carries that capability, so a
+// fresh one would not help; the shield still refuses it while the old lease is live.
+export async function createShieldDestinationLease({ ready, targetOrigin, launcherContext, capability = randomUUID().replaceAll("-", ""), paths, io, fetchImpl = fetch } = {}) {
   if ((ready?.lane !== "managed" && ready?.lane !== "subscription") || !ready.origin || !targetOrigin) throw new Error("shield destination lease requires a fresh lane identity");
+  if (typeof capability !== "string" || !/^[A-Za-z0-9._-]{32,512}$/.test(capability)) throw new Error("shield destination lease capability is invalid");
   if (launcherContext !== undefined) classifyShieldRequest({ body: Buffer.alloc(0), launcherContext });
   const config = await readShieldConfig({ paths: paths ?? shieldPaths({ lane: ready.lane }), io });
-  const capability = randomUUID().replaceAll("-", "");
   const response = await fetchImpl(`${ready.origin}${shieldWireNames(ready).prefix}destination-lease`, {
     method: "POST",
     headers: { [shieldWireNames(ready).control]: config.controlCapability, "content-type": "application/json" },
@@ -791,19 +797,61 @@ async function ensurePathDrift(plan, io) {
   if (existing !== plan.plistXml) throw new Error(`shield launch plist path drift detected: ${plan.plistPath} (${describePlistDrift(existing, plan.plistXml)}); run the install command from the checkout that should own this job`);
 }
 
-// launchctl reports an already-bootstrapped service as "Bootstrap failed: 5:
-// Input/output error" rather than saying so, which made `shield start` fail on
-// every service `install --write` had already loaded. Tolerating it is safe
-// because the kickstart that follows is not tolerated: a service that genuinely
-// failed to bootstrap still raises there.
-const TOLERATED_LAUNCHCTL_FAILURES = /already (loaded|bootstrapped)|could not find service|no such process|Bootstrap failed: 5:/i;
+// Only "the job is not there" is tolerated, and only where that is the wanted state (print,
+// bootout). bootstrap is never tolerated: install and start both check whether the job is
+// loaded first, so "Bootstrap failed: 5" there means the bootstrap really failed.
+const LAUNCHCTL_NOT_FOUND = 113;
+const TOLERATED_LAUNCHCTL_FAILURES = /could not find service|no such process/i;
+const LAUNCHD_UNLOAD_TIMEOUT_MS = 30_000;
+const LAUNCHD_UNLOAD_POLL_MS = 100;
+const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function launch(runLaunchctl, args, tolerateFailure) {
-  const result = await runLaunchctl(args);
-  if (result?.ok === false && !(tolerateFailure && TOLERATED_LAUNCHCTL_FAILURES.test(result.stderr ?? ""))) {
-    throw new Error(`launchctl ${args[0]} failed: ${result.stderr ?? "unknown error"}`);
+  return checkLaunchctl(args, await runLaunchctl(args), tolerateFailure);
+}
+
+function launchctlOutput(result) {
+  return [result.stderr, result.stdout].map((text) => (typeof text === "string" ? text.trim() : "")).find((text) => text !== "") ?? "";
+}
+
+function checkLaunchctl(args, result, tolerateFailure) {
+  if (result?.ok === false) {
+    // launchctl writes some failures to stdout and some to nothing at all; execFile then
+    // reports stderr as "", so fall through every source instead of stopping at the first defined one.
+    const output = launchctlOutput(result);
+    const notFound = result.status === LAUNCHCTL_NOT_FOUND || TOLERATED_LAUNCHCTL_FAILURES.test(output);
+    if (!(tolerateFailure && notFound)) {
+      const detail = output || result.message || "no output";
+      const exit = result.status === undefined || result.status === null ? "" : ` (exit ${result.status})`;
+      throw new Error(`launchctl ${args[0]} failed: ${detail}${exit}`);
+    }
   }
   return { ok: result?.ok !== false, ...result };
+}
+
+async function isLaunchdJobLoaded(runLaunchctl, target) {
+  return (await launch(runLaunchctl, ["print", target], true)).ok;
+}
+
+async function unloadLaunchdJob(runLaunchctl, target, { sleep, unloadTimeoutMs }) {
+  if (!(await isLaunchdJobLoaded(runLaunchctl, target))) return;
+  await launch(runLaunchctl, ["bootout", target], true);
+  for (let waited = 0; await isLaunchdJobLoaded(runLaunchctl, target); waited += LAUNCHD_UNLOAD_POLL_MS) {
+    if (waited >= unloadTimeoutMs) throw new Error(`launchd is still unloading ${target} after ${unloadTimeoutMs} ms; rerun the install once the old daemon has exited`);
+    await sleep(LAUNCHD_UNLOAD_POLL_MS);
+  }
+}
+
+// print can stop listing the old job a moment before launchd has finished tearing it down, and
+// bootstrap then still answers error 5. Retry that one answer within the same budget the unload had.
+async function bootstrapAfterUnload(runLaunchctl, plan, { sleep, unloadTimeoutMs }) {
+  const args = ["bootstrap", plan.domain, plan.plistPath];
+  for (let waited = 0; ; waited += LAUNCHD_UNLOAD_POLL_MS) {
+    const result = await runLaunchctl(args);
+    const busy = result?.ok === false && (result.status === 5 || /Bootstrap failed: 5:/.test(launchctlOutput(result)));
+    if (!busy || waited >= unloadTimeoutMs) return checkLaunchctl(args, result, false);
+    await sleep(LAUNCHD_UNLOAD_POLL_MS);
+  }
 }
 
 async function defaultLaunchctl(args) {
@@ -811,7 +859,7 @@ async function defaultLaunchctl(args) {
     const result = await execFileAsync("launchctl", args);
     return { ok: true, status: 0, stdout: result.stdout, stderr: result.stderr };
   } catch (error) {
-    return { ok: false, status: error.code, stderr: error.stderr ?? error.message };
+    return { ok: false, status: error.code, stdout: error.stdout ?? "", stderr: error.stderr ?? "", message: error.message };
   }
 }
 

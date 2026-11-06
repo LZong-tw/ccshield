@@ -73,8 +73,9 @@ planned.
 
 ## Failure log
 
-When the daemon answers `503 shield_unavailable` (or blocks an oversized body),
-it appends one JSON line to `failures.jsonl` in the lane's state directory
+When the daemon answers `503 shield_unavailable`, blocks an oversized body, or
+refuses a request before evaluating it (`401`, or a `403` that never reaches
+policy), it appends one JSON line to `failures.jsonl` in the lane's state directory
 (`~/.local/share/ccshield/<lane>/`, mode 0600): `ts`, `stage`, `reason`,
 `bytes`, `elapsedMs`, `queuedMs` when the privacy worker queue failed a scan
 it had admitted (validation failures after a completed scan carry none), and
@@ -106,6 +107,12 @@ A few reasons are worth reading precisely:
 - `readiness/not_ready` and `readiness/readiness_failed`: the `/ready` probe
   answered 503. Launchers and status lines poll it, so one line is written
   per outage (and per change of cause), not per poll.
+- `auth/lease_expired`: the request carried a launch's destination lease that
+  lapsed, typically because the machine slept past its 30 s lifetime. The
+  launcher re-registers the same lease on its next 15 s tick, so these stop
+  within one tick. `auth/lease_renew_rejected` is that tick finding the lease
+  gone. `auth/capability_rejected` is a capability the daemon never knew or
+  had revoked; no capability value is ever logged.
 - A client that disconnects mid-request is not a failure and is not logged;
   `upstream/transport_unavailable` means the upstream connection itself
   failed.
