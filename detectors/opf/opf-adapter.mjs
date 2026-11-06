@@ -638,7 +638,7 @@ function validateAllValues(values, expected) {
 
 // Names which control field tripped, from fixed vocabularies only; anything else is reported as "other".
 export const CONTROL_RULES = ["value", "key", "type", "selector"];
-export const CONTROL_CONTEXTS = ["request", "messages", "message", "block", "tools", "tool", "content", "data", "control", "thinking", "cache", "choice", "output", "schema"];
+export const CONTROL_CONTEXTS = ["request", "messages", "message", "block", "tools", "tool", "content", "data", "control", "thinking", "cache", "choice", "output", "schema", "fields", "literal"];
 export const CONTROL_KEYS = ["model", "messages", "system", "tools", "tool_choice", "max_tokens", "stream", "metadata", "temperature", "top_p", "top_k",
   "stop_sequences", "thinking", "output_config", "service_tier", "mcp_servers", "context_management", "container", "cache_control", "role", "content",
   "type", "text", "id", "tool_use_id", "name", "input", "is_error", "source", "signature", "data", "citations", "transformations", "file_id",
@@ -654,7 +654,7 @@ function controlMutation(rule, context, key) {
 function validateJsonShape(before, after, context = before.type === "object"
   && before.children.some(({ key, value }) => key === "messages" && value.type === "array") ? "request" : "data", pinned, field = null) {
   const container = (node) => node.type === "object" || node.type === "array";
-  const control = ["control", "thinking", "cache", "choice", "output", "schema"].includes(context);
+  const control = ["control", "thinking", "cache", "choice", "output", "schema", "fields", "literal"].includes(context);
   if (control && (before.type !== after.type || !container(before) && before.value !== after.value)) throw controlMutation("value", context, typeof field === "string" && /^[a-z_]+$/.test(field) ? field : null);
   if (container(before) !== container(after) || (container(before) && before.type !== after.type)) throw new Error("invalid JSON topology");
   if (!container(before)) return;
@@ -702,10 +702,17 @@ function validateJsonShape(before, after, context = before.type === "object"
     else if (context === "messages") childContext = "message";
     else if (context === "tools") childContext = "tool";
     else if (context === "tool") childContext = { description: "data", cache_control: "cache", input_schema: "schema" }[entry.key] ?? "control";
-    // Schema prose is only documentation the API accepts back altered. Every other schema value (type, enum,
-    // required, default, pattern, property names) constrains the tool call and stays locked.
-    else if (context === "schema") childContext = before.type === "object" && ["description", "title"].includes(entry.key)
-      && entry.value.type === "string" ? "data" : "schema";
+    // Schema prose is only documentation the API accepts back altered. Every other schema value (type, required,
+    // pattern, property names) constrains the tool call and stays locked. Literal instances (enum, const, default,
+    // examples) are locked whole, prose-shaped keys included, and keyword maps hold property names, not prose.
+    else if (context === "schema") {
+      if (before.type === "object" && ["enum", "const", "default", "examples"].includes(entry.key)) childContext = "literal";
+      else if (before.type === "object" && ["properties", "patternProperties", "$defs", "definitions", "dependentSchemas"].includes(entry.key)
+        && entry.value.type === "object") childContext = "fields";
+      else childContext = before.type === "object" && ["description", "title"].includes(entry.key) && entry.value.type === "string" ? "data" : "schema";
+    }
+    else if (context === "fields") childContext = "schema";
+    else if (context === "literal") childContext = "literal";
     else if (context === "message" && entry.key === "content" || context === "block" && entry.key === "content") childContext = "content";
     else if (context === "content") childContext = "block";
     else if (context === "block" && entry.key === "cache_control") childContext = "cache";

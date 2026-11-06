@@ -2594,10 +2594,23 @@ test("OPF redacts tool schema prose that repeats a finding instead of failing cl
 });
 
 test("OPF tool schema constraints that repeat a finding stay locked with a named control", () => {
-  for (const [property, key] of [[{ enum: ["Alice"] }, "enum"], [{ default: "Alice" }, "default"], [{ pattern: "Alice" }, "pattern"]]) {
+  for (const [property, detail] of [[{ enum: ["Alice"] }, "literal:enum"], [{ default: "Alice" }, "literal:default"], [{ pattern: "Alice" }, "schema:pattern"]]) {
     const original = Buffer.from(JSON.stringify(managedRequest(schemaTool(property))));
     const scan = prepareOpfScan(original);
     assert.deepEqual(adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice")),
-      { status: "unknown", findings: [], reason: "protocol-control-mutation", detail: `control:value:schema:${key}` });
+      { status: "unknown", findings: [], reason: "protocol-control-mutation", detail: `control:value:${detail}` });
+  }
+});
+
+test("OPF tool schema literals and property maps stay locked even under prose-shaped keys", () => {
+  for (const [property, detail] of [
+    [{ enum: [{ description: "Alice" }] }, "literal:description"], [{ const: { title: "Alice" } }, "literal:title"],
+    [{ default: { description: "Alice" } }, "literal:description"], [{ examples: [{ title: "Alice" }] }, "literal:title"],
+    [{ type: "object", properties: { title: "Alice" } }, "schema:title"],
+  ]) {
+    const original = Buffer.from(JSON.stringify(managedRequest(schemaTool(property))));
+    const scan = prepareOpfScan(original);
+    assert.deepEqual(adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice")),
+      { status: "unknown", findings: [], reason: "protocol-control-mutation", detail: `control:value:${detail}` });
   }
 });
