@@ -17,9 +17,12 @@ const DISK_COUNTS = ["diskHits", "diskMisses", "diskWrites", "diskErrors"];
 const MAX_ATTACHED_WAITERS = 8;
 const RECENT_SCANS = 32;
 const MAX_WINDOW_COUNT = 65_536;
+const COOPERATIVE_TIMEOUTS = new Set(["model_timeout", "projected_timeout"]);
+// A projected refusal that computed a window is resumed in place; each pass caches at least one more window.
+const MAX_RESUMED_SCANS = 64;
 const MAX_TOTAL = 4_294_967_295;
 // A fixed key set keeps the diagnostics payload bounded; everything else lands in "other".
-const TOTAL_FAILURE_REASONS = ["admission_limit", "queue_timeout", "scan_timeout", "model_timeout", "model_error", "model_killed", "worker_unavailable"];
+const TOTAL_FAILURE_REASONS = ["admission_limit", "queue_timeout", "scan_timeout", "model_timeout", "projected_timeout", "model_error", "model_killed", "worker_unavailable"];
 const REQUEST_FAILURE = Symbol("privacy request failure");
 const GRAPH_REASONS = new Set(["invalid-protocol-graph", "protocol-id-limit", "protocol-control-mutation"]);
 // Structural name of the tripped control field, built by the adapter from fixed vocabularies.
@@ -31,7 +34,7 @@ const ADAPTER_UNKNOWN_REASONS = new Set([
   "invalid-protocol-graph", "protocol-id-collision", "conflicting-protocol-context", "protocol-id-limit", "adapter-error",
   "protocol-graph-mutation", "protocol-control-mutation", "signed-block-mutation",
   "invalid-source-provenance", "json-key-collision", "invalid-json-topology",
-  "model_timeout", "model_error", "model_killed",
+  "model_timeout", "projected_timeout", "model_error", "model_killed",
   "redaction-projection-limit", "redaction-match-limit", "redaction-body-limit", "redaction-frame-limit",
   "segment-coverage", "segment-cache-invalid",
 ]);
@@ -253,6 +256,9 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
     const startMs = activeEnd + queue.length * cold - now;
     return startMs > scanTimeoutMs ? Object.freeze({ ...unavailable("admission_limit"), retryAfterSeconds: retryAfter(startMs) }) : null;
   };
+  const resumable = (entry, session, reply) => !closed && !entry.settled && entry.waiters.size > 0 && queue.length === 0
+    && current === session && session.ready && session.cooperativeTimeout && !session.stopped
+    && reply?.type === "scan" && reply.status === "unknown" && reply.reason === "projected_timeout" && windowCounts(reply)?.misses > 0;
   const drain = async () => {
     if (closed || active || queue.length === 0) return;
     const entry = queue.shift();
@@ -283,15 +289,26 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
         const budgetMs = entry.admittedAt + scanTimeoutMs - Date.now();
         if (budgetMs <= 0) { result = retryLater("queue_timeout"); return; }
         reply = await request(session, { type: "scan", body: entry.body.toString("base64"), budgetMs }, budgetMs + 6_000);
+        cache = windowCounts(reply);
+        // A projected refusal hands back budget the caller already granted. While the caller still waits, nobody
+        // is queued behind it and the pass cached a window, scan the same body again on what is left instead of
+        // answering 503: an idle worker would spend that time warming this body anyway. Only a complete scan
+        // comes back ok, so a resumed body is never forwarded unscanned.
+        for (let resumed = 0; resumed < MAX_RESUMED_SCANS && resumable(entry, session, reply); resumed += 1) {
+          const remainingMs = entry.admittedAt + scanTimeoutMs - Date.now();
+          if (remainingMs <= 0) break;
+          reply = await request(session, { type: "scan", body: entry.body.toString("base64"), budgetMs: remainingMs }, remainingMs + 6_000);
+          cache = addWindowCounts(cache, windowCounts(reply));
+        }
       } else {
         reply = await request(session, { type: "scan", body: entry.body.toString("base64") }, scanTimeoutMs);
+        cache = windowCounts(reply);
       }
       result = normalizeScanReply(reply);
-      cache = windowCounts(reply);
       segments = segmentCounts(reply);
       detail = graphDetail(reply, result);
       // Only a worker that advertises cooperative timeouts keeps its model and window cache alive across model_timeout.
-      if (result.status === "unknown" && (["model_killed", "model_error"].includes(result.reason) || (result.reason === "model_timeout" && !session.cooperativeTimeout))) session.ready = false;
+      if (result.status === "unknown" && (["model_killed", "model_error"].includes(result.reason) || (COOPERATIVE_TIMEOUTS.has(result.reason) && !session.cooperativeTimeout))) session.ready = false;
     } catch {} finally {
       entry.settle(result);
       // Record what the caller actually received; close() or a stopped worker may have settled it first.
@@ -439,6 +456,16 @@ function windowCounts(reply) {
   return { hits: cache.hits, misses: cache.misses, ...disk };
 }
 
+// A resumed pass re-hits every window the earlier passes cached, so hits stay those the request found on arrival;
+// misses and the disk writes and errors add up to the windows this request computed.
+function addWindowCounts(total, next) {
+  if (total === null || next === null) return next ?? total;
+  const merge = (name) => ["hits", "diskHits"].includes(name) || next[name] === undefined
+    ? total[name]
+    : Math.min(MAX_WINDOW_COUNT, (total[name] ?? 0) + next[name]);
+  return Object.fromEntries(["hits", "misses", ...DISK_COUNTS].map((name) => [name, merge(name)]).filter(([, value]) => value !== undefined));
+}
+
 function segmentCounts(reply) {
   const count = (value) => Number.isSafeInteger(value) && value >= 0 && value <= MAX_WINDOW_COUNT;
   return isPlainObject(reply) && count(reply.segmentHits) && count(reply.segmentMisses) ? { hits: reply.segmentHits, misses: reply.segmentMisses } : null;
@@ -470,7 +497,7 @@ function normalizeScanReply(reply) {
   if (!isPlainObject(reply) || reply.type !== "scan" || typeof reply.status !== "string") return unavailable("reply_invalid");
   if (reply.status === "unknown") {
     const reason = ADAPTER_UNKNOWN_REASONS.has(reply.reason) ? reply.reason : "privacy_unavailable";
-    const retry = reason === "model_timeout" && Number.isInteger(reply.retryAfterSeconds) && reply.retryAfterSeconds >= 1 && reply.retryAfterSeconds <= 60;
+    const retry = COOPERATIVE_TIMEOUTS.has(reason) && Number.isInteger(reply.retryAfterSeconds) && reply.retryAfterSeconds >= 1 && reply.retryAfterSeconds <= 60;
     return Object.freeze({ status: "unknown", findings: Object.freeze([]), reason, ...(retry ? { retryAfterSeconds: reply.retryAfterSeconds } : {}) });
   }
   if (reply.status !== "ok" || !Array.isArray(reply.findings) || reply.findings.length > 128) return unavailable("reply_invalid");

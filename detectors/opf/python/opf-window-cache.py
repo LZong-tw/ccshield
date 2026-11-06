@@ -13,6 +13,8 @@ import torch
 class CooperativeScanTimeout(TimeoutError):
     # remaining_ms: projected compute for the unscanned windows, or None when unknown.
     remaining_ms = None
+    # projected: refused ahead of the deadline because the remaining windows would not fit, not because it passed.
+    projected = False
 
     """The current scan exhausted its budget without invalidating complete windows."""
 
@@ -375,6 +377,7 @@ class ExactWindowLogitsCache:
             if now >= self._deadline or (project and priced is not None and now + priced / 1000 > self._deadline):
                 timeout = CooperativeScanTimeout("scan budget exhausted")
                 timeout.remaining_ms = remaining
+                timeout.projected = now < self._deadline
                 raise timeout
         if not self._computing and self._interrupt is not None and self._interrupt():
             raise ScanInterrupted("scan interrupted")
