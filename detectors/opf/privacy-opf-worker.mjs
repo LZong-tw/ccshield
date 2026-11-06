@@ -11,14 +11,14 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const PROTOCOL = "airkit-privacy-ndjson-v1";
 const VERSION = "opf-1-client-exempt";
-// model_timeout leaves Python and its window cache alive, so callers may keep the session ready.
+// model_timeout and projected_timeout leave Python and its window cache alive, so callers may keep the session ready.
 const CAPABILITIES = ["cooperative-timeout"];
 const MAX_FRAME_BYTES = 4 * 1_048_576; // base64 redacted body (≤1 MiB → ~1.4 MiB) plus findings must fit
 const MAX_BODY_BYTES = 1_048_576;
 const MAX_SCANS = 4;
 const HELPERS = {
   "opf-cpu-grouped.py": "adb9dd7d6f47e482ccb0925e621a1375461b997833dfa5be6dfc67b9d58b6f0e",
-  "opf-window-cache.py": "7a13a6da135e96504ce61da003132c720d43ee7e1724b491d7cd4668ed1b1102",
+  "opf-window-cache.py": "76eab8dfd27f8d4036a5e789c5c57e0bf58f6a2e1f99bd4967458cc9cec0a46f",
   "opf-mmap-weights.py": "8be0f49097d7317937ebe7572b09619925b0c10044f0376d6438f31400485bbc",
   "opf-viterbi-deadline.py": "6fbfb16aae67c6eecacc292f8d41dda13cbe7d6792d8c2be97b8d629cc590117",
 };
@@ -219,7 +219,8 @@ while True:
             warming = None
     except cache_module.CooperativeScanTimeout as timeout:
         warming = (request["text"], 0.0) if WARM_SECONDS > 0 else None
-        reply = {"id": request["id"], "error": "model_timeout", "warming": warming is not None, "cache": window_counts(before, windows)}
+        reply = {"id": request["id"], "error": "model_timeout", "projected": timeout.projected is True,
+                 "warming": warming is not None, "cache": window_counts(before, windows)}
         if timeout.remaining_ms is not None:
             reply["remainingMs"] = timeout.remaining_ms
         print(json.dumps(reply), flush=True)
@@ -525,7 +526,9 @@ async function main() {
       const reply = current ? await query(current, scan.text, budgetMs) : null;
       // Window cache hits and misses per scan, so retry convergence is visible without any request content.
       const cache = windowCounts(reply?.cache);
-      if (reply?.error === "model_timeout") return { type: "scan", id: request.id, status: "unknown", reason: "model_timeout", ...retryAfter(reply), ...cache };
+      // A projected refusal stops ahead of the deadline with budget left; only a scan that ran out of time is a model_timeout.
+      if (reply?.error === "model_timeout") return { type: "scan", id: request.id, status: "unknown",
+        reason: reply.projected === true ? "projected_timeout" : "model_timeout", ...retryAfter(reply), ...cache };
       if (reply?.error || !reply?.prediction) return { type: "scan", id: request.id, status: "unknown",
         reason: reply?.error === "model_killed" ? "model_killed" : "model_error", ...cache };
       return { type: "scan", id: request.id, ...adaptOpfPrediction(original, scan, reply.prediction), ...cache };

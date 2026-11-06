@@ -95,6 +95,21 @@ read differently from what the name suggests:
 - Concurrent requests with an identical body share one scan, and every one of
   them receives the first requester's wait, not its own.
 
+A few reasons are worth reading precisely:
+
+- `privacy_scan/projected_timeout`: the OPF worker stopped ahead of the
+  deadline because the windows it still had to compute would not fit the
+  budget left. While the caller waits, nobody is queued and each pass caches a
+  window, the daemon resumes the same body on the remaining budget instead of
+  answering 503, so this is logged only when it had to yield or could not
+  progress. `model_timeout` now means the scan really reached its deadline.
+- `readiness/not_ready` and `readiness/readiness_failed`: the `/ready` probe
+  answered 503. Launchers and status lines poll it, so one line is written
+  per outage (and per change of cause), not per poll.
+- A client that disconnects mid-request is not a failure and is not logged;
+  `upstream/transport_unavailable` means the upstream connection itself
+  failed.
+
 Each failure is written synchronously on the request path (`stat`, `append`,
 `chmod`). Failures are rare enough that this is accepted; a write error is
 swallowed and the `503` still goes out.

@@ -12,6 +12,7 @@ const DIAGNOSTICS_PATHS = [`${CONTROL_PREFIX}diagnostics`, `${NEW_CONTROL_PREFIX
 const DIAGNOSTICS_PATH = DIAGNOSTICS_PATHS[0];
 const SHIELD_HEADER = /^x-(?:airkit-shield|ccshield)(?:-|$)/i;
 const FAILURE_REASONS = new Map([
+  ["readiness", new Set(["not_ready", "readiness_failed"])],
   ["body_read", new Set(["body_read_failed", "body_too_large"])],
   ["evaluation", new Set(["evaluation_unavailable"])],
   ["media_scan", new Set(["media_scan_failed"])],
@@ -25,7 +26,7 @@ const FAILURE_REASONS = new Map([
     "invalid-protocol-graph", "protocol-id-collision", "conflicting-protocol-context", "protocol-id-limit", "adapter-error",
     "protocol-graph-mutation", "protocol-control-mutation", "signed-block-mutation",
     "invalid-source-provenance", "json-key-collision", "invalid-json-topology",
-    "model_timeout", "model_error", "model_killed",
+    "model_timeout", "projected_timeout", "model_error", "model_killed",
     "redaction-projection-limit", "redaction-match-limit", "redaction-body-limit", "redaction-frame-limit",
     "segment-coverage", "segment-cache-invalid",
   ])],
@@ -87,8 +88,9 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
   const destinationLeases = new Map();
   const imageOverrides = new Set();
   const failures = [];
+  const readiness = { reason: null };
   const server = createServer((request, response) => {
-    void handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision: record, isReady, approvalChannels, imageOverrides, onImageOverrideChange, now, failures, onFailure, scanStats, scanTotals });
+    void handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision: record, isReady, approvalChannels, imageOverrides, onImageOverrideChange, now, failures, readiness, onFailure, scanStats, scanTotals });
   });
   await listenLoopback(server, port);
   const address = server.address();
@@ -102,7 +104,7 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
   };
 }
 
-async function handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision, isReady, approvalChannels, imageOverrides, onImageOverrideChange, now, failures, onFailure, scanStats, scanTotals }) {
+async function handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision, isReady, approvalChannels, imageOverrides, onImageOverrideChange, now, failures, readiness, onFailure, scanStats, scanTotals }) {
   const startedAt = Date.now();
   const fail = (stage, reason, bytes = 0, { cause, queuedMs } = {}) =>
     recordFailure(failures, onFailure, { stage, reason, bytes, elapsedMs: Date.now() - startedAt, cause, queuedMs, launchId: shieldHeader(request, "launch") });
@@ -171,12 +173,17 @@ async function handleShieldRequest({ request, response, capability, controlCapab
 
   if (request.method === "GET" && request.url === "/_airkit/shield/ready") {
     request.resume();
+    let reason = null;
     try {
-      if (isReady !== null && await isReady() !== true) {
-        await finish(response, { status: 503, code: "shield_unavailable" });
-        return;
-      }
+      if (isReady !== null && await isReady() !== true) reason = "not_ready";
     } catch {
+      reason = "readiness_failed";
+    }
+    // Launchers and status lines poll this endpoint, so one row per outage (or change of cause) is logged, not one per poll.
+    const changed = reason !== readiness.reason;
+    readiness.reason = reason;
+    if (reason !== null) {
+      if (changed) fail("readiness", reason);
       await finish(response, { status: 503, code: "shield_unavailable" });
       return;
     }
@@ -212,6 +219,8 @@ async function handleShieldRequest({ request, response, capability, controlCapab
         writeUpstreamHeaders(response, upstream);
         await streamResponse(upstream, response, lifecycle.signal);
       } catch {
+        // A client that hung up aborts the upstream fetch with it; that is not a transport failure.
+        if (lifecycle.signal.aborted) { if (!response.destroyed) response.destroy(); return; }
         fail("upstream", "transport_unavailable");
         if (!response.headersSent) {
           await finish(response, { status: 503, code: "shield_unavailable" });
@@ -363,6 +372,7 @@ async function handleShieldRequest({ request, response, capability, controlCapab
     writeUpstreamHeaders(response, upstream);
     await streamResponse(upstream, response, lifecycle.signal);
   } catch {
+    if (lifecycle.signal.aborted) { if (!response.destroyed) response.destroy(); return; }
     fail("upstream", "transport_unavailable", inspection.bytes);
     if (!response.headersSent) {
       await finish(response, { status: 503, code: "shield_unavailable" });
@@ -434,7 +444,7 @@ export function describeFailureCause(error) {
 
 export function createShieldFailure(stage, reason, message, { retryAfterSeconds, cause, queuedMs } = {}) {
   const defaults = {
-    body_read: "body_read_failed", evaluation: "evaluation_unavailable", secret_scan: "scanner_unavailable",
+    readiness: "readiness_failed", body_read: "body_read_failed", evaluation: "evaluation_unavailable", secret_scan: "scanner_unavailable",
     privacy_scan: "privacy_unavailable", image_scan: "image_scan_unavailable", policy: "policy_unavailable", redaction: "redaction_invalid",
     audit: "audit_unavailable", upstream: "transport_unavailable",
   };
@@ -451,9 +461,9 @@ export function createShieldFailure(stage, reason, message, { retryAfterSeconds,
   });
 }
 
-// Only a full queue, a cooperative model timeout (whose worker keeps warming the unscanned windows), or an
+// Only a full queue, a cooperative model or projected timeout (whose worker keeps warming the unscanned windows), or an
 // image scan still in progress is worth retrying later; the estimate comes from the scanner.
-const RETRYABLE_PRIVACY_REASONS = new Set(["admission_limit", "queue_timeout", "model_timeout"]);
+const RETRYABLE_PRIVACY_REASONS = new Set(["admission_limit", "queue_timeout", "model_timeout", "projected_timeout"]);
 function validRetryAfter({ stage, reason, retryAfterSeconds }) {
   const retryable =
     (stage === "privacy_scan" && RETRYABLE_PRIVACY_REASONS.has(reason)) || (stage === "image_scan" && reason === "image_pending");

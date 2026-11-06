@@ -138,7 +138,7 @@ test("recent scans keep only bounded window cache counts, status and allowlisted
   const totals = filter.scanTotals();
   assert.deepEqual({ ...totals, failuresByReason: { ...totals.failuresByReason } }, {
     scans: 12, ok: 8, unknown: 4, unavailable: 0, coalesced: 0, aborted: 0, diskHits: 0, diskMisses: 0, diskWrites: 0, diskErrors: 0,
-    failuresByReason: { admission_limit: 0, queue_timeout: 0, scan_timeout: 0, model_timeout: 1, model_error: 0, model_killed: 0, worker_unavailable: 0, other: 3 },
+    failuresByReason: { admission_limit: 0, queue_timeout: 0, scan_timeout: 0, model_timeout: 1, projected_timeout: 0, model_error: 0, model_killed: 0, worker_unavailable: 0, other: 3 },
   });
   assert.doesNotMatch(JSON.stringify(totals), new RegExp(sentinel));
   for (let index = 0; index < 40; index += 1) await filter.scan(Buffer.from('{}'));
@@ -174,7 +174,7 @@ test("scan totals count every caller outcome since start, including rejections t
   assert.deepEqual((await Promise.all(timed)).map((result) => result.reason), ["scan_timeout", "queue_timeout", "queue_timeout", "queue_timeout"]);
   assert.deepEqual(filter.scanTotals(), {
     scans: 11, ok: 5, unknown: 0, unavailable: 6, coalesced: 2, aborted: 1, diskHits: 0, diskMisses: 0, diskWrites: 0, diskErrors: 0,
-    failuresByReason: { admission_limit: 1, queue_timeout: 3, scan_timeout: 1, model_timeout: 0, model_error: 0, model_killed: 0, worker_unavailable: 0, other: 0 },
+    failuresByReason: { admission_limit: 1, queue_timeout: 3, scan_timeout: 1, model_timeout: 0, projected_timeout: 0, model_error: 0, model_killed: 0, worker_unavailable: 0, other: 0 },
   });
   const copy = filter.scanTotals();
   copy.failuresByReason.admission_limit = 99;
@@ -215,7 +215,7 @@ test("Privacy Filter labels retain their original categories across the worker b
 
 test("privacy unknown reasons preserve only the pinned worker and adapter's fixed codes", async (t) => {
   // Adapter codes come from the adapter itself; the rest are the worker's own fixed codes.
-  const allowed = [...new Set([...ADAPTER_REASONS.values(), "adapter-error", "model_timeout", "model_error", "model_killed",
+  const allowed = [...new Set([...ADAPTER_REASONS.values(), "adapter-error", "model_timeout", "projected_timeout", "model_error", "model_killed",
     "redaction-too-large", "redaction-frame-limit"])];
   for (const reason of [...allowed, sentinel, null, {}, 42, "scan_timeout", undefined]) {
     const worker = fakeWorker((message, emit) => {
@@ -229,7 +229,7 @@ test("privacy unknown reasons preserve only the pinned worker and adapter's fixe
     assert.equal(Number.isInteger(queuedMs) && queuedMs >= 0, true);
     assert.deepEqual(rest, { status: "unknown", findings: [], reason: allowed.includes(reason) ? reason : "privacy_unavailable" });
     assert.doesNotMatch(JSON.stringify(result), new RegExp(sentinel));
-    if (["model_killed", "model_error", "model_timeout"].includes(reason)) {
+    if (["model_killed", "model_error", "model_timeout", "projected_timeout"].includes(reason)) {
       assert.equal(await filter.isReady(), false);
       await flushTasks();
     }
@@ -239,7 +239,7 @@ test("privacy unknown reasons preserve only the pinned worker and adapter's fixe
 
 test("every reason the pinned OPF adapter and worker emit survives the privacy boundary", async (t) => {
   const adapterReasons = [...ADAPTER_REASONS.values()];
-  const workerReasons = ["adapter-error", "model_timeout", "model_error", "model_killed"];
+  const workerReasons = ["adapter-error", "model_timeout", "projected_timeout", "model_error", "model_killed"];
   let reason;
   const worker = fakeWorker((message, emit) => {
     if (message.type === "health") emit(cooperativeHealth(message));
@@ -395,9 +395,9 @@ test("OPF filter accepts a pinned twenty-five-second scan budget", async (t) => 
   assert.equal((await filter.scan(Buffer.from('{"content":"synthetic"}'))).status, "ok");
 });
 
-async function opfFilter(t, handler, budget = "60000") {
+async function opfFilter(t, handler, budget = "60000", { cooperative = false } = {}) {
   const worker = fakeWorker((message, emit) => {
-    if (message.type === "health") emit(health(message));
+    if (message.type === "health") emit(cooperative ? cooperativeHealth(message) : health(message));
     else handler?.(message, emit);
   });
   const extended = { privacy: { ...opfProvision.privacy,
@@ -455,9 +455,11 @@ test("time an OPF scan spends queued comes out of the budget its worker frame ca
   assert.equal((await second).status, "ok");
 });
 
-test("only a model_timeout keeps the worker's bounded Retry-After", async (t) => {
+test("only a model or projected timeout keeps the worker's bounded Retry-After", async (t) => {
   const replies = [
     [{ reason: "model_timeout", retryAfterSeconds: 7 }, 7],
+    [{ reason: "projected_timeout", retryAfterSeconds: 9 }, 9],
+    [{ reason: "projected_timeout", retryAfterSeconds: 61 }, undefined],
     [{ reason: "model_timeout", retryAfterSeconds: 61 }, undefined],
     [{ reason: "model_timeout", retryAfterSeconds: 0 }, undefined],
     [{ reason: "model_timeout", retryAfterSeconds: 2.5 }, undefined],
@@ -470,6 +472,82 @@ test("only a model_timeout keeps the worker's bounded Retry-After", async (t) =>
     assert.equal(result.status, "unknown");
     assert.equal(result.retryAfterSeconds, expected);
   }
+});
+
+// 2026-11-05/06: nine of ten logged 503s were projected refusals that still had budget left, so the client
+// waited out Retry-After while the worker warmed the same body. The daemon now keeps scanning in place.
+const projected = (message, misses = 1) => ({ type: "scan", id: message.id, status: "unknown", reason: "projected_timeout",
+  retryAfterSeconds: 30, cache: { hits: 2, misses, windows: 8 } });
+
+test("a projected timeout that cached a window resumes on the remaining budget instead of answering 503", async (t) => {
+  let passes = 0;
+  const { worker, filter } = await opfFilter(t, (message, emit) => {
+    passes += 1;
+    emit(passes < 3 ? projected(message) : { type: "scan", id: message.id, status: "ok", findings: [], cache: { hits: 6, misses: 2 } });
+  }, "60000", { cooperative: true });
+  const body = Buffer.from('{"content":"cold"}');
+  const result = await filter.scan(body);
+  assert.equal(result.status, "ok");
+  const scans = worker.messages.filter((message) => message.type === "scan");
+  assert.equal(scans.length, 3);
+  for (const scan of scans) assert.equal(Buffer.from(scan.body, "base64").equals(body), true);
+  // Every pass spends what is left of the one admission budget, never a fresh one.
+  for (const [index, scan] of scans.entries()) {
+    assert.equal(scan.budgetMs <= 60_000 && scan.budgetMs > 0, true);
+    if (index > 0) assert.equal(scan.budgetMs <= scans[index - 1].budgetMs, true);
+  }
+  const [recent] = filter.recentScans();
+  // Hits are what the body found cached on arrival; misses are every window this request computed.
+  assert.deepEqual([recent.status, recent.hits, recent.misses], ["ok", 2, 4]);
+});
+
+test("a projected timeout is answered at once when it computed nothing, ran out of time, or the worker is not cooperative", async (t) => {
+  for (const [label, reply, cooperative] of [
+    ["no window computed", (message) => projected(message, 0), true],
+    ["hard deadline", (message) => ({ ...projected(message), reason: "model_timeout" }), true],
+    ["no cooperative capability", (message) => projected(message), false],
+  ]) {
+    const { worker, filter } = await opfFilter(t, (message, emit) => emit(reply(message)), "60000", { cooperative });
+    const result = await filter.scan(Buffer.from('{"content":"cold"}'));
+    assert.equal(result.status, "unknown", label);
+    assert.equal(result.retryAfterSeconds, 30, label);
+    assert.equal(worker.messages.filter((message) => message.type === "scan").length, 1, label);
+  }
+});
+
+test("a projected timeout yields the worker to a queued scan instead of resuming", async (t) => {
+  const { worker, filter } = await opfFilter(t, undefined, "60000", { cooperative: true });
+  const sent = () => worker.messages.filter((message) => message.type === "scan");
+  const first = filter.scan(Buffer.from('{"content":"first"}'));
+  await flushTasks();
+  const second = filter.scan(Buffer.from('{"content":"second"}'));
+  await flushTasks();
+  assert.equal(sent().length, 1);
+  emit(worker, projected(sent()[0]));
+  assert.equal((await first).reason, "projected_timeout");
+  for (let spins = 0; spins < 50 && sent().length < 2; spins += 1) await flushTasks();
+  assert.equal(Buffer.from(sent()[1].body, "base64").toString(), '{"content":"second"}');
+  emit(worker, { type: "scan", id: sent()[1].id, status: "ok", findings: [] });
+  assert.equal((await second).status, "ok");
+});
+
+test("a caller that leaves stops the resumed scan, and resumption is bounded even when every pass progresses", async (t) => {
+  const controller = new AbortController();
+  let passes = 0;
+  const { filter } = await opfFilter(t, (message, emit) => {
+    passes += 1;
+    if (passes === 2) controller.abort();
+    emit(projected(message));
+  }, "60000", { cooperative: true });
+  assert.equal((await filter.scan(Buffer.from('{"content":"left"}'), { signal: controller.signal })).reason, "aborted");
+  assert.equal(passes, 2);
+
+  let bounded = 0;
+  const { filter: endless } = await opfFilter(t, (message, emit) => { bounded += 1; emit(projected(message)); }, "60000", { cooperative: true });
+  const result = await endless.scan(Buffer.from('{"content":"endless"}'));
+  assert.equal(result.reason, "projected_timeout");
+  assert.equal(result.status, "unknown");
+  assert.equal(bounded, 65);
 });
 
 test("OPF admission refuses at once, with Retry-After, a scan that cold scans ahead of it would push past its budget", async (t) => {

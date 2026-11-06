@@ -1470,6 +1470,24 @@ class CacheTests(unittest.TestCase):
         self.assertEqual((clock.value, model.calls), (10.0, 1))
         self.assertEqual(raised.exception.remaining_ms, 50_000)
 
+    # The worker reports projected_timeout only for a refusal made with budget left; a scan that ran past its
+    # deadline stays a model_timeout, so the failure log can tell the two apart.
+    def test_only_a_refusal_ahead_of_the_deadline_is_projected(self):
+        clock, model, cache = self.make_cache()
+        model.cost = 10.0
+        cache.begin_scan(100.0, total_windows=1)
+        cache.forward(Tensor(99))
+        cache.end_scan()
+        cache.begin_scan(5.0, total_windows=5)
+        with self.assertRaises(helper.CooperativeScanTimeout) as projected: cache.forward(Tensor(1))
+        cache.end_scan()
+        self.assertIs(projected.exception.projected, True)
+        cache.begin_scan(5.0)
+        with self.assertRaises(helper.CooperativeScanTimeout) as expired: cache.forward(Tensor(2))
+        cache.end_scan()
+        self.assertIs(expired.exception.projected, False)
+        self.assertIs(helper.CooperativeScanTimeout("before start").projected, False)
+
     def test_a_cached_window_after_a_cold_one_is_not_priced(self):
         clock, model, cache = self.make_cache()
         model.cost = 10.0
@@ -1833,7 +1851,7 @@ class OPF:
         assert type(cache).__name__ == "ExactWindowLogitsCache"
         assert f"cpu:threads{expected_threads()}:" in cache._namespace and "ctx4096" in cache._namespace
         assert "adb9dd7d6f47e482ccb0925e621a1375461b997833dfa5be6dfc67b9d58b6f0e" in cache._namespace
-        assert "7a13a6da135e96504ce61da003132c720d43ee7e1724b491d7cd4668ed1b1102" in cache._namespace
+        assert "76eab8dfd27f8d4036a5e789c5c57e0bf58f6a2e1f99bd4967458cc9cec0a46f" in cache._namespace
         self.calls += 1
         scan_number[0] = self.calls
         if self.calls == 1:
@@ -2138,7 +2156,7 @@ syncBuiltinESMExports();
         env: { ...process.env, CCSHIELD_TEST_COOPERATIVE_MODE: "windows", CCSHIELD_TEST_COOPERATIVE_MARKER: marker,
           CCSHIELD_OPF_WARM_SECONDS: "0", CCSHIELD_TEST_TOKENS: "8192" } });
       // Two windows of 0.75 budget each: after the first miss the second cannot fit, so it never runs.
-      assert.deepEqual(parseReplies(result), [{ type: "scan", id: "projected", status: "unknown", reason: "model_timeout",
+      assert.deepEqual(parseReplies(result), [{ type: "scan", id: "projected", status: "unknown", reason: "projected_timeout",
         retryAfterSeconds: Math.min(60, Math.ceil(0.75 * scan / 1000)), cache: { hits: 0, misses: 1, windows: 2 } }]);
     });
     for (const scan of [30_000, 240_000]) await t.test(`a ${scan}ms retry of a projected timeout resumes from the cached window`, () => {
@@ -2149,7 +2167,7 @@ syncBuiltinESMExports();
         env: { ...process.env, CCSHIELD_TEST_COOPERATIVE_MODE: "windows", CCSHIELD_TEST_COOPERATIVE_MARKER: marker,
           CCSHIELD_OPF_WARM_SECONDS: "0", CCSHIELD_TEST_TOKENS: "8192" } });
       const [first, retry] = parseReplies(result);
-      assert.equal(first.reason, "model_timeout");
+      assert.equal(first.reason, "projected_timeout");
       // Both windows cold would need 1.5 budgets, but window 1 is cached, so only window 2's 0.75 is projected.
       assert.equal(retry.id, "retry");
       assert.equal(retry.status, "ok", `the retry must not be refused for windows it already has: ${JSON.stringify(retry)}`);
@@ -2164,7 +2182,7 @@ syncBuiltinESMExports();
         env: { ...process.env, CCSHIELD_TEST_COOPERATIVE_MODE: "windows", CCSHIELD_TEST_COOPERATIVE_MARKER: marker,
           CCSHIELD_OPF_WARM_SECONDS: "0", CCSHIELD_TEST_TOKENS: "8192", CCSHIELD_TEST_SCAN_WINDOWS: "2;1,2" } });
       const [tail, retry] = parseReplies(result);
-      assert.equal(tail.reason, "model_timeout");
+      assert.equal(tail.reason, "projected_timeout");
       // Window 2 is cached and window 1 is not. Pricing every unscanned window as cold would refuse the retry
       // after window 1 (0.75 + 0.75 budgets); the plan knows window 2 costs nothing.
       assert.equal(retry.status, "ok", `the retry must not be priced for windows it already has: ${JSON.stringify(retry)}`);

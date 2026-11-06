@@ -32,7 +32,7 @@ test("diagnostics size limit covers the worst-case payload", () => {
   // describeFailureCause caps the cause at 400 UTF-16 units; control characters are the costliest to JSON-escape.
   const failure = { ts: "2026-10-29T01:02:03.000Z", stage: "privacy_scan", reason, bytes: 1_048_576, elapsedMs: 3_600_000, launch: "a".repeat(12), cause: "\u0001".repeat(400) };
   const scan = { status: "unavailable", reason, detail: "duplicate", hits: 65_536, misses: 65_536, diskHits: 65_536, segmentHits: 65_536, segmentMisses: 65_536, attached: 8, elapsedMs: 3_600_000, queuedMs: 3_600_000 };
-  const failuresByReason = Object.fromEntries(["admission_limit", "queue_timeout", "scan_timeout", "model_timeout", "model_error", "model_killed", "worker_unavailable", "other"].map((key) => [key, max]));
+  const failuresByReason = Object.fromEntries(["admission_limit", "queue_timeout", "scan_timeout", "model_timeout", "projected_timeout", "model_error", "model_killed", "worker_unavailable", "other"].map((key) => [key, max]));
   const totals = { scans: max, ok: max, unknown: max, unavailable: max, coalesced: max, aborted: max,
     diskHits: max, diskMisses: max, diskWrites: max, diskErrors: max, failuresByReason };
   const bytes = Buffer.byteLength(JSON.stringify({ failures: Array(16).fill(failure), scans: Array(32).fill(scan), totals }));
@@ -111,7 +111,7 @@ test("diagnostics include cumulative scan totals only when a totals source is co
 
 // Every fixed code the OPF adapter and worker can return; derived from the adapter so a new adapter reason
 // that the proxy's failure allowlist misses fails here instead of degrading to privacy_unavailable.
-const PRIVACY_REASONS = [...new Set([...ADAPTER_REASONS.values(), "adapter-error", "model_timeout", "model_error", "model_killed",
+const PRIVACY_REASONS = [...new Set([...ADAPTER_REASONS.values(), "adapter-error", "model_timeout", "projected_timeout", "model_error", "model_killed",
   "redaction-too-large", "redaction-frame-limit", "segment-coverage", "segment-cache-invalid"])];
 
 test("diagnostics separate real daemon scan, policy and redaction failures while readiness remains healthy", async (t) => {
@@ -169,7 +169,7 @@ test("diagnostics separate real daemon scan, policy and redaction failures while
     assert.equal(latest.stage, stage, mode); assert.equal(latest.reason, reason, mode);
     assert.equal(latest.bytes, 25);
     const ready = () => fetch(`${daemon.shield.origin}/_airkit/shield/ready`, { headers: { "x-airkit-shield": CAPABILITY } });
-    if (["model_killed", "model_error", "model_timeout"].includes(mode)) assert.equal((await ready()).status, 503);
+    if (["model_killed", "model_error", "model_timeout", "projected_timeout"].includes(mode)) assert.equal((await ready()).status, 503);
     assert.equal((await ready()).status, 204);
   }
   assert.equal(upstreamCalls, 0);
@@ -246,6 +246,8 @@ test("admission, queue and cooperative model timeouts reach the client as a Retr
     ["admission_limit", 12, "12", true],
     ["model_timeout", 7, "7", false],
     ["model_timeout", 61, null, false],
+    ["projected_timeout", 9, "9", false],
+    ["projected_timeout", 61, null, false],
     ["model_killed", 7, null, false],
     ["scan_timeout", 7, null, false],
     ["worker_unavailable", 7, null, false],
@@ -612,6 +614,29 @@ test("readiness probe fails closed when durable audit storage is unavailable", a
   assert.deepEqual(await ready.json(), { error: { code: "shield_unavailable" } });
 });
 
+test("a 503 from the readiness probe is logged once per outage and once per change of cause", async (t) => {
+  const states = [false, false, "throw", "throw", true, false];
+  let next = 0;
+  const logged = [];
+  const shield = await startShield(t, {
+    targetOrigin: "http://127.0.0.1:1",
+    decide: async () => ({ action: "deny" }),
+    isReady: async () => { const state = states[next++]; if (state === "throw") throw new Error("private-secret"); return state; },
+    onFailure: (entry) => logged.push(entry),
+  });
+  const statuses = [];
+  for (let probe = 0; probe < states.length; probe += 1) {
+    const response = await fetch(`${shield.origin}/_airkit/shield/ready`, { headers: { "x-airkit-shield": CAPABILITY } });
+    await response.arrayBuffer();
+    statuses.push(response.status);
+  }
+  assert.deepEqual(statuses, [503, 503, 503, 503, 204, 503]);
+  assert.deepEqual(logged.map(({ stage, reason }) => `${stage}/${reason}`), ["readiness/not_ready", "readiness/readiness_failed", "readiness/not_ready"]);
+  const { failures } = await readDiagnostics(shield);
+  assert.deepEqual(failures.map(({ reason }) => reason), ["not_ready", "readiness_failed", "not_ready"]);
+  assert.doesNotMatch(JSON.stringify(failures), /private-secret/);
+});
+
 test("proxy has a loopback listener and refuses malformed fixed targets", async (t) => {
   const upstream = await startFixture(t, async (_request, response) => response.end());
   const shield = await startShield(t, { targetOrigin: upstream.origin, decide: async () => ({ action: "deny" }) });
@@ -822,7 +847,8 @@ test("proxy aborts an upstream request when the downstream client disconnects", 
     notifyStarted();
     await once(response, "close");
   });
-  const shield = await startShield(t, { targetOrigin: upstream.origin, decide: async () => ({ action: "allow" }) });
+  const logged = [];
+  const shield = await startShield(t, { targetOrigin: upstream.origin, decide: async () => ({ action: "allow" }), onFailure: (entry) => logged.push(entry) });
   const target = new URL(shield.origin);
   const client = httpRequest({
     host: target.hostname,
@@ -844,6 +870,10 @@ test("proxy aborts an upstream request when the downstream client disconnects", 
   ]);
   if (!upstreamAborted) upstreamResponse.destroy();
   assert.equal(upstreamAborted, true, "upstream request was not aborted after downstream disconnect");
+  // The client hung up; the upstream transport was fine, so nothing is logged as transport_unavailable.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(logged, []);
+  assert.deepEqual((await readDiagnostics(shield)).failures, []);
 });
 
 test("proxy does not forward after a downstream disconnect during decision", async (t) => {
