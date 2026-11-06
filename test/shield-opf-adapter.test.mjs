@@ -1456,6 +1456,20 @@ class CacheTests(unittest.TestCase):
             self.assertGreaterEqual(spent, 10.0, attempts)
             self.assertGreaterEqual(computed, 1, attempts)
 
+    # A first cold window that cannot fit is still refused before its forward: the hard deadline would
+    # discard it half-done, which is no progress either.
+    def test_a_first_cold_window_that_cannot_fit_is_refused_before_its_forward(self):
+        clock, model, cache = self.make_cache()
+        model.cost = 10.0
+        cache.begin_scan(100.0, total_windows=1)
+        cache.forward(Tensor(99))
+        cache.end_scan()
+        cache.begin_scan(5.0, total_windows=5)
+        with self.assertRaises(helper.CooperativeScanTimeout) as raised: cache.forward(Tensor(1))
+        cache.end_scan()
+        self.assertEqual((clock.value, model.calls), (10.0, 1))
+        self.assertEqual(raised.exception.remaining_ms, 50_000)
+
     def test_a_cached_window_after_a_cold_one_is_not_priced(self):
         clock, model, cache = self.make_cache()
         model.cost = 10.0
@@ -1819,7 +1833,7 @@ class OPF:
         assert type(cache).__name__ == "ExactWindowLogitsCache"
         assert f"cpu:threads{expected_threads()}:" in cache._namespace and "ctx4096" in cache._namespace
         assert "adb9dd7d6f47e482ccb0925e621a1375461b997833dfa5be6dfc67b9d58b6f0e" in cache._namespace
-        assert "68cd09acd2f5ac5f575190389bbce0b99fd761718d27c7e5ebaa634e8caba25a" in cache._namespace
+        assert "7a13a6da135e96504ce61da003132c720d43ee7e1724b491d7cd4668ed1b1102" in cache._namespace
         self.calls += 1
         scan_number[0] = self.calls
         if self.calls == 1:

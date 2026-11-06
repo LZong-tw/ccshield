@@ -360,12 +360,19 @@ class ExactWindowLogitsCache:
         self._check(project=False)
 
     # The projection runs only before a cold forward and right after one, so cache hits pass unprojected.
+    # Before a scan's first cold window it asks only whether that one window fits: refusing on the whole
+    # remainder would leave a retry exactly where the last attempt stopped, so a body whose projection
+    # never fits would time out on every retry without caching anything. A window that cannot fit is still
+    # refused, since the hard deadline would discard it half-done. The reply reports the whole remainder.
     # The interrupt is honoured only between windows: dropping a half-computed window would let a stream of
     # requests keep warming from ever storing one.
     def _check(self, project):
         if self._deadline is not None:
             now, remaining = self._clock(), self._remaining_ms()
-            if now >= self._deadline or (project and remaining is not None and now + remaining / 1000 > self._deadline):
+            priced = remaining
+            if remaining is not None and not self._computed:
+                priced = min(remaining, int(self._miss_median * 1000))
+            if now >= self._deadline or (project and priced is not None and now + priced / 1000 > self._deadline):
                 timeout = CooperativeScanTimeout("scan budget exhausted")
                 timeout.remaining_ms = remaining
                 raise timeout
@@ -411,10 +418,7 @@ class ExactWindowLogitsCache:
             disk_key = self._disk.key(self._namespace, tokens, attention_mask)
             stored = self._disk_call(self._disk.get, disk_key, tokens.shape[-1])
         computed = stored is None
-        # Every scan computes at least one cold window before the projection may refuse it. Refusing the
-        # first one too would leave a retry exactly where the last attempt stopped, so a body whose
-        # projection never fits would time out on every retry without caching anything.
-        if computed and self._computed:
+        if computed:
             self._check(project=True)
         # Counted after the projection: a window it refuses was never looked up for this scan's work.
         self._misses += 1
@@ -689,6 +693,20 @@ def self_test():
                 cache.end_scan()
             self.assertEqual(now[0], 20.0)
             self.assertEqual(raised.exception.remaining_ms, 40_000)
+
+        def test_a_first_cold_window_that_cannot_fit_is_refused_before_its_forward(self):
+            cache, now = self.projected(10.0)
+            with torch.inference_mode():
+                cache.begin_scan(100, total_windows=1)
+                cache.forward(torch.tensor([[99]], dtype=torch.int32))
+                cache.end_scan()
+                cache.begin_scan(5, total_windows=5)
+                with self.assertRaises(CooperativeScanTimeout) as raised:
+                    cache.forward(torch.tensor([[1]], dtype=torch.int32))
+                cache.end_scan()
+            self.assertEqual(now[0], 10.0)
+            self.assertEqual(cache.model.calls, 1)
+            self.assertEqual(raised.exception.remaining_ms, 50_000)
 
         # The 2026-11-05 incident: a retry whose cached prefix ended at a cold window was refused before
         # that window, in under a second, every time, so the body never converged without warming.
