@@ -12,6 +12,7 @@ import { pathToFileURL } from "node:url";
 
 import { prepareOpfScan, adaptOpfPrediction, FragmentMatcher, UNKNOWN_REASONS } from "../detectors/opf/opf-adapter.mjs";
 import { buildOpfWorkerArgs } from "../src/shield/opf-args.mjs";
+import { isGraphFailureDetail } from "../src/shield/protocol.mjs";
 import { createPrivacyFilter, isVerifiedRedaction } from "../src/shield/privacy.mjs";
 
 const sourceOf = (name) => resolve(import.meta.dirname, name.endsWith(".py") ? "../detectors/opf/python" : "../detectors/opf", name);
@@ -2561,4 +2562,128 @@ syncBuiltinESMExports();
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
+});
+
+// A finding in user text is replayed over every value, including the tool schemas the scan never sees.
+// Schema prose (description, title) is accepted back altered; the rest of input_schema stays locked.
+function schemaTool(property) {
+  return { name: "lookup", description: "Find people like Alice", input_schema: { type: "object", title: "Lookup Alice",
+    properties: { query: { type: "string", description: "Name, e.g. Alice", ...property },
+      description: { type: "string", description: "Ask Alice" } }, required: ["query"] } };
+}
+
+function managedRequest(tool) {
+  return { model: "claude-fixture", max_tokens: 4096, system: [{ type: "text", text: "You are a fixture." }],
+    tools: [tool], messages: [{ role: "user", content: [{ type: "text", text: "Alice wrote" }] }] };
+}
+
+test("OPF redacts tool schema prose that repeats a finding instead of failing closed", () => {
+  const fixture = managedRequest(schemaTool({}));
+  const original = Buffer.from(JSON.stringify(fixture));
+  const scan = prepareOpfScan(original);
+  assert.equal(scan.text.includes("Ask"), false);
+  const body = verifiedResult(original, adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice")));
+  assert.equal(JSON.stringify(body).includes("Alice"), false);
+  assert.equal(body.messages[0].content[0].text, "[redacted:private_person] wrote");
+  const schema = body.tools[0].input_schema;
+  assert.equal(body.tools[0].description, "Find people like [redacted:private_person]");
+  assert.equal(schema.title, "Lookup [redacted:private_person]");
+  assert.equal(schema.properties.query.description, "Name, e.g. [redacted:private_person]");
+  assert.equal(schema.properties.description.description, "Ask [redacted:private_person]");
+  const prose = (key, value) => ["description", "title"].includes(key) && typeof value === "string" ? undefined : value;
+  assert.equal(JSON.stringify(body, prose).replace(/\[redacted:private_person\]/g, "Alice"), JSON.stringify(fixture, prose));
+});
+
+test("OPF tool schema constraints that repeat a finding stay locked with a named control", () => {
+  for (const [property, detail] of [[{ enum: ["Alice"] }, "literal:enum"], [{ default: "Alice" }, "literal:default"], [{ pattern: "Alice" }, "schema:pattern"]]) {
+    const original = Buffer.from(JSON.stringify(managedRequest(schemaTool(property))));
+    const scan = prepareOpfScan(original);
+    assert.deepEqual(adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice")),
+      { status: "unknown", findings: [], reason: "protocol-control-mutation", detail: `control:value:${detail}` });
+  }
+});
+
+test("OPF tool schema literals and property maps stay locked even under prose-shaped keys", () => {
+  for (const [property, detail] of [
+    [{ enum: [{ description: "Alice" }] }, "literal:description"], [{ const: { title: "Alice" } }, "literal:title"],
+    [{ default: { description: "Alice" } }, "literal:description"], [{ examples: [{ title: "Alice" }] }, "literal:title"],
+    [{ type: "object", properties: { title: "Alice" } }, "schema:title"],
+  ]) {
+    const original = Buffer.from(JSON.stringify(managedRequest(schemaTool(property))));
+    const scan = prepareOpfScan(original);
+    assert.deepEqual(adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice")),
+      { status: "unknown", findings: [], reason: "protocol-control-mutation", detail: `control:value:${detail}` });
+  }
+});
+
+test("OPF walks only known subschema keywords; prose-shaped keys anywhere else stay locked", () => {
+  const locked = [
+    [{ type: "object", oneOf: [{ $ref: "#/$defs/Pet" }], discriminator: { propertyName: "kind", mapping: { title: "#/$defs/Alice" } } }, "literal:title"],
+    [{ type: "string", example: { title: "Alice" } }, "literal:title"],
+    [{ type: "object", "x-meta": { description: "Alice" } }, "literal:description"],
+    [{ type: "object", dependencies: { title: "Alice" } }, "literal:title"],
+    [{ type: "object", description: { title: "Alice" } }, "literal:title"],
+    [JSON.parse('{"type":"object","d\\u0065fault":{"title":"Alice"}}'), "literal:title"],
+    [{ anyOf: [{ type: "object", properties: { a: { const: "Alice" } } }] }, "literal:const"],
+    [{ type: "object", additionalProperties: { enum: ["Alice"] } }, "literal:enum"],
+    [{ $defs: { X: { items: [{ pattern: "Alice" }] } } }, "schema:pattern"],
+    [{ type: "object", properties: { Alice: { type: "string" } } }, "fields:other"],
+    [{ type: "object", required: ["Alice"] }, "literal:required"],
+    [{ $ref: "#/$defs/Alice", $defs: { Alice: {} } }, "schema:-"],
+    [{ if: { const: "Alice" }, then: { type: "string" } }, "literal:const"],
+    [{ allOf: [[{ description: "Alice" }]] }, "literal:description"],
+  ];
+  for (const [schema, detail] of locked) {
+    const original = Buffer.from(JSON.stringify(managedRequest({ name: "lookup", input_schema: schema })));
+    const scan = prepareOpfScan(original);
+    const result = adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice"));
+    assert.equal(result.status, "unknown", detail);
+    assert.equal(result.reason, "protocol-control-mutation", detail);
+    assert.match(result.detail, new RegExp(`^control:(value|key):${detail.replace("$", "\\$")}$`), detail);
+  }
+});
+
+test("OPF redacts prose in every subschema position, including properties named after prose keywords", () => {
+  const schema = { type: "object", title: "Alice",
+    properties: { description: { type: "object", title: "Alice", properties: { title: { type: "string", description: "Alice" } } } },
+    anyOf: [{ description: "Alice" }], prefixItems: [{ title: "Alice" }], items: [{ description: "Alice" }],
+    additionalProperties: { description: "Alice" }, not: { title: "Alice" }, if: { title: "Alice" }, then: { description: "Alice" },
+    $defs: { Pet: { description: "Alice", items: { title: "Alice" } } }, dependentSchemas: { x: { title: "Alice" } } };
+  const fixture = managedRequest({ name: "lookup", input_schema: schema });
+  const original = Buffer.from(JSON.stringify(fixture));
+  const scan = prepareOpfScan(original);
+  const body = verifiedResult(original, adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice")));
+  assert.equal(JSON.stringify(body).includes("Alice"), false);
+  const prose = (key, value) => ["description", "title"].includes(key) && typeof value === "string" ? undefined : value;
+  assert.equal(JSON.stringify(body, prose), JSON.stringify(fixture, prose).replace(/Alice/g, "[redacted:private_person]"));
+});
+
+test("OPF locks tool schemas that only raw JSON can express: duplicate keys, escaped keywords, non-object roots", () => {
+  const raw = (schema) => Buffer.from(`{"model":"claude-fixture","max_tokens":4096,"tools":[{"name":"lookup","input_schema":${schema}}],`
+    + `"messages":[{"role":"user","content":[{"type":"text","text":"Alice wrote"}]}]}`);
+  const locked = [
+    '{"type":"object","description":"Alice","description":{"title":"Alice"}}',
+    '{"type":"object","enum":"x","enum":[{"title":"Alice"}]}',
+    '{"type":"object","\\u0065num":[{"title":"Alice"}]}',
+    '{"type":"string","x-enum-descriptions":{"title":"Alice"}}',
+    '{"type":"object","dependentRequired":{"title":["Alice"]}}',
+    '{"type":"object","properties":{"title":"Alice"}}',
+    '{"type":"object","Alice":"x"}',
+    '{"anyOf":["Alice"]}',
+    '"Alice"',
+    '[{"description":"Alice"}]',
+  ];
+  for (const schema of locked) {
+    const original = raw(schema);
+    const scan = prepareOpfScan(original);
+    const result = adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice"));
+    assert.equal(result.status, "unknown", schema);
+    assert.equal(result.reason, "protocol-control-mutation", schema);
+    assert.equal(isGraphFailureDetail(result.detail), true, schema);
+    assert.equal(result.detail.includes("alice"), false, schema);
+  }
+  const original = raw('{"type":"object","d\\u0065scription":"Alice"}');
+  const scan = prepareOpfScan(original);
+  const body = verifiedResult(original, adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice")));
+  assert.equal(body.tools[0].input_schema.description, "[redacted:private_person]");
 });

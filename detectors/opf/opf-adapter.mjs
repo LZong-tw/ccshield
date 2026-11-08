@@ -638,11 +638,12 @@ function validateAllValues(values, expected) {
 
 // Names which control field tripped, from fixed vocabularies only; anything else is reported as "other".
 export const CONTROL_RULES = ["value", "key", "type", "selector"];
-export const CONTROL_CONTEXTS = ["request", "messages", "message", "block", "tools", "tool", "content", "data", "control", "thinking", "cache", "choice", "output"];
+export const CONTROL_CONTEXTS = ["request", "messages", "message", "block", "tools", "tool", "content", "data", "control", "thinking", "cache", "choice", "output", "schema", "schemas", "fields", "literal"];
 export const CONTROL_KEYS = ["model", "messages", "system", "tools", "tool_choice", "max_tokens", "stream", "metadata", "temperature", "top_p", "top_k",
   "stop_sequences", "thinking", "output_config", "service_tier", "mcp_servers", "context_management", "container", "cache_control", "role", "content",
   "type", "text", "id", "tool_use_id", "name", "input", "is_error", "source", "signature", "data", "citations", "transformations", "file_id",
-  "defer_loading", "strict", "max_uses", "budget_tokens", "ttl", "disable_parallel_tool_use", "effort"];
+  "defer_loading", "strict", "max_uses", "budget_tokens", "ttl", "disable_parallel_tool_use", "effort", "input_schema", "description", "title",
+  "properties", "items", "enum", "required", "const", "default", "pattern", "format", "examples", "url", "media_type"];
 function controlMutation(rule, context, key) {
   const part = (value, allowed) => allowed.includes(value) ? value : "other";
   const defect = `control:${part(rule, CONTROL_RULES)}:${part(context, CONTROL_CONTEXTS)}:${key === null ? "-" : part(key, CONTROL_KEYS)}`;
@@ -653,7 +654,7 @@ function controlMutation(rule, context, key) {
 function validateJsonShape(before, after, context = before.type === "object"
   && before.children.some(({ key, value }) => key === "messages" && value.type === "array") ? "request" : "data", pinned, field = null) {
   const container = (node) => node.type === "object" || node.type === "array";
-  const control = ["control", "thinking", "cache", "choice", "output"].includes(context);
+  const control = ["control", "thinking", "cache", "choice", "output", "schema", "schemas", "fields", "literal"].includes(context);
   if (control && (before.type !== after.type || !container(before) && before.value !== after.value)) throw controlMutation("value", context, typeof field === "string" && /^[a-z_]+$/.test(field) ? field : null);
   if (container(before) !== container(after) || (container(before) && before.type !== after.type)) throw new Error("invalid JSON topology");
   if (!container(before)) return;
@@ -700,7 +701,14 @@ function validateJsonShape(before, after, context = before.type === "object"
       ?? (fixed.request.includes(entry.key) ? "control" : "data");
     else if (context === "messages") childContext = "message";
     else if (context === "tools") childContext = "tool";
-    else if (context === "tool") childContext = entry.key === "description" ? "data" : entry.key === "cache_control" ? "cache" : "control";
+    else if (context === "tool") childContext = { description: "data", cache_control: "cache", input_schema: "schema" }[entry.key] ?? "control";
+    // Schema prose is only documentation the API accepts back altered. Every other schema value (type, required,
+    // pattern, property names) constrains the tool call and stays locked. Only keywords known to hold subschemas
+    // are walked as schemas; anything else (enum, const, default, examples, discriminator, extensions) is a
+    // literal, locked whole even under prose-shaped keys, and keyword maps hold property names, not prose.
+    else if (context === "schema") childContext = schemaChildContext(before, entry);
+    else if (context === "schemas" || context === "fields") childContext = "schema";
+    else if (context === "literal") childContext = "literal";
     else if (context === "message" && entry.key === "content" || context === "block" && entry.key === "content") childContext = "content";
     else if (context === "content") childContext = "block";
     else if (context === "block" && entry.key === "cache_control") childContext = "cache";
@@ -717,6 +725,25 @@ function validateJsonShape(before, after, context = before.type === "object"
     else if (context === "block" && fixed.block.includes(entry.key) && !["type", "id", "tool_use_id", "name", "text", "input"].includes(entry.key)) childContext = "control";
     validateJsonShape(entry.value, candidate.value, childContext, pinned, before.type === "array" ? field : entry.key);
   }
+}
+
+const SCHEMA_PROSE = ["description", "title"];
+const SUBSCHEMA = ["items", "additionalItems", "additionalProperties", "unevaluatedItems", "unevaluatedProperties", "contains",
+  "propertyNames", "not", "if", "then", "else", "contentSchema"];
+const SUBSCHEMA_LISTS = ["anyOf", "oneOf", "allOf", "prefixItems", "items"];
+const SUBSCHEMA_MAPS = ["properties", "patternProperties", "$defs", "definitions", "dependentSchemas"];
+const SCHEMA_LITERALS = ["enum", "const", "default", "examples", "example"];
+
+// Default-deny: a schema object's value is walked as a schema only under a keyword known to hold one. Scalars stay
+// in schema context so a mutation names its keyword; any other container is a literal.
+function schemaChildContext(schema, { key, value }) {
+  if (schema.type !== "object") return value.type === "object" || value.type === "array" ? "literal" : "schema";
+  if (SCHEMA_PROSE.includes(key) && value.type === "string") return "data";
+  if (SCHEMA_LITERALS.includes(key)) return "literal";
+  if (value.type === "object" && SUBSCHEMA.includes(key)) return "schema";
+  if (value.type === "array" && SUBSCHEMA_LISTS.includes(key)) return "schemas";
+  if (value.type === "object" && SUBSCHEMA_MAPS.includes(key)) return "fields";
+  return value.type === "object" || value.type === "array" ? "literal" : "schema";
 }
 
 const GRAPH_DEFECTS = new Set(["orphan", "duplicate", "role", "id", "limit"]);

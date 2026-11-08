@@ -2,6 +2,7 @@ import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { readApprovalChannelRegistration, requestApprovalChannel } from "./approval-channel.mjs";
 import { classifyShieldRequest } from "./classify.mjs";
+import { isGraphFailureDetail } from "./protocol.mjs";
 
 const INSPECTION_MAX_BYTES = 1_048_576;
 // Phase 5 transition: /_ccshield/ and x-ccshield-* are the new names; the
@@ -112,8 +113,8 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
 
 async function handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, expiredLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision, isReady, approvalChannels, imageOverrides, onImageOverrideChange, now, failures, readiness, onFailure, scanStats, scanTotals }) {
   const startedAt = Date.now();
-  const fail = (stage, reason, bytes = 0, { cause, queuedMs } = {}) =>
-    recordFailure(failures, onFailure, { stage, reason, bytes, elapsedMs: Date.now() - startedAt, cause, queuedMs, launchId: shieldHeader(request, "launch") });
+  const fail = (stage, reason, bytes = 0, { cause, queuedMs, detail } = {}) =>
+    recordFailure(failures, onFailure, { stage, reason, bytes, elapsedMs: Date.now() - startedAt, cause, queuedMs, detail, launchId: shieldHeader(request, "launch") });
   request.url = canonicalControlPath(request.url);
   if (isDiagnosticsPath(request.url)) {
     request.resume();
@@ -326,7 +327,7 @@ async function handleShieldRequest({ request, response, capability, controlCapab
   } catch (error) {
     if (lifecycle.signal.aborted) return;
     const failure = error?.shieldFailure;
-    if (FAILURE_REASONS.get(failure?.stage)?.has(failure?.reason)) fail(failure.stage, failure.reason, inspection.bytes, { cause: failure.cause, queuedMs: failure.queuedMs });
+    if (FAILURE_REASONS.get(failure?.stage)?.has(failure?.reason)) fail(failure.stage, failure.reason, inspection.bytes, { cause: failure.cause, queuedMs: failure.queuedMs, detail: failure.detail });
     else fail("evaluation", "evaluation_unavailable", inspection.bytes);
     await finish(response, { status: 503, code: "shield_unavailable", retryAfterSeconds: validRetryAfter(failure ?? {}), message: failure?.stage === "image_scan" ? IMAGE_MESSAGES[failure.reason] : undefined });
     return;
@@ -437,7 +438,7 @@ function shieldHeader(request, kind) {
   return current ?? legacy;
 }
 
-function recordFailure(failures, onFailure, { stage, reason, bytes, elapsedMs, cause, queuedMs, launchId }) {
+function recordFailure(failures, onFailure, { stage, reason, bytes, elapsedMs, cause, queuedMs, detail, launchId }) {
   if (!FAILURE_REASONS.get(stage)?.has(reason)) return;
   const bounded = (value, max) => Number.isFinite(value) ? Math.min(max, Math.max(0, Math.floor(value))) : 0;
   // The launch id is a correlation handle, not something to keep in the clear; a short digest is enough to group retries.
@@ -445,7 +446,7 @@ function recordFailure(failures, onFailure, { stage, reason, bytes, elapsedMs, c
   // ts and launch appear in both the ring and the persisted log so the two records of one failure can be matched.
   const failure = {
     ts: new Date().toISOString(), stage, reason, bytes: bounded(bytes, INSPECTION_MAX_BYTES), elapsedMs: bounded(elapsedMs, 3_600_000),
-    ...(launch ? { launch } : {}),
+    ...(launch ? { launch } : {}), ...(isGraphFailureDetail(detail) ? { detail } : {}),
   };
   // The cause is error-message text and may echo request content, so it stays in the in-memory ring and never reaches onFailure.
   failures.push({ ...failure, ...(typeof cause === "string" && cause !== "" ? { cause } : {}) });
@@ -467,7 +468,7 @@ export function describeFailureCause(error) {
   return parts.join(" <- ").slice(0, 400);
 }
 
-export function createShieldFailure(stage, reason, message, { retryAfterSeconds, cause, queuedMs } = {}) {
+export function createShieldFailure(stage, reason, message, { retryAfterSeconds, cause, queuedMs, detail } = {}) {
   const defaults = {
     readiness: "readiness_failed", body_read: "body_read_failed", evaluation: "evaluation_unavailable", secret_scan: "scanner_unavailable",
     privacy_scan: "privacy_unavailable", image_scan: "image_scan_unavailable", policy: "policy_unavailable", redaction: "redaction_invalid",
@@ -482,6 +483,7 @@ export function createShieldFailure(stage, reason, message, { retryAfterSeconds,
       ...(retryAfter === undefined ? {} : { retryAfterSeconds: retryAfter }),
       ...(cause === undefined ? {} : { cause: describeFailureCause(cause) }),
       ...(Number.isFinite(queuedMs) ? { queuedMs } : {}),
+      ...(isGraphFailureDetail(detail) ? { detail } : {}),
     },
   });
 }

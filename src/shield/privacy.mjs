@@ -7,7 +7,7 @@ import { envNamesFor, readEnv } from "../compat-env.mjs";
 import { attestShieldCheckpoint } from "./checkpoint.mjs";
 import { isValidOpfWorkerArgs } from "./opf-args.mjs";
 import { laneWindowCachePath } from "./paths.mjs";
-import { PRIVACY_PROTOCOL as PROTOCOL } from "./protocol.mjs";
+import { isGraphFailureDetail, PRIVACY_PROTOCOL as PROTOCOL } from "./protocol.mjs";
 const MAX_BODY_BYTES = 1_048_576;
 const MAX_FRAME_BYTES = 4 * 1_048_576; // base64 redacted body (≤1 MiB → ~1.4 MiB) plus findings must fit
 const DEFAULT_TIMEOUT_MS = 2_000;
@@ -25,9 +25,6 @@ const MAX_TOTAL = 4_294_967_295;
 const TOTAL_FAILURE_REASONS = ["admission_limit", "queue_timeout", "scan_timeout", "model_timeout", "projected_timeout", "model_error", "model_killed", "worker_unavailable"];
 const REQUEST_FAILURE = Symbol("privacy request failure");
 const GRAPH_REASONS = new Set(["invalid-protocol-graph", "protocol-id-limit", "protocol-control-mutation"]);
-// Structural name of the tripped control field, built by the adapter from fixed vocabularies.
-const CONTROL_DETAIL = /^control:[a-z]+:[a-z]+:(?:[a-z_]+|-)$/;
-const GRAPH_DETAILS = new Set(["orphan", "duplicate", "role", "id", "limit"]);
 const ADAPTER_UNKNOWN_REASONS = new Set([
   "invalid-prediction", "prediction-span-limit", "inconsistent-counts", "invalid-span", "unmapped-span", "cross-field-span",
   "inconsistent-quoting", "unmapped-finding", "redaction-too-large", "value-survived",
@@ -307,6 +304,8 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
       result = normalizeScanReply(reply);
       segments = segmentCounts(reply);
       detail = graphDetail(reply, result);
+      // The caller's failure log needs the rule too, or a fail-closed refusal is indistinguishable from the next.
+      if (detail) result = Object.freeze({ ...result, detail });
       // Only a worker that advertises cooperative timeouts keeps its model and window cache alive across model_timeout.
       if (result.status === "unknown" && (["model_killed", "model_error"].includes(result.reason) || (COOPERATIVE_TIMEOUTS.has(result.reason) && !session.cooperativeTimeout))) session.ready = false;
     } catch {} finally {
@@ -474,7 +473,7 @@ function segmentCounts(reply) {
 // The adapter names which protocol-graph rule failed; only these values reach diagnostics.
 function graphDetail(reply, result) {
   const graphFailure = result.status === "unknown" && GRAPH_REASONS.has(result.reason);
-  return graphFailure && (GRAPH_DETAILS.has(reply?.detail) || CONTROL_DETAIL.test(reply?.detail ?? "")) ? reply.detail : null;
+  return graphFailure && isGraphFailureDetail(reply?.detail) ? reply.detail : null;
 }
 
 function ownCopy(result) {

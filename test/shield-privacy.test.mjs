@@ -54,7 +54,7 @@ test("persistent privacy worker health-checks then returns a validated redacted 
   assert.equal(worker.messages.filter((entry) => entry.type === "scan").length, 1);
 });
 
-test("recent scans keep an allowlisted protocol-graph detail and drop any other", async (t) => {
+test("recent scans and the delivered result keep an allowlisted protocol-graph detail and drop any other", async (t) => {
   const replies = [
     { status: "unknown", reason: "invalid-protocol-graph", detail: "orphan" },
     { status: "unknown", reason: "protocol-id-limit", detail: "limit" },
@@ -71,10 +71,13 @@ test("recent scans keep an allowlisted protocol-graph detail and drop any other"
   });
   const filter = await createPrivacyFilter({ provision, spawnWorker: () => worker, validateWorker });
   t.after(() => filter.close());
+  const delivered = [];
   for (let index = 0; index < replies.length; index += 1) {
     const result = await filter.scan(Buffer.from(`{"n":${index}}`));
-    assert.equal("detail" in result, false);
+    delivered.push(result.detail);
   }
+  // The caller's failure log receives exactly what the diagnostics ring kept.
+  assert.deepEqual(delivered, filter.recentScans().map((scan) => scan.detail));
   assert.deepEqual(filter.recentScans().map((scan) => [scan.reason, scan.detail]), [
     ["invalid-protocol-graph", "orphan"],
     ["protocol-id-limit", "limit"],
