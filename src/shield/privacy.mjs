@@ -580,11 +580,12 @@ export function isVerifiedRedaction({ original, result } = {}) {
   if (!Array.isArray(result.findings) || !Array.isArray(result.redactions)) return false;
   const requiredCounts = new Map();
   for (const finding of result.findings) requiredCounts.set(finding.label, (requiredCounts.get(finding.label) ?? 0) + finding.count);
-  const before = opaqueValues(Buffer.from(original));
-  const after = opaqueValues(result.redactedBody);
+  const before = protectedValues(Buffer.from(original));
+  const after = protectedValues(result.redactedBody);
   if (!before || !after || before.length !== after.length
     || before.some(([path, value], index) => after[index][0] !== path || after[index][1] !== value)) return false;
-  // Provider-signed values travel unscanned, so an original value may survive only inside one of them.
+  // Provider-signed values travel unscanned and control names must reach the API unchanged, so an original
+  // value may survive only inside one of them.
   const visible = withoutTokens(result.redactedBody, new Set(after.map(([, value]) => JSON.stringify(value))));
   const counts = new Map();
   for (const redaction of result.redactions) {
@@ -626,6 +627,29 @@ export function opaqueValues(body) {
     } else if (type === "text") each(block.citations, (citation, index) => {
       if (citation?.type === "web_search_result_location") add(`${path}.citations.${index}.encrypted_index`, citation.encrypted_index);
     });
+  }));
+  return entries;
+}
+
+function protectedValues(body) {
+  const opaque = opaqueValues(body);
+  const names = opaque && controlNames(body);
+  return names && [...opaque, ...names];
+}
+
+// Names the API resolves against each other (a tool definition, the tool_choice and tool_use blocks naming it)
+// plus the model. The OPF adapter pins these; a finding they happen to repeat stays, the name never changes.
+export function controlNames(body) {
+  let root;
+  try { root = JSON.parse(body.toString("utf8")); } catch { return null; }
+  const entries = [];
+  const add = (path, value) => { if (typeof value === "string") entries.push([path, value]); };
+  const each = (value, visit) => { if (Array.isArray(value)) value.forEach(visit); };
+  add("model", root?.model);
+  each(root?.tools, (tool, index) => add(`tools.${index}.name`, tool?.name));
+  add("tool_choice.name", root?.tool_choice?.name);
+  each(root?.messages, (message, messageIndex) => each(message?.content, (block, blockIndex) => {
+    if (["tool_use", "server_tool_use"].includes(block?.type)) add(`${messageIndex}.${blockIndex}.name`, block.name);
   }));
   return entries;
 }
