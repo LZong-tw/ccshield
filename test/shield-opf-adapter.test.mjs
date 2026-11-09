@@ -2734,3 +2734,20 @@ test("OPF control-name exemption does not loosen genuine control or residual che
   assert.equal(forged((copy) => { copy.model = "claude-other"; }), false);
   assert.equal(forged((copy) => { copy.messages[0].content[0].text = "Alice wrote"; }), false);
 });
+
+// Each protected name hides one literal: prose that merely repeats a tool name must still be checked, or a
+// body leaving the finding inside that prose would pass as a kept control.
+test("OPF verifier still sees a finding in prose that repeats a kept control name", () => {
+  for (const name of ["mcp__Alice__lookup", "Alice"]) {
+    const fixture = managedRequest({ name, input_schema: { type: "object" } });
+    fixture.messages[0].content.push({ type: "text", text: name });
+    const original = Buffer.from(JSON.stringify(fixture));
+    const scan = prepareOpfScan(original);
+    const result = adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice"));
+    const body = verifiedResult(original, result);
+    assert.equal(body.tools[0].name, name);
+    assert.equal(body.messages[0].content[1].text.includes("Alice"), false);
+    body.messages[0].content[1].text = name;
+    assert.equal(isVerifiedRedaction({ original, result: { ...result, redactedBody: Buffer.from(JSON.stringify(body)) } }), false);
+  }
+});
