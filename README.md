@@ -127,6 +127,21 @@ rotated or size-capped. The daemon itself writes only fixed strings there, but
 an uncaught exception lets Node print the error message and stack, which may
 quote request content and then stays on disk until removed by hand.
 
+A daemon that cannot boot writes one line and exits 1:
+`CCSHIELDD code=CCSHIELDD_BOOT_FAILED reason=<reason>`. The reason names the
+startup stage that failed, never the error message: `config_invalid`,
+`policy_invalid`, `assets_invalid`, `gitleaks_unavailable`,
+`opf_start_timeout` (the OPF worker did not answer health within its startup
+budget), `opf_spawn_failed`, `privacy_unavailable` (any other privacy detector
+refusal), `audit_unavailable`, `image_unavailable`, `port_in_use`,
+`proxy_unavailable`, `state_write_failed`, or `unknown`.
+
+`ccshield install --write` waits for the OPF job before it restarts the
+daemon when the bundle and venv are already on disk, because that job only
+re-runs the OPF self-test and a daemon booting beside it can miss its OPF
+startup budget. A first install, which still has to download OPF, hands the
+job to the background as before.
+
 ### Upgrading an installed lane
 
 The plist now carries `StandardOutPath` and `StandardErrorPath`, so a plist

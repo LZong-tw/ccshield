@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -209,6 +209,85 @@ test("background install records Gitleaks and hands OPF to the job", () => withH
   const unsupported = await fetchDetectorAssets({ paths, write: true, background: true, io: { ...io, detectPlatform: async () => ({ supported: false, key: null, reason: "macOS 13 is not supported" }) } });
   assert.equal(unsupported.opf.state, "unsupported");
   assert.deepEqual(calls, ["job"]);
+}));
+
+// The bundle and venv are already on disk, so the job only re-runs the self-test.
+function selfTestIo(overrides = {}) {
+  const calls = [];
+  const clock = { now: 0 };
+  const io = {
+    loadPins: async () => ({ code: { commit: "f".repeat(40) }, checkpoint: { revision: "e".repeat(40) }, gitleaks: { version: "8.30.1" } }),
+    detectPlatform: async () => ({ supported: true, key: "darwin-arm64" }),
+    installGitleaks: async () => ({ origin: "downloaded", version: "8.30.1", path: "/store/gitleaks", sha256: "a".repeat(64) }),
+    exists: async () => true,
+    readAssets: async () => null,
+    updateAssets: async ({ update }) => { await update(null); calls.push("record"); },
+    startOpfJob: async () => { calls.push("job"); return { started: true, state: "running", pid: 7001 }; },
+    isProcessAlive: async () => false,
+    liveOpfJob: async () => null,
+    readOpfJob: async () => ({ state: "verified", progress: 100 }),
+    now: () => clock.now,
+    sleep: async (ms) => { calls.push(`sleep ${ms}`); clock.now += ms; },
+    ...overrides,
+  };
+  return { io, calls, clock };
+}
+
+test("install waits for a self-test-only job before the daemon restarts", () => withHome(async (paths) => {
+  let alive = 3;
+  const { io, calls } = selfTestIo({ isProcessAlive: async (pid) => { assert.equal(pid, 7001); return alive-- > 0; } });
+  const result = await fetchDetectorAssets({ paths, write: true, background: true, io });
+  assert.deepEqual(calls, ["record", "job", "sleep 1000", "sleep 1000", "sleep 1000"]);
+  assert.equal(result.state, "verified");
+  assert.deepEqual(result.opf, { state: "verified", job: "started" });
+}));
+
+test("install also waits on a self-test some other install already started", () => withHome(async (paths) => {
+  let live = 2;
+  const { io, calls } = selfTestIo({
+    startOpfJob: async () => { calls.push("job"); return { started: false, state: "running", pid: LIVE_PID }; },
+    isProcessAlive: async () => false,
+    liveOpfJob: async () => (live-- > 0 ? { state: "running", pid: LIVE_PID } : null),
+    readOpfJob: async () => ({ state: "failed", reason: "privacy provision failed: self-test" }),
+  });
+  const result = await fetchDetectorAssets({ paths, write: true, background: true, io });
+  assert.deepEqual(calls, ["record", "job", "sleep 1000", "sleep 1000"]);
+  assert.equal(result.state, "degraded");
+  assert.deepEqual(result.opf, { state: "failed", job: "already running", reason: "privacy provision failed: self-test" });
+}));
+
+test("a first install without the bundle on disk still hands OPF to the background", () => withHome(async (paths) => {
+  const { io, calls } = selfTestIo({
+    exists: async () => false,
+    isProcessAlive: async () => assert.fail("a first download is not waited for"),
+  });
+  const result = await fetchDetectorAssets({ paths, write: true, background: true, io });
+  assert.deepEqual(calls, ["record", "job"]);
+  assert.deepEqual(result.opf, { state: "preparing", job: "started" });
+}));
+
+test("a self-test that outlives its budget stops install before any restart", () => withHome(async (paths) => {
+  const { io, clock } = selfTestIo({ isProcessAlive: async () => true });
+  await assert.rejects(fetchDetectorAssets({ paths, write: true, background: true, io }),
+    { message: "the OPF self-test is still running; rerun ccshield install --write after it finishes" });
+  assert.equal(clock.now, 360_000);
+}));
+
+test("the wait sees a real detached job exit", () => withHome(async (paths) => {
+  const { io } = selfTestIo({
+    startOpfJob: async () => {
+      const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 300)"], { detached: true, stdio: "ignore" });
+      child.unref();
+      return { started: true, state: "running", pid: child.pid };
+    },
+    isProcessAlive: undefined,
+    sleep: undefined,
+    now: undefined,
+  });
+  const started = Date.now();
+  const result = await fetchDetectorAssets({ paths, write: true, background: true, io });
+  assert.equal(result.opf.state, "verified");
+  assert.ok(Date.now() - started < 10_000, "an exited job must not keep install waiting");
 }));
 
 test("launch starts the job only for a regex-provisioned lane with no OPF record", () => withHome(async (paths) => {

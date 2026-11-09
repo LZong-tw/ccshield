@@ -1738,3 +1738,31 @@ test("the worker environment maps the old OPF warm-budget name and lets the new 
   assert.deepEqual(privacyWorkerEnv({ AIRKIT_SHIELD_OPF_WARM_SECONDS: "0", CCSHIELD_OPF_WARM_SECONDS: "30" }), { CCSHIELD_OPF_WARM_SECONDS: "30" });
   assert.deepEqual(privacyWorkerEnv({ PATH: "/bin" }), { PATH: "/bin" });
 });
+
+test("an OPF worker that never answers health is refused as a startup timeout", async () => {
+  const worker = fakeWorker(() => {});
+  await assert.rejects(createPrivacyFilter({ provision: opfProvision, spawnWorker: () => worker, validateWorker, validateFile,
+    validateCheckpoint: async () => async () => {}, startupTimeoutMs: 20 }), (error) => {
+    assert.equal(error.message, "shield privacy worker unavailable");
+    assert.equal(error.opf, true);
+    assert.equal(error.startFailure, "timeout");
+    return true;
+  });
+});
+
+test("an OPF worker that cannot be spawned is refused as a spawn failure", async () => {
+  await assert.rejects(createPrivacyFilter({ provision: opfProvision, validateWorker, validateFile,
+    validateCheckpoint: async () => async () => {}, spawnWorker: () => { throw new Error("spawn ENOENT /secret/path"); } }), (error) => {
+    assert.equal(error.opf, true);
+    assert.equal(error.startFailure, "spawn");
+    return true;
+  });
+});
+
+test("a regex worker that fails to start is not tagged as OPF", async () => {
+  await assert.rejects(createPrivacyFilter({ provision, validateWorker, spawnWorker: () => ({}) }), (error) => {
+    assert.equal(error.opf, false);
+    assert.equal(error.startFailure, "spawn");
+    return true;
+  });
+});

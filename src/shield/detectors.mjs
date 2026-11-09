@@ -8,12 +8,18 @@ import { buildOpfVenv } from "./opf-venv.mjs";
 import { doctorGitleaksWarnings, gitleaksOverride, installGitleaks, pinnedGitleaksSha256 } from "./gitleaks-install.mjs";
 import { detectPlatform } from "./platform.mjs";
 import { adoptAsset, storedGitleaksPath } from "./asset-adopt.mjs";
+import { defaultIsProcessAlive } from "./file-lock.mjs";
+import { OPF_SCAN_TIMEOUT_MS, OPF_STARTUP_TIMEOUT_MS } from "./opf-args.mjs";
 import { readShieldAssetsProvision, shieldAssetStore, updateShieldAssetsProvision } from "./paths.mjs";
 
 const UNSUPPORTED_NOTICE = "OPF is unsupported on this platform; Shield stays on regex + Gitleaks";
 const FALLBACK_NOTICE = "Shield is degraded: PII detection runs on the regex fallback until OPF is verified";
 // Downloads fill the first 90% of the progress bar; the venv build is the rest.
 const DOWNLOAD_SHARE = 90;
+// A self-test-only job is one checkpoint attestation, one worker start and one
+// probe scan; a minute on top covers the attestation and the record writes.
+const OPF_SELF_TEST_WAIT_MS = OPF_STARTUP_TIMEOUT_MS + Math.max(...OPF_SCAN_TIMEOUT_MS) + 60_000;
+const OPF_JOB_POLL_MS = 1_000;
 
 function defaults(io = {}) {
   return {
@@ -33,6 +39,9 @@ function defaults(io = {}) {
     liveOpfJob: io.liveOpfJob ?? liveOpfJob,
     readOpfJob: io.readOpfJob ?? readOpfJob,
     provisionOpfPrivacy: io.provisionOpfPrivacy ?? provisionOpfPrivacy,
+    isProcessAlive: io.isProcessAlive ?? defaultIsProcessAlive,
+    sleep: io.sleep ?? ((ms) => new Promise((settle) => setTimeout(settle, ms))),
+    now: io.now ?? Date.now,
   };
 }
 
@@ -40,7 +49,11 @@ function defaults(io = {}) {
 // is downloaded and its venv built only on a supported platform; elsewhere the
 // result names the regex + Gitleaks fallback and nothing is fetched. With
 // `background`, the OPF half is handed to the detached job and install returns
-// as soon as Gitleaks is recorded.
+// as soon as Gitleaks is recorded, unless the bundle and venv are already on
+// disk: then the job only re-runs the OPF self-test, and install waits for it.
+// Install restarts the daemon next, and a daemon booting beside that self-test
+// competes with it for the checkpoint and the CPU inside its fixed OPF startup
+// budget; with no signed regex fallback, losing that race exits the daemon.
 export async function fetchDetectorAssets({ paths, gitleaksPath, write = false, background = false, io } = {}) {
   const deps = defaults(io);
   const pins = await deps.loadPins();
@@ -61,7 +74,20 @@ export async function fetchDetectorAssets({ paths, gitleaksPath, write = false, 
   const gitleaksSummary = { origin: gitleaks.origin, version: gitleaks.version, sha256: gitleaks.sha256 };
   if (background && platform.supported) {
     const recorded = await recordDetectorInstall({ paths, gitleaks, deps });
+    const selfTestOnly = await opfOnDisk({ paths, pins, deps });
     const job = await deps.startOpfJob({ paths });
+    if (selfTestOnly) {
+      await waitForOpfJob({ paths, pid: job.pid, deps });
+      const outcome = await deps.readOpfJob({ paths });
+      const state = outcome?.state ?? "failed";
+      return Object.freeze({
+        state: state === "verified" ? "verified" : "degraded",
+        platform: platformSummary(platform),
+        gitleaks: gitleaksSummary,
+        opf: { state, job: job.started ? "started" : "already running", ...(outcome?.reason ? { reason: outcome.reason } : {}) },
+        recorded,
+      });
+    }
     return Object.freeze({
       state: "preparing",
       platform: platformSummary(platform),
@@ -80,6 +106,21 @@ export async function fetchDetectorAssets({ paths, gitleaksPath, write = false, 
       : { state: opf.state, ...(opf.reason ? { reason: opf.reason } : {}) },
     recorded,
   });
+}
+
+async function opfOnDisk({ paths, pins, deps }) {
+  const bundle = shieldAssetStore(paths).opfBundle(pins.code.commit, pins.checkpoint.revision);
+  return await deps.exists(bundle.dir) && await deps.exists(join(bundle.venv, "bin", "python"));
+}
+
+// The spawned pid covers the moment before the job takes its lock; the lock
+// covers a job some other install had already started.
+async function waitForOpfJob({ paths, pid, deps }) {
+  const deadline = deps.now() + OPF_SELF_TEST_WAIT_MS;
+  while ((Number.isInteger(pid) && await deps.isProcessAlive(pid)) || await deps.liveOpfJob({ paths })) {
+    if (deps.now() >= deadline) throw new Error("the OPF self-test is still running; rerun ccshield install --write after it finishes");
+    await deps.sleep(OPF_JOB_POLL_MS);
+  }
 }
 
 // The OPF fetch + venv build the background job runs. `onProgress` receives

@@ -8,7 +8,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { startShieldDaemon } from "../src/shieldd.mjs";
+import { BOOT_FAILURE_REASONS, bootFailureReason, startShieldDaemon } from "../src/shieldd.mjs";
 import { canonicalJson } from "../src/shield/policy-bundle.mjs";
 import { shieldPaths } from "../src/shield/paths.mjs";
 
@@ -89,10 +89,61 @@ test("daemon CLI exits on boot failure and prints only its fixed diagnostic even
 
   assert.deepEqual(result, { code: 1, signal: null }, "boot failure must terminate rather than retain background handles");
   assert.equal(stdout, "");
-  assert.equal(stderr, "CCSHIELDD code=CCSHIELDD_BOOT_FAILED\n");
+  assert.equal(stderr, "CCSHIELDD code=CCSHIELDD_BOOT_FAILED reason=audit_unavailable\n");
   const workerPid = Number(await readFile(fixture.workerPidPath, "utf8"));
   assert.equal(await waitForProcessExit(workerPid), true);
   await assert.rejects(readFile(fixture.paths.identityPath), { code: "ENOENT" });
+});
+
+test("daemon CLI names an unreadable configuration without quoting its path", async (t) => {
+  const homeDir = await realpath(await mkdtemp(join(tmpdir(), "ccshield-boot-")));
+  t.after(() => rm(homeDir, { recursive: true, force: true }));
+  const paths = shieldPaths({ homeDir, env: {} });
+  const child = spawn(process.execPath, [daemonPath, "--config", paths.configPath], {
+    env: { HOME: homeDir, PATH: "", CCSHIELD_ROOT_DIR: paths.rootDir },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  t.after(() => child.kill("SIGKILL"));
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  assert.deepEqual(await boundedExit(child, 5_000), { code: 1, signal: null });
+  assert.equal(stderr, "CCSHIELDD code=CCSHIELDD_BOOT_FAILED reason=config_invalid\n");
+});
+
+test("each boot stage reports its own fixed reason and rethrows the original error", async (t) => {
+  const fixture = await startupFixture(t);
+  const boot = (overrides) => startShieldDaemon({ config: fixture.config, paths: fixture.paths, ...overrides });
+  const fails = (failure) => async () => { throw failure; };
+  const cases = [
+    ["policy_invalid", { readPolicyBundle: fails(new Error("bundle")) }],
+    ["assets_invalid", { readAssetsProvision: async () => null }],
+    ["gitleaks_unavailable", { createScanner: fails(new Error("gitleaks")) }],
+    ["opf_start_timeout", { createPrivacy: fails(Object.assign(new Error("shield privacy worker unavailable"), { opf: true, startFailure: "timeout" })) }],
+    ["opf_spawn_failed", { createPrivacy: fails(Object.assign(new Error("shield privacy worker unavailable"), { opf: true, startFailure: "spawn" })) }],
+    ["privacy_unavailable", { createPrivacy: fails(Object.assign(new Error("shield privacy worker unavailable"), { opf: false, startFailure: "timeout" })) }],
+    ["audit_unavailable", { createDecisionRecorder: fails(new Error("audit")) }],
+    ["state_write_failed", { createDecisionRecorder: async () => ({ recordShieldDecision: async () => ({ durable: "ack" }) }), writePolicyState: fails(new Error("disk")) }],
+    ["port_in_use", { createDecisionRecorder: async () => ({ recordShieldDecision: async () => ({ durable: "ack" }) }), startProxy: fails(Object.assign(new Error("listen EADDRINUSE"), { code: "EADDRINUSE" })) }],
+    ["proxy_unavailable", { createDecisionRecorder: async () => ({ recordShieldDecision: async () => ({ durable: "ack" }) }), startProxy: fails(new Error("listen")) }],
+  ];
+  for (const [reason, overrides] of cases) {
+    let caught;
+    await assert.rejects(boot(overrides), (error) => { caught = error; return true; });
+    assert.equal(bootFailureReason(caught), reason, reason);
+    assert.ok(BOOT_FAILURE_REASONS.includes(reason));
+  }
+  const original = new Error("identity");
+  await assert.rejects(boot({ createDecisionRecorder: async () => ({ recordShieldDecision: async () => ({ durable: "ack" }) }),
+    startProxy: async () => ({ origin: "http://127.0.0.1:8811", close: async () => {} }), writeIdentity: fails(original) }), (error) => error === original);
+  assert.equal(bootFailureReason(original), "state_write_failed");
+});
+
+test("anything the daemon cannot place is unknown, never its message", () => {
+  assert.equal(bootFailureReason(undefined), "unknown");
+  assert.equal(bootFailureReason("a string that could quote a prompt"), "unknown");
+  assert.equal(bootFailureReason(new Error("untagged")), "unknown");
+  assert.equal(bootFailureReason(Object.freeze(new Error("frozen"))), "unknown");
+  for (const reason of BOOT_FAILURE_REASONS) assert.match(reason, /^[a-z_]+$/);
 });
 
 const imagePin = (version) => async () => ({ path: "/x/image-worker", sha256: "a".repeat(64), source: { path: "/x/w.swift", sha256: "b".repeat(64) }, version });

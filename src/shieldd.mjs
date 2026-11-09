@@ -24,11 +24,55 @@ import { createShieldDecisionRecorder } from "./shield/audit.mjs";
 import { getMasterKey } from "./keys.mjs";
 import { openShieldStore } from "./store.mjs";
 
+// daemon.err.log holds fixed strings only, so a boot failure is reported as
+// one of these codes and never as an error message, which can quote content.
+export const BOOT_FAILURE_REASONS = Object.freeze([
+  "config_invalid",
+  "policy_invalid",
+  "assets_invalid",
+  "gitleaks_unavailable",
+  "opf_start_timeout",
+  "opf_spawn_failed",
+  "privacy_unavailable",
+  "audit_unavailable",
+  "image_unavailable",
+  "port_in_use",
+  "proxy_unavailable",
+  "state_write_failed",
+  "unknown",
+]);
+const BOOT_STAGE = Symbol("ccshieldd boot stage");
+
+// The innermost stage wins: an error already tagged keeps its stage.
+function tagBootStage(error, stage) {
+  if (error && typeof error === "object" && !Object.hasOwn(error, BOOT_STAGE) && Object.isExtensible(error)) {
+    Object.defineProperty(error, BOOT_STAGE, { value: stage });
+  }
+  return error;
+}
+
+export function bootFailureReason(error) {
+  if (!error || typeof error !== "object") return "unknown";
+  if (error.code === "EADDRINUSE") return "port_in_use";
+  const stage = error[BOOT_STAGE];
+  if (stage === "privacy_unavailable" && error.opf === true) {
+    if (error.startFailure === "timeout") return "opf_start_timeout";
+    if (error.startFailure === "spawn") return "opf_spawn_failed";
+  }
+  return BOOT_FAILURE_REASONS.includes(stage) ? stage : "unknown";
+}
+
 async function main() {
-  const configPath = parseConfigPath(process.argv.slice(2));
-  const paths = shieldPathsForConfigPath({ env: process.env, configPath });
-  await assertPrivateConfig(configPath);
-  const config = await readShieldConfig({ paths });
+  let paths;
+  let config;
+  try {
+    const configPath = parseConfigPath(process.argv.slice(2));
+    paths = shieldPathsForConfigPath({ env: process.env, configPath });
+    await assertPrivateConfig(configPath);
+    config = await readShieldConfig({ paths });
+  } catch (error) {
+    throw tagBootStage(error, "config_invalid");
+  }
   const { shield } = await startShieldDaemon({ config, paths });
   const stop = async () => {
     await shield.close();
@@ -39,7 +83,16 @@ async function main() {
   await new Promise(() => {});
 }
 
-export async function startShieldDaemon({
+export async function startShieldDaemon(options) {
+  const boot = { stage: "config_invalid" };
+  try {
+    return await bootShieldDaemon(boot, options);
+  } catch (error) {
+    throw tagBootStage(error, boot.stage);
+  }
+}
+
+async function bootShieldDaemon(boot, {
   config,
   paths,
   pid = process.pid,
@@ -58,16 +111,19 @@ export async function startShieldDaemon({
 } = {}) {
   if (!config || !paths) throw new TypeError("shield daemon configuration and paths are required");
   const destinationClass = resolveDestinationClass(config);
+  boot.stage = "policy_invalid";
   const provision = await readPolicyBundle({ paths });
   const policy = await loadPolicy({ bundle: provision.bundle, publicKey: provision.publicKey });
   // Once an image worker is pinned, only a bundle that names that exact image
   // version may boot, so a 2-key bundle cannot silently drop image scanning.
+  boot.stage = "assets_invalid";
   const image = await readImageProvision({ paths });
   if (image && policy.detectorVersions.image !== image.version) throw new Error("shield image detector version does not match the provisioned worker");
   const assets = await readAssetsProvision({ paths });
   if (!assets) throw new Error("shield asset provision is missing");
   if (!config.gitleaks) throw new Error("shield gitleaks provision is missing");
   assertGitleaksAsset(config.gitleaks, assets.gitleaks);
+  boot.stage = "gitleaks_unavailable";
   const scanner = await createScanner(config.gitleaks);
   if (scanner?.version !== policy.detectorVersions.gitleaks) throw new Error("shield gitleaks version does not match policy metadata");
   let privacy;
@@ -94,6 +150,7 @@ export async function startShieldDaemon({
     }
   };
   try {
+    boot.stage = "privacy_unavailable";
     privacy = await openPrivacyDetector({
       paths,
       assets,
@@ -102,10 +159,12 @@ export async function startShieldDaemon({
       createPrivacy,
       onOpfFailure: () => process.stderr.write("ccshieldd: OPF is unusable; staying on the regex detector\n"),
     });
+    boot.stage = "audit_unavailable";
     recorder = await createDecisionRecorder({ config, paths, policy, assets });
     if (typeof recorder?.recordShieldDecision !== "function") throw new Error("shield audit recorder is unavailable");
     // Without a provisioned worker, images stay unscanned (Q1). With one, an
     // image request fails closed until the readiness check has passed.
+    boot.stage = "image_unavailable";
     if (image) {
       images = await createImageScanner({
         image,
@@ -233,7 +292,9 @@ export async function startShieldDaemon({
     };
 
     const failureLog = createFailureLog({ path: paths.failureLogPath });
+    boot.stage = "state_write_failed";
     await writePolicyState({ paths, state: { version: policy.version, detectorVersions: policy.detectorVersions } });
+    boot.stage = "proxy_unavailable";
     shield = await startProxy({
       capability: config.capability,
       controlCapability: config.controlCapability,
@@ -273,6 +334,7 @@ export async function startShieldDaemon({
         media: { documents: DOCUMENT_COVERAGE, images: imageOverrides > 0 ? "unscanned-override" : imageCoverage },
       },
     });
+    boot.stage = "state_write_failed";
     await publish();
   } catch (error) {
     await close().catch(() => {});
@@ -379,7 +441,7 @@ async function assertPrivateConfig(path) {
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  main().catch(() => {
-    process.stderr.write("CCSHIELDD code=CCSHIELDD_BOOT_FAILED\n", () => process.exit(1));
+  main().catch((error) => {
+    process.stderr.write(`CCSHIELDD code=CCSHIELDD_BOOT_FAILED reason=${bootFailureReason(error)}\n`, () => process.exit(1));
   });
 }

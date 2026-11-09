@@ -61,6 +61,9 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
   let assertSourceUnchanged;
   let current = null;
   let starting = null;
+  // Why the latest start attempt gave up ("timeout" or "spawn"), so a refused
+  // construction can say which without carrying any worker output.
+  let startFailure = null;
   let readiness = null;
   let active = null;
   const queue = [];
@@ -180,9 +183,13 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
         shell: false,
         stdio: ["pipe", "pipe", "pipe"],
       });
-    } catch { return false; }
+    } catch {
+      startFailure = "spawn";
+      return false;
+    }
     if (!worker?.stdin || !worker?.stdout || typeof worker.stdin.write !== "function" || typeof worker.stdout.on !== "function") {
       try { worker?.kill?.(); } catch {}
+      startFailure = "spawn";
       return false;
     }
     const session = { worker, pending: new Map(), stopped: false };
@@ -217,10 +224,12 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
     if (starting) return await starting;
     if (current?.ready) return true;
     const attempt = { session: current, expired: false };
+    startFailure = null;
     let timer;
     const deadline = new Promise((resolve) => {
       timer = setTimeout(() => {
         attempt.expired = true;
+        startFailure = "timeout";
         stopWorker(attempt.session);
         resolve(false);
       }, startupBudgetMs);
@@ -321,7 +330,10 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
       void drain();
     }
   };
-  if (!await ensureWorker()) { close(); throw new Error("shield privacy worker unavailable"); }
+  if (!await ensureWorker()) {
+    close();
+    throw Object.assign(new Error("shield privacy worker unavailable"), { opf: Boolean(privacy.checkpoint), ...(startFailure ? { startFailure } : {}) });
+  }
   return Object.freeze({
     version: privacy.version,
     async isReady() {
