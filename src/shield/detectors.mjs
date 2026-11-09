@@ -9,16 +9,16 @@ import { doctorGitleaksWarnings, gitleaksOverride, installGitleaks, pinnedGitlea
 import { detectPlatform } from "./platform.mjs";
 import { adoptAsset, storedGitleaksPath } from "./asset-adopt.mjs";
 import { defaultIsProcessAlive } from "./file-lock.mjs";
-import { OPF_SCAN_TIMEOUT_MS, OPF_STARTUP_TIMEOUT_MS } from "./opf-args.mjs";
+import { OPF_OPEN_BUDGET_MS, OPF_SCAN_TIMEOUT_MS } from "./opf-args.mjs";
 import { readShieldAssetsProvision, shieldAssetStore, updateShieldAssetsProvision } from "./paths.mjs";
 
 const UNSUPPORTED_NOTICE = "OPF is unsupported on this platform; Shield stays on regex + Gitleaks";
 const FALLBACK_NOTICE = "Shield is degraded: PII detection runs on the regex fallback until OPF is verified";
 // Downloads fill the first 90% of the progress bar; the venv build is the rest.
 const DOWNLOAD_SHARE = 90;
-// A self-test-only job is one checkpoint attestation, one worker start and one
-// probe scan; a minute on top covers the attestation and the record writes.
-const OPF_SELF_TEST_WAIT_MS = OPF_STARTUP_TIMEOUT_MS + Math.max(...OPF_SCAN_TIMEOUT_MS) + 60_000;
+// A self-test-only job is one checkpoint verification, one OPF open and one
+// probe scan; a minute on top covers the verification and the record writes.
+export const OPF_SELF_TEST_WAIT_MS = OPF_OPEN_BUDGET_MS + Math.max(...OPF_SCAN_TIMEOUT_MS) + 60_000;
 const OPF_JOB_POLL_MS = 1_000;
 
 function defaults(io = {}) {

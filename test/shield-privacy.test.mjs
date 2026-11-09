@@ -7,7 +7,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { UNKNOWN_REASONS as ADAPTER_REASONS } from "../detectors/opf/opf-adapter.mjs";
-import { buildOpfWorkerArgs } from "../src/shield/opf-args.mjs";
+import { OPF_OPEN_BUDGET_MS, OPF_STARTUP_TIMEOUT_MS, buildOpfWorkerArgs } from "../src/shield/opf-args.mjs";
 import { shieldPaths } from "../src/shield/paths.mjs";
 import { attestShieldCheckpoint } from "../src/shield/checkpoint.mjs";
 import { createPrivacyFilter, isVerifiedRedaction, privacyWorkerEnv, runPrivacyWorkerSelfTest } from "../src/shield/privacy.mjs";
@@ -1748,6 +1748,52 @@ test("an OPF worker that never answers health is refused as a startup timeout", 
     assert.equal(error.startFailure, "timeout");
     return true;
   });
+});
+
+test("a slow OPF open past the worker's own 60 s load bound still comes up within the daemon budget", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  let pending = null;
+  // Only the opening health probe is held back; later probes answer at once.
+  const worker = fakeWorker((message, reply) => {
+    if (message.type !== "health") return;
+    if (pending === null) pending = () => reply(health(message));
+    else reply(health(message));
+  });
+  const opening = createPrivacyFilter({ provision: opfProvision, spawnWorker: () => worker, validateWorker, validateFile,
+    validateCheckpoint: async () => async () => {} });
+  await flushTasks();
+  t.mock.timers.tick(OPF_STARTUP_TIMEOUT_MS + 30_000);
+  await flushTasks();
+  assert.equal(typeof pending, "function", "the health probe is still waiting");
+  pending();
+  const filter = await opening;
+  t.after(() => filter.close());
+  assert.equal(await filter.isReady(), true);
+});
+
+test("an OPF open that outlives the daemon budget is refused as a startup timeout", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const worker = fakeWorker(() => {});
+  const opening = createPrivacyFilter({ provision: opfProvision, spawnWorker: () => worker, validateWorker, validateFile,
+    validateCheckpoint: async () => async () => {} });
+  const outcome = opening.then(() => "opened", (error) => error);
+  await flushTasks();
+  t.mock.timers.tick(OPF_OPEN_BUDGET_MS - 1);
+  await flushTasks();
+  t.mock.timers.tick(1);
+  const error = await outcome;
+  assert.equal(error.message, "shield privacy worker unavailable");
+  assert.equal(error.startFailure, "timeout");
+});
+
+test("the OPF open budget may reach the daemon bound but the regex worker keeps its own", async () => {
+  const opf = { provision: opfProvision, spawnWorker: () => fakeWorker((message, reply) => { if (message.type === "health") reply(health(message)); }),
+    validateWorker, validateFile, validateCheckpoint: async () => async () => {} };
+  const filter = await createPrivacyFilter({ ...opf, startupTimeoutMs: OPF_OPEN_BUDGET_MS });
+  filter.close();
+  await assert.rejects(createPrivacyFilter({ ...opf, startupTimeoutMs: OPF_OPEN_BUDGET_MS + 1 }), { message: "shield privacy startup timeout is invalid" });
+  await assert.rejects(createPrivacyFilter({ provision, validateWorker, spawnWorker: () => fakeWorker(() => {}), startupTimeoutMs: 60_001 }),
+    { message: "shield privacy startup timeout is invalid" });
 });
 
 test("an OPF worker that cannot be spawned is refused as a spawn failure", async () => {

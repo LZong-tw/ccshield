@@ -1,6 +1,15 @@
 import { isAbsolute, resolve } from "node:path";
 
+// The worker's own bound on Python loading the model. It is part of the signed
+// argv, so changing it means re-provisioning every installed bundle.
 export const OPF_STARTUP_TIMEOUT_MS = 60_000;
+// The daemon's bound on opening OPF: its checkpoint and source digests, the
+// worker's own digests, then the Python load above. Both digests read the
+// whole 2.6 GB checkpoint, and a cold, busy machine has measured 9 s per pass
+// and 54 s end to end, so the bound must sit well past the worker's 60 s or the
+// daemon kills starts the worker would still accept. A minute covers both
+// digest passes several times over.
+export const OPF_OPEN_BUDGET_MS = OPF_STARTUP_TIMEOUT_MS + 60_000;
 export const OPF_SCAN_TIMEOUT_MS = Object.freeze([2_000, 10_000, 25_000, 60_000, 240_000]);
 export const OPF_WINDOW_CACHE_MAX_MIB = 256;
 

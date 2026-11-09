@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { runShieldCli } from "../src/shield/cli.mjs";
-import { doctorDetectorAssets, ensureOpfJob, fetchDetectorAssets } from "../src/shield/detectors.mjs";
+import { OPF_SELF_TEST_WAIT_MS, doctorDetectorAssets, ensureOpfJob, fetchDetectorAssets } from "../src/shield/detectors.mjs";
 import { liveOpfJob, OPF_JOB_ENTRY, OPF_JOB_MAX_ATTEMPTS, opfJobFiles, readOpfJob, runOpfJob, startOpfJob } from "../src/shield/opf-job.mjs";
 import { shieldPaths } from "../src/shield/paths.mjs";
 import { readShieldStatuslineState, shieldStatuslineSuffix } from "../src/shield/statusline-state.mjs";
@@ -270,7 +270,8 @@ test("a self-test that outlives its budget stops install before any restart", ()
   const { io, calls, clock } = selfTestIo({ isProcessAlive: async () => true });
   await assert.rejects(fetchDetectorAssets({ paths, write: true, background: true, io }),
     { message: "the OPF self-test is still running; rerun ccshield install --write after it finishes" });
-  assert.equal(clock.now, 360_000);
+  assert.equal(clock.now, OPF_SELF_TEST_WAIT_MS);
+  assert.equal(clock.now, 420_000);
   // The running daemon's config still names the recorded Gitleaks, so a KeepAlive restart keeps booting.
   assert.equal(calls.includes("record"), false);
 }));

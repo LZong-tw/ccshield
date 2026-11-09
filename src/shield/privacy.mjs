@@ -5,7 +5,7 @@ import { dirname, isAbsolute, resolve } from "node:path";
 
 import { envNamesFor, readEnv } from "../compat-env.mjs";
 import { attestShieldCheckpoint } from "./checkpoint.mjs";
-import { isValidOpfWorkerArgs } from "./opf-args.mjs";
+import { OPF_OPEN_BUDGET_MS, isValidOpfWorkerArgs } from "./opf-args.mjs";
 import { laneWindowCachePath } from "./paths.mjs";
 import { isGraphFailureDetail, PRIVACY_PROTOCOL as PROTOCOL } from "./protocol.mjs";
 const MAX_BODY_BYTES = 1_048_576;
@@ -47,7 +47,8 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
   const privacy = assertPrivacyProvision(provision);
   // Without lane paths (the self-test) the OPF worker keeps its cache in memory.
   const windowCacheArgs = privacy.checkpoint && paths !== undefined ? ["--window-cache-dir", laneWindowCachePath(paths)] : [];
-  const startupBudgetMs = startupTimeoutMs ?? (privacy.checkpoint ? 60_000 : DEFAULT_STARTUP_TIMEOUT_MS);
+  const startupCapMs = privacy.checkpoint ? OPF_OPEN_BUDGET_MS : DEFAULT_STARTUP_TIMEOUT_MS;
+  const startupBudgetMs = startupTimeoutMs ?? startupCapMs;
   // One budget per request, from admission to reply: queueing, startup and the scan all spend it.
   const scanTimeoutMs = timeoutMs ?? (privacy.checkpoint ? Number(privacy.worker.args[21]) : DEFAULT_TIMEOUT_MS);
   if (typeof spawnWorker !== "function") throw new TypeError("shield privacy worker launcher is required");
@@ -55,7 +56,7 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
   if (typeof validateCheckpoint !== "function") throw new TypeError("shield privacy checkpoint validator is required");
   if (typeof validateFile !== "function") throw new TypeError("shield privacy file validator is required");
   if (!Number.isInteger(scanTimeoutMs) || scanTimeoutMs < 1 || scanTimeoutMs > (privacy.checkpoint ? 240_000 : 30_000)) throw new TypeError("shield privacy worker timeout is invalid");
-  if (!Number.isInteger(startupBudgetMs) || startupBudgetMs < 1 || startupBudgetMs > 60_000) throw new TypeError("shield privacy startup timeout is invalid");
+  if (!Number.isInteger(startupBudgetMs) || startupBudgetMs < 1 || startupBudgetMs > startupCapMs) throw new TypeError("shield privacy startup timeout is invalid");
 
   let assertCheckpointUnchanged;
   let assertSourceUnchanged;

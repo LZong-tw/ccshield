@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildOpfWorkerArgs, isValidOpfWorkerArgs } from "../src/shield/opf-args.mjs";
+import { OPF_OPEN_BUDGET_MS, OPF_SCAN_TIMEOUT_MS, OPF_STARTUP_TIMEOUT_MS, buildOpfWorkerArgs, isValidOpfWorkerArgs } from "../src/shield/opf-args.mjs";
+import { OPF_SELF_TEST_WAIT_MS } from "../src/shield/detectors.mjs";
 
 const references = {
   checkpoint: { path: "/opt/ccshield/checkpoint", sha256: "a".repeat(64), version: "test-1" },
@@ -42,4 +43,12 @@ test("the OPF worker argv allows the 240 s budget and every disk-tier size in ra
     assert.equal(sized[23], String(windowCacheMaxMib));
     assert.equal(isValidOpfWorkerArgs(sized, references), true);
   }
+});
+
+test("the daemon's OPF open budget leaves the worker's load bound room for both checkpoint digests", () => {
+  // The worker's 60 s starts after both digests; the daemon's budget starts before them.
+  assert.equal(OPF_STARTUP_TIMEOUT_MS, 60_000, "the worker bound is part of every provisioned argv");
+  assert.ok(OPF_OPEN_BUDGET_MS - OPF_STARTUP_TIMEOUT_MS >= 60_000);
+  // An install waiting on the self-test must outlast one whole open plus its probe scan.
+  assert.ok(OPF_SELF_TEST_WAIT_MS > OPF_OPEN_BUDGET_MS + Math.max(...OPF_SCAN_TIMEOUT_MS));
 });
