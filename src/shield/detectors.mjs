@@ -73,11 +73,14 @@ export async function fetchDetectorAssets({ paths, gitleaksPath, write = false, 
     : await deps.installGitleaks({ pins, store: shieldAssetStore(paths), platform });
   const gitleaksSummary = { origin: gitleaks.origin, version: gitleaks.version, sha256: gitleaks.sha256 };
   if (background && platform.supported) {
-    const recorded = await recordDetectorInstall({ paths, gitleaks, deps });
     const selfTestOnly = await opfOnDisk({ paths, pins, deps });
     const job = await deps.startOpfJob({ paths });
     if (selfTestOnly) {
+      // Gitleaks is recorded only after the wait: until install reaches the
+      // plist, a KeepAlive restart of the running daemon must still find the
+      // Gitleaks its config names, including when the wait times out.
       await waitForOpfJob({ paths, pid: job.pid, deps });
+      const recorded = await recordDetectorInstall({ paths, gitleaks, deps });
       const outcome = await deps.readOpfJob({ paths });
       const state = outcome?.state ?? "failed";
       return Object.freeze({
@@ -88,6 +91,7 @@ export async function fetchDetectorAssets({ paths, gitleaksPath, write = false, 
         recorded,
       });
     }
+    const recorded = await recordDetectorInstall({ paths, gitleaks, deps });
     return Object.freeze({
       state: "preparing",
       platform: platformSummary(platform),

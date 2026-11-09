@@ -237,7 +237,7 @@ test("install waits for a self-test-only job before the daemon restarts", () => 
   let alive = 3;
   const { io, calls } = selfTestIo({ isProcessAlive: async (pid) => { assert.equal(pid, 7001); return alive-- > 0; } });
   const result = await fetchDetectorAssets({ paths, write: true, background: true, io });
-  assert.deepEqual(calls, ["record", "job", "sleep 1000", "sleep 1000", "sleep 1000"]);
+  assert.deepEqual(calls, ["job", "sleep 1000", "sleep 1000", "sleep 1000", "record"]);
   assert.equal(result.state, "verified");
   assert.deepEqual(result.opf, { state: "verified", job: "started" });
 }));
@@ -251,7 +251,7 @@ test("install also waits on a self-test some other install already started", () 
     readOpfJob: async () => ({ state: "failed", reason: "privacy provision failed: self-test" }),
   });
   const result = await fetchDetectorAssets({ paths, write: true, background: true, io });
-  assert.deepEqual(calls, ["record", "job", "sleep 1000", "sleep 1000"]);
+  assert.deepEqual(calls, ["job", "sleep 1000", "sleep 1000", "record"]);
   assert.equal(result.state, "degraded");
   assert.deepEqual(result.opf, { state: "failed", job: "already running", reason: "privacy provision failed: self-test" });
 }));
@@ -262,15 +262,17 @@ test("a first install without the bundle on disk still hands OPF to the backgrou
     isProcessAlive: async () => assert.fail("a first download is not waited for"),
   });
   const result = await fetchDetectorAssets({ paths, write: true, background: true, io });
-  assert.deepEqual(calls, ["record", "job"]);
+  assert.deepEqual(calls, ["job", "record"]);
   assert.deepEqual(result.opf, { state: "preparing", job: "started" });
 }));
 
 test("a self-test that outlives its budget stops install before any restart", () => withHome(async (paths) => {
-  const { io, clock } = selfTestIo({ isProcessAlive: async () => true });
+  const { io, calls, clock } = selfTestIo({ isProcessAlive: async () => true });
   await assert.rejects(fetchDetectorAssets({ paths, write: true, background: true, io }),
     { message: "the OPF self-test is still running; rerun ccshield install --write after it finishes" });
   assert.equal(clock.now, 360_000);
+  // The running daemon's config still names the recorded Gitleaks, so a KeepAlive restart keeps booting.
+  assert.equal(calls.includes("record"), false);
 }));
 
 test("the wait sees a real detached job exit", () => withHome(async (paths) => {
