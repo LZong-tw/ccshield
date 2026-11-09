@@ -1780,6 +1780,7 @@ test("an OPF open that outlives the daemon budget is refused as a startup timeou
   await flushTasks();
   t.mock.timers.tick(OPF_OPEN_BUDGET_MS - 1);
   await flushTasks();
+  assert.equal(await Promise.race([outcome, Promise.resolve("pending")]), "pending", "the open is still inside its budget");
   t.mock.timers.tick(1);
   const error = await outcome;
   assert.equal(error.message, "shield privacy worker unavailable");

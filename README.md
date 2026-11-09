@@ -145,7 +145,7 @@ re-runs the OPF self-test and a daemon booting beside it can miss its OPF
 startup budget. A first install, which still has to download OPF, hands the
 job to the background as before.
 
-That wait is bounded at six minutes, one self-test attempt. If the job is
+That wait is bounded at seven minutes, one self-test attempt. If the job is
 still running then (a failed attempt it is retrying, or a venv another job is
 still building), install stops with `the OPF self-test is still running` before
 it touches the plist, so the running daemon keeps serving; rerun
