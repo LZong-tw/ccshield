@@ -61,8 +61,9 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
   let assertSourceUnchanged;
   let current = null;
   let starting = null;
-  // Why the latest start attempt gave up ("timeout" or "spawn"), so a refused
-  // construction can say which without carrying any worker output.
+  // Why the latest start attempt gave up ("timeout", "spawn", "health" or
+  // "assets"), so a refused construction can say which without carrying any
+  // worker output.
   let startFailure = null;
   let readiness = null;
   let active = null;
@@ -173,7 +174,13 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
           await validateFile(privacy.tokenizer, { label: "tokenizer" });
         } catch { throw new Error("shield privacy pinned file unavailable"); }
       }
-    } catch (error) { if (!attempt.expired) close("assets_invalid"); throw error; }
+    } catch (error) {
+      if (!attempt.expired) {
+        startFailure = "assets";
+        close("assets_invalid");
+      }
+      throw error;
+    }
     if (closed || attempt.expired) return false;
     let worker;
     try {
@@ -217,7 +224,10 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
       stderrBytes += Buffer.byteLength(chunk);
       if (stderrBytes > MAX_FRAME_BYTES) stopWorker(session, "frame_limit");
     });
-    return await waitForHealth(session);
+    const healthy = await waitForHealth(session);
+    // A worker that exits or answers health wrongly before the deadline.
+    if (!healthy && !attempt.expired) startFailure = "health";
+    return healthy;
   };
   const ensureWorker = async () => {
     if (closed) return false;
@@ -330,9 +340,18 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
       void drain();
     }
   };
-  if (!await ensureWorker()) {
+  const refused = (error) => Object.assign(error, { opf: Boolean(privacy.checkpoint), ...(startFailure ? { startFailure } : {}) });
+  let started;
+  try {
+    started = await ensureWorker();
+  } catch (error) {
+    // startWorker only throws its own fixed-message errors (attestation, pinned files).
     close();
-    throw Object.assign(new Error("shield privacy worker unavailable"), { opf: Boolean(privacy.checkpoint), ...(startFailure ? { startFailure } : {}) });
+    throw refused(error);
+  }
+  if (!started) {
+    close();
+    throw refused(new Error("shield privacy worker unavailable"));
   }
   return Object.freeze({
     version: privacy.version,

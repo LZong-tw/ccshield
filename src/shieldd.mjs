@@ -33,6 +33,8 @@ export const BOOT_FAILURE_REASONS = Object.freeze([
   "gitleaks_unavailable",
   "opf_start_timeout",
   "opf_spawn_failed",
+  "opf_health_failed",
+  "opf_assets_invalid",
   "privacy_unavailable",
   "audit_unavailable",
   "image_unavailable",
@@ -58,6 +60,8 @@ export function bootFailureReason(error) {
   if (stage === "privacy_unavailable" && error.opf === true) {
     if (error.startFailure === "timeout") return "opf_start_timeout";
     if (error.startFailure === "spawn") return "opf_spawn_failed";
+    if (error.startFailure === "health") return "opf_health_failed";
+    if (error.startFailure === "assets") return "opf_assets_invalid";
   }
   return BOOT_FAILURE_REASONS.includes(stage) ? stage : "unknown";
 }

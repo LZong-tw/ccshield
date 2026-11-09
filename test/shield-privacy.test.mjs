@@ -1759,6 +1759,29 @@ test("an OPF worker that cannot be spawned is refused as a spawn failure", async
   });
 });
 
+test("an OPF worker that exits before answering health is refused as a health failure", async () => {
+  const worker = fakeWorker((message, _emit, self) => { if (message.type === "health") self.emit("exit", 1, null); });
+  await assert.rejects(createPrivacyFilter({ provision: opfProvision, spawnWorker: () => worker, validateWorker, validateFile,
+    validateCheckpoint: async () => async () => {}, startupTimeoutMs: 5_000 }), (error) => {
+    assert.equal(error.message, "shield privacy worker unavailable");
+    assert.equal(error.opf, true);
+    assert.equal(error.startFailure, "health");
+    return true;
+  });
+});
+
+test("an OPF checkpoint that fails attestation is refused as invalid assets and keeps its fixed message", async () => {
+  let spawned = false;
+  await assert.rejects(createPrivacyFilter({ provision: opfProvision, spawnWorker: () => { spawned = true; return fakeWorker(() => {}); }, validateWorker, validateFile,
+    validateCheckpoint: async () => { throw new Error("digest mismatch at /opt/ccshield/model"); } }), (error) => {
+    assert.equal(error.message, "shield privacy checkpoint unavailable");
+    assert.equal(error.opf, true);
+    assert.equal(error.startFailure, "assets");
+    return true;
+  });
+  assert.equal(spawned, false);
+});
+
 test("a regex worker that fails to start is not tagged as OPF", async () => {
   await assert.rejects(createPrivacyFilter({ provision, validateWorker, spawnWorker: () => ({}) }), (error) => {
     assert.equal(error.opf, false);

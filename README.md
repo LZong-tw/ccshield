@@ -132,15 +132,24 @@ A daemon that cannot boot writes one line and exits 1:
 startup stage that failed, never the error message: `config_invalid`,
 `policy_invalid`, `assets_invalid`, `gitleaks_unavailable`,
 `opf_start_timeout` (the OPF worker did not answer health within its startup
-budget), `opf_spawn_failed`, `privacy_unavailable` (any other privacy detector
-refusal), `audit_unavailable`, `image_unavailable`, `port_in_use`,
-`proxy_unavailable`, `state_write_failed`, or `unknown`.
+budget), `opf_spawn_failed`, `opf_health_failed` (the OPF worker exited or
+answered health wrongly before that budget ran out), `opf_assets_invalid` (the
+checkpoint, source or pinned files failed attestation), `privacy_unavailable`
+(any other privacy detector refusal, including a regex worker),
+`audit_unavailable`, `image_unavailable`, `port_in_use`, `proxy_unavailable`,
+`state_write_failed`, or `unknown`.
 
 `ccshield install --write` waits for the OPF job before it restarts the
 daemon when the bundle and venv are already on disk, because that job only
 re-runs the OPF self-test and a daemon booting beside it can miss its OPF
 startup budget. A first install, which still has to download OPF, hands the
 job to the background as before.
+
+That wait is bounded at six minutes, one self-test attempt. If the job is
+still running then (a failed attempt it is retrying, or a venv another job is
+still building), install stops with `the OPF self-test is still running` before
+it touches the plist, so the running daemon keeps serving; rerun
+`install --write` once the job has finished.
 
 ### Upgrading an installed lane
 

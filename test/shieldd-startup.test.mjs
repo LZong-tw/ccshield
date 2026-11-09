@@ -120,6 +120,8 @@ test("each boot stage reports its own fixed reason and rethrows the original err
     ["gitleaks_unavailable", { createScanner: fails(new Error("gitleaks")) }],
     ["opf_start_timeout", { createPrivacy: fails(Object.assign(new Error("shield privacy worker unavailable"), { opf: true, startFailure: "timeout" })) }],
     ["opf_spawn_failed", { createPrivacy: fails(Object.assign(new Error("shield privacy worker unavailable"), { opf: true, startFailure: "spawn" })) }],
+    ["opf_health_failed", { createPrivacy: fails(Object.assign(new Error("shield privacy worker unavailable"), { opf: true, startFailure: "health" })) }],
+    ["opf_assets_invalid", { createPrivacy: fails(Object.assign(new Error("shield privacy checkpoint unavailable"), { opf: true, startFailure: "assets" })) }],
     ["privacy_unavailable", { createPrivacy: fails(Object.assign(new Error("shield privacy worker unavailable"), { opf: false, startFailure: "timeout" })) }],
     ["audit_unavailable", { createDecisionRecorder: fails(new Error("audit")) }],
     ["state_write_failed", { createDecisionRecorder: async () => ({ recordShieldDecision: async () => ({ durable: "ack" }) }), writePolicyState: fails(new Error("disk")) }],
@@ -168,6 +170,15 @@ test("the boot rule passes a matching image version, and Q1 boots without a work
   const twoKey = await startupFixture(t);
   await assert.rejects(startShieldDaemon({ config: twoKey.config, paths: twoKey.paths, readImageProvision: async () => null,
     createDecisionRecorder: async () => { throw reachedAudit; } }), (error) => error === reachedAudit);
+});
+
+test("a provisioned image worker that cannot be created reports image_unavailable", async (t) => {
+  const three = await startupFixture(t, { detectorVersions: { gitleaks: "8.24.0", image: "image-0123456789ab", privacy: "privacy-1" } });
+  let caught;
+  await assert.rejects(startShieldDaemon({ config: three.config, paths: three.paths, readImageProvision: imagePin("image-0123456789ab"),
+    createDecisionRecorder: async () => ({ recordShieldDecision: async () => ({ durable: "ack" }) }),
+    createImageScanner: async () => { throw new Error("image worker /x/image-worker failed"); } }), (error) => { caught = error; return true; });
+  assert.equal(bootFailureReason(caught), "image_unavailable");
 });
 
 async function startupFixture(t, { detectorVersions = { gitleaks: "8.24.0", privacy: "privacy-1" } } = {}) {
