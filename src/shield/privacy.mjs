@@ -580,12 +580,16 @@ export function isVerifiedRedaction({ original, result } = {}) {
   if (!Array.isArray(result.findings) || !Array.isArray(result.redactions)) return false;
   const requiredCounts = new Map();
   for (const finding of result.findings) requiredCounts.set(finding.label, (requiredCounts.get(finding.label) ?? 0) + finding.count);
-  const before = opaqueValues(Buffer.from(original));
-  const after = opaqueValues(result.redactedBody);
+  const before = protectedValues(Buffer.from(original));
+  const after = protectedValues(result.redactedBody);
   if (!before || !after || before.length !== after.length
     || before.some(([path, value], index) => after[index][0] !== path || after[index][1] !== value)) return false;
-  // Provider-signed values travel unscanned, so an original value may survive only inside one of them.
-  const visible = withoutTokens(result.redactedBody, new Set(after.map(([, value]) => JSON.stringify(value))));
+  // Provider-signed values travel unscanned and control names must reach the API unchanged, so an original
+  // value may survive only inside one of them. Each protected entry hides one literal, never every literal
+  // equal to it: a prose block that merely repeats a tool name is still checked.
+  const tokens = new Map();
+  for (const token of after.map(([, value]) => JSON.stringify(value))) tokens.set(token, (tokens.get(token) ?? 0) + 1);
+  const visible = withoutTokens(result.redactedBody, tokens);
   const counts = new Map();
   for (const redaction of result.redactions) {
     if (!Array.isArray(redaction.spans) || redaction.spans.length !== redaction.count) return false;
@@ -630,7 +634,31 @@ export function opaqueValues(body) {
   return entries;
 }
 
+function protectedValues(body) {
+  const opaque = opaqueValues(body);
+  const names = opaque && controlNames(body);
+  return names && [...opaque, ...names];
+}
+
+// Names the API resolves against each other (a tool definition, the tool_choice and tool_use blocks naming it)
+// plus the model. The OPF adapter pins these; a finding they happen to repeat stays, the name never changes.
+export function controlNames(body) {
+  let root;
+  try { root = JSON.parse(body.toString("utf8")); } catch { return null; }
+  const entries = [];
+  const add = (path, value) => { if (typeof value === "string") entries.push([path, value]); };
+  const each = (value, visit) => { if (Array.isArray(value)) value.forEach(visit); };
+  add("model", root?.model);
+  each(root?.tools, (tool, index) => add(`tools.${index}.name`, tool?.name));
+  add("tool_choice.name", root?.tool_choice?.name);
+  each(root?.messages, (message, messageIndex) => each(message?.content, (block, blockIndex) => {
+    if (["tool_use", "server_tool_use"].includes(block?.type)) add(`${messageIndex}.${blockIndex}.name`, block.name);
+  }));
+  return entries;
+}
+
 // One pass over the body's string literals: a body with thousands of opaque entries must not stall the event loop.
+// tokens maps each literal to how many occurrences to drop; occurrences past that count stay visible.
 // Tokens are ASCII JSON literals, so a latin1 view compares them exactly; a match nested in an escaped quote never counts.
 function withoutTokens(body, tokens) {
   const pieces = [];
@@ -639,7 +667,10 @@ function withoutTokens(body, tokens) {
     let end = at + 1;
     while (end < body.length && body[end] !== 0x22) end += body[end] === 0x5c ? 2 : 1;
     if (end >= body.length) break;
-    if (tokens.has(body.toString("latin1", at, end + 1))) {
+    const token = body.toString("latin1", at, end + 1);
+    const left = tokens.get(token);
+    if (left) {
+      tokens.set(token, left - 1);
       pieces.push(body.subarray(from, at));
       from = end + 1;
     }

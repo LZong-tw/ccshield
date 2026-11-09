@@ -184,6 +184,8 @@ export function adaptOpfPrediction(original, scan, result) {
     validateAllValues(scan.allValues, canonical.allValues);
     const pinned = new Set();
     validateJsonShape(canonical.root, canonical.root, undefined, pinned);
+    // Pinned values a kept span reaches into; replay still rewrites those so the shape check names the control.
+    const spannedPins = new Set();
     const replacementsByRange = new Map();
     const fragments = new Map();
     const projectedRanges = new Set();
@@ -211,6 +213,7 @@ export function adaptOpfPrediction(original, scan, result) {
         const end = Math.min(source.end, span.end);
         if (end <= start) continue;
         projected = true;
+        if (pinned.has(canonical.sources[index].node)) spannedPins.add(canonical.sources[index].node);
         const key = `${span.label}:${source.node.map[start - source.start].start}:${source.node.map[end - source.start - 1].end}`;
         if (projectedRanges.has(key)) continue;
         if (projectedRanges.size >= MAX_PROJECTED_RANGES) throw new Error("redaction projection limit");
@@ -240,7 +243,9 @@ export function adaptOpfPrediction(original, scan, result) {
     let hitCount = 0;
     let overflow = false;
     canonical.allValues.forEach((node, nodeIndex) => {
-      if (canonical.opaque.nodes.has(node)) return;
+      // A finding in prose is not replayed into a pinned control no span touched: a tool named
+      // mcp__alice__lookup keeps its name when Alice is found in user text.
+      if (canonical.opaque.nodes.has(node) || pinned.has(node) && !spannedPins.has(node)) return;
       const signed = canonical.opaque.signedText.has(node);
       // A hit that splits a surrogate pair is not an occurrence, so it never counts toward the bound.
       matcher.scanWhole(node.value, (pattern, end) => {
@@ -372,11 +377,19 @@ export function adaptOpfPrediction(original, scan, result) {
     if (redacted.length > MAX_BODY_BYTES) throw new Error("redaction body limit");
     const candidate = prepareOpfScan(redacted);
     validateOpaqueValues(canonical.opaque, candidate.opaque);
-    const opaqueRanges = candidate.opaque.entries.map(({ node }) => ({ start: node.map[0].start - 1, end: node.map.at(-1).end + 1 }));
-    if (originalMatcher.includesOutside(redacted, opaqueRanges)) throw new Error("value survived");
-    if (hasDecodedResidual(candidate.root, matcher, candidate.opaque.nodes)) throw new Error("value survived");
+    // A changed control is named before residuals are counted: a span inside a key would otherwise surface as
+    // value-survived through the key's untouched siblings.
     validateProtocolIds(canonical.protocolIds, candidate.protocolIds);
     validateJsonShape(canonical.root, candidate.root);
+    // Pinned controls no span touched were left byte-identical on purpose, so a finding they repeat is not a
+    // residual. The shape check above proved every control unchanged, and redaction rewrites values in place,
+    // so the same index is the same node.
+    const keptPins = new Set(canonical.allValues.flatMap((node, index) => pinned.has(node) && !spannedPins.has(node) ? [candidate.allValues[index]] : []));
+    const keptRanges = [...candidate.opaque.entries.map(({ node }) => node), ...keptPins].filter((node) => node.map.length > 0)
+      .map((node) => node.type === "string" ? { start: node.map[0].start - 1, end: node.map.at(-1).end + 1 }
+        : { start: node.map[0].start, end: node.map.at(-1).end });
+    if (originalMatcher.includesOutside(redacted, keptRanges)) throw new Error("value survived");
+    if (hasDecodedResidual(candidate.root, matcher, new Set([...candidate.opaque.nodes, ...keptPins]))) throw new Error("value survived");
     const redactions = [];
     let proofCount = 0;
     for (const [label, spans] of grouped) {

@@ -2687,3 +2687,67 @@ test("OPF locks tool schemas that only raw JSON can express: duplicate keys, esc
   const body = verifiedResult(original, adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice")));
   assert.equal(body.tools[0].input_schema.description, "[redacted:private_person]");
 });
+
+// Before the fix the user-text finding was replayed into the unscanned tool definition name and the whole
+// request failed with control:value:control:name (failures.jsonl, 2026-11-09 03:25Z).
+test("OPF keeps tool names that repeat a finding found in user text and still redacts the text", () => {
+  const name = "mcp__Alice__lookup";
+  const fixture = {
+    ...managedRequest({ name, input_schema: { type: "object" } }),
+    tool_choice: { type: "tool", name },
+    messages: [
+      { role: "user", content: [{ type: "text", text: "Alice wrote" }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "toolu_alice1", name, input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_alice1", content: "done" }] },
+    ],
+  };
+  const original = Buffer.from(JSON.stringify(fixture));
+  const scan = prepareOpfScan(original);
+  assert.equal(scan.text.indexOf("Alice wrote") < scan.text.indexOf(name), true);
+  const result = adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice"));
+  assert.deepEqual(result.findings, [{ label: "private_person", count: 1 }]);
+  const body = verifiedResult(original, result);
+  assert.equal(body.messages[0].content[0].text, "[redacted:private_person] wrote");
+  assert.deepEqual([body.tools[0].name, body.tool_choice.name, body.messages[1].content[0].name], [name, name, name]);
+});
+
+test("OPF control-name exemption does not loosen genuine control or residual checks", () => {
+  // A finding repeated in a locked schema constraint still names the control instead of being forwarded.
+  const locked = Buffer.from(JSON.stringify(managedRequest({ name: "mcp__Alice__lookup",
+    input_schema: { type: "object", properties: { who: { type: "string", pattern: "Alice" } } } })));
+  const lockedScan = prepareOpfScan(locked);
+  assert.deepEqual(adaptOpfPrediction(locked, lockedScan, prediction(lockedScan.text, "private_person", "Alice")),
+    { status: "unknown", findings: [], reason: "protocol-control-mutation", detail: "control:value:schema:pattern" });
+
+  // The verifier rejects a body whose control name changed, and one whose name hides a leftover finding elsewhere.
+  const original = Buffer.from(JSON.stringify(managedRequest({ name: "mcp__Alice__lookup", input_schema: { type: "object" } })));
+  const scan = prepareOpfScan(original);
+  const result = adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice"));
+  const body = verifiedResult(original, result);
+  const forged = (edit) => {
+    const copy = structuredClone(body);
+    edit(copy);
+    return isVerifiedRedaction({ original, result: { ...result, redactedBody: Buffer.from(JSON.stringify(copy)) } });
+  };
+  assert.equal(forged(() => {}), true);
+  assert.equal(forged((copy) => { copy.tools[0].name = "mcp__[redacted:private_person]__lookup"; }), false);
+  assert.equal(forged((copy) => { copy.model = "claude-other"; }), false);
+  assert.equal(forged((copy) => { copy.messages[0].content[0].text = "Alice wrote"; }), false);
+});
+
+// Each protected name hides one literal: prose that merely repeats a tool name must still be checked, or a
+// body leaving the finding inside that prose would pass as a kept control.
+test("OPF verifier still sees a finding in prose that repeats a kept control name", () => {
+  for (const name of ["mcp__Alice__lookup", "Alice"]) {
+    const fixture = managedRequest({ name, input_schema: { type: "object" } });
+    fixture.messages[0].content.push({ type: "text", text: name });
+    const original = Buffer.from(JSON.stringify(fixture));
+    const scan = prepareOpfScan(original);
+    const result = adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice"));
+    const body = verifiedResult(original, result);
+    assert.equal(body.tools[0].name, name);
+    assert.equal(body.messages[0].content[1].text.includes("Alice"), false);
+    body.messages[0].content[1].text = name;
+    assert.equal(isVerifiedRedaction({ original, result: { ...result, redactedBody: Buffer.from(JSON.stringify(body)) } }), false);
+  }
+});
