@@ -5,7 +5,7 @@ import { dirname, isAbsolute, resolve } from "node:path";
 
 import { envNamesFor, readEnv } from "../compat-env.mjs";
 import { attestShieldCheckpoint } from "./checkpoint.mjs";
-import { OPF_OPEN_BUDGET_MS, isValidOpfWorkerArgs } from "./opf-args.mjs";
+import { OPF_MAX_SCAN_TIMEOUT_MS, OPF_OPEN_BUDGET_MS, isValidOpfWorkerArgs } from "./opf-args.mjs";
 import { laneWindowCachePath } from "./paths.mjs";
 import { isGraphFailureDetail, PRIVACY_PROTOCOL as PROTOCOL } from "./protocol.mjs";
 const MAX_BODY_BYTES = 1_048_576;
@@ -55,7 +55,7 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
   if (typeof validateWorker !== "function") throw new TypeError("shield privacy worker validator is required");
   if (typeof validateCheckpoint !== "function") throw new TypeError("shield privacy checkpoint validator is required");
   if (typeof validateFile !== "function") throw new TypeError("shield privacy file validator is required");
-  if (!Number.isInteger(scanTimeoutMs) || scanTimeoutMs < 1 || scanTimeoutMs > (privacy.checkpoint ? 240_000 : 30_000)) throw new TypeError("shield privacy worker timeout is invalid");
+  if (!Number.isInteger(scanTimeoutMs) || scanTimeoutMs < 1 || scanTimeoutMs > (privacy.checkpoint ? OPF_MAX_SCAN_TIMEOUT_MS : 30_000)) throw new TypeError("shield privacy worker timeout is invalid");
   if (!Number.isInteger(startupBudgetMs) || startupBudgetMs < 1 || startupBudgetMs > startupCapMs) throw new TypeError("shield privacy startup timeout is invalid");
 
   let assertCheckpointUnchanged;

@@ -10,7 +10,8 @@ export const OPF_STARTUP_TIMEOUT_MS = 60_000;
 // daemon kills starts the worker would still accept. A minute covers both
 // digest passes several times over.
 export const OPF_OPEN_BUDGET_MS = OPF_STARTUP_TIMEOUT_MS + 60_000;
-export const OPF_SCAN_TIMEOUT_MS = Object.freeze([2_000, 10_000, 25_000, 60_000, 240_000]);
+export const OPF_MAX_SCAN_TIMEOUT_MS = 240_000;
+export const OPF_SCAN_TIMEOUT_MS = Object.freeze([2_000, 10_000, 25_000, 60_000, OPF_MAX_SCAN_TIMEOUT_MS]);
 export const OPF_WINDOW_CACHE_MAX_MIB = 256;
 
 // The only argv the OPF worker accepts. Provisioning writes it and the daemon
