@@ -529,17 +529,19 @@ test("real gateway requires complete OPF secret redaction proof before forwardin
   const cases = [
     { name: "verified secret", status: 200, body: redacted, transforms: 1 },
     { name: "verified secret and private email", original: mixedOriginal, reply: { findings: mixedFindings, redactions: [secretRedaction, { label: "private_email", count: 1, spans: [{ start: 26, end: 43 }] }], redactedBody: '{"content":"[SECRET] [PRIVATE_EMAIL]"}' }, status: 200, body: '{"content":"[SECRET] [PRIVATE_EMAIL]"}', transforms: 2 },
-    { name: "unchanged body", reply: { redactedBody: original }, status: 503 },
-    { name: "secret survives elsewhere", reply: { redactedBody: '{"content":"[SECRET]","other":"fixture-token"}' }, status: 503 },
-    { name: "missing replacement body", reply: { redactedBody: undefined }, status: 503 },
+    // A well-formed reply whose redaction fails the independent check is refused (400); a reply the worker
+    // framed wrongly is a worker failure (503).
+    { name: "unchanged body", reply: { redactedBody: original }, status: 400 },
+    { name: "secret survives elsewhere", reply: { redactedBody: '{"content":"[SECRET]","other":"fixture-token"}' }, status: 400 },
+    { name: "missing replacement body", reply: { redactedBody: undefined }, status: 400 },
     { name: "replacement is not JSON", reply: { redactedBody: "[SECRET]" }, status: 503 },
-    { name: "missing proof", reply: { redactions: undefined }, status: 503 },
-    { name: "empty proof", reply: { redactions: [] }, status: 503 },
-    { name: "missing spans", reply: { redactions: [{ label: "secret", count: 1 }] }, status: 503 },
-    { name: "out-of-bounds span", reply: { redactions: [{ label: "secret", count: 1, spans: [{ start: 12, end: 100 }] }] }, status: 503 },
-    { name: "finding count exceeds proof", reply: { findings: [{ label: "secret", count: 2 }] }, status: 503 },
-    { name: "proof label does not cover secret", reply: { redactions: [{ ...secretRedaction, label: "private_email" }] }, status: 503 },
-    { name: "mixed finding lacks email proof", original: mixedOriginal, reply: { findings: mixedFindings, redactedBody: '{"content":"[SECRET] [PRIVATE_EMAIL]"}' }, status: 503 },
+    { name: "missing proof", reply: { redactions: undefined }, status: 400 },
+    { name: "empty proof", reply: { redactions: [] }, status: 400 },
+    { name: "missing spans", reply: { redactions: [{ label: "secret", count: 1 }] }, status: 400 },
+    { name: "out-of-bounds span", reply: { redactions: [{ label: "secret", count: 1, spans: [{ start: 12, end: 100 }] }] }, status: 400 },
+    { name: "finding count exceeds proof", reply: { findings: [{ label: "secret", count: 2 }] }, status: 400 },
+    { name: "proof label does not cover secret", reply: { redactions: [{ ...secretRedaction, label: "private_email" }] }, status: 400 },
+    { name: "mixed finding lacks email proof", original: mixedOriginal, reply: { findings: mixedFindings, redactedBody: '{"content":"[SECRET] [PRIVATE_EMAIL]"}' }, status: 400 },
     { name: "Gitleaks confirmation", secretFindings: [{ category: "private-key", count: 1 }], status: 403 },
     { name: "restricted repository", repositoryClass: "restricted", status: 403 },
     { name: "restricted path", pathClasses: ["terraform_state"], status: 403 },
@@ -604,6 +606,12 @@ test("real gateway requires complete OPF secret redaction proof before forwardin
         assert.deepEqual(upstreamBodies, [fixture.body]);
         assert.equal(events[0].action, "redact");
         assert.equal(events[0].transformCount, fixture.transforms);
+      } else if (fixture.status === 400) {
+        const { error } = await response.json();
+        assert.deepEqual([error.code, error.message.includes("（redaction_invalid）")], ["shield_refused", true]);
+        assert.equal(response.headers.get("x-should-retry"), "false");
+        assert.doesNotMatch(error.message, /fixture-token|alice@example/);
+        assert.deepEqual(upstreamBodies, []);
       } else {
         assert.deepEqual(await response.json(), { error: { code: fixture.status === 403 ? "shield_blocked" : "shield_unavailable" } });
         assert.deepEqual(upstreamBodies, []);

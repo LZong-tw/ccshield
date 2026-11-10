@@ -116,8 +116,8 @@ const PRIVACY_REASONS = [...new Set([...ADAPTER_REASONS.values(), "adapter-error
 // Refusals decided by the body and its cached prediction alone; a retry fails the same way, so they must not be 503.
 const REFUSED_REASONS = new Set(["signed-block-mutation", "protocol-control-mutation", "protocol-graph-mutation", "invalid-protocol-graph",
   "protocol-id-collision", "protocol-id-limit", "conflicting-protocol-context", "json-key-collision", "invalid-json-topology",
-  "prediction-span-limit", "redaction-projection-limit", "redaction-match-limit", "redaction-body-limit",
-  "cross-field-span", "inconsistent-quoting", "unmapped-finding", "value-survived"]);
+  "prediction-span-limit", "redaction-projection-limit", "redaction-match-limit", "redaction-body-limit", "redaction-frame-limit",
+  "cross-field-span", "inconsistent-quoting", "unmapped-finding", "value-survived", "invalid-source-provenance"]);
 
 test("diagnostics separate real daemon scan, policy and redaction failures while readiness remains healthy", async (t) => {
   let upstreamCalls = 0;
@@ -168,7 +168,7 @@ test("diagnostics separate real daemon scan, policy and redaction failures while
   ]) {
     mode = nextMode;
     const response = await fetch(`${daemon.shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield": CAPABILITY }, body: '{"private":"body-secret"}' });
-    const refused = stage === "privacy_scan" && REFUSED_REASONS.has(reason);
+    const refused = (stage === "privacy_scan" && REFUSED_REASONS.has(reason)) || stage === "redaction";
     assert.equal(response.status, refused ? 400 : 503, mode);
     assert.equal(response.headers.get("x-should-retry"), refused ? "false" : null, mode);
     if (refused) {
@@ -326,12 +326,69 @@ test("diagnostics sanitize arbitrary metadata and separate redaction, audit and 
   ]) {
     const shield = await startShield(t, { targetOrigin: redirect.origin, ...options });
     const response = await fetch(`${shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield": CAPABILITY }, body: "{}" });
-    assert.equal(response.status, 503);
-    assert.deepEqual(await response.json(), { error: { code: "shield_unavailable" } });
+    if (stage === "redaction") {
+      assert.equal(response.status, 400);
+      assert.equal((await response.json()).error.code, "shield_refused");
+    } else {
+      assert.equal(response.status, 503);
+      assert.deepEqual(await response.json(), { error: { code: "shield_unavailable" } });
+    }
     const diagnostics = await readDiagnostics(shield);
     assert.equal(diagnostics.failures.length, 1);
     assert.equal(diagnostics.failures[0].stage, stage); assert.equal(diagnostics.failures[0].reason, reason);
     assert.doesNotMatch(JSON.stringify(diagnostics), /private-secret|credential-secret|Infinity/);
+  }
+});
+
+test("a redaction that fails validation is refused without retry on the direct, approval and cached paths", async (t) => {
+  let upstreamCalls = 0;
+  const upstream = await startFixture(t, async (_request, response) => { upstreamCalls += 1; response.end("{}"); });
+  const decisionContext = { lane: "subscription", destinationClass: "subscription", policyVersion: "policy-1", detectorVersions: { gitleaks: "1", privacy: "1" } };
+  const notJson = async () => ({ action: "redact", redactedBody: Buffer.from("private-secret") });
+  for (const [name, options] of [
+    ["direct", { decide: notJson }],
+    ["approval", { decide: async () => ({ action: "require_approval", redactedBody: Buffer.from("private-secret") }) }],
+    ["cached", { decisionCache: createDecisionCache(), decisionContext, decide: notJson }],
+    ["cached daemon", { decisionCache: createDecisionCache(), decisionContext,
+      decide: async () => { throw createShieldFailure("redaction", "redaction_invalid", "shield privacy redaction is invalid"); } }],
+  ]) {
+    const shield = await startShield(t, { targetOrigin: upstream.origin, ...options });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await fetch(`${shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield": CAPABILITY }, body: "{}" });
+      assert.equal(response.status, 400, name);
+      assert.equal(response.headers.get("x-should-retry"), "false", name);
+      assert.equal(response.headers.get("retry-after"), null, name);
+      const { type, error } = await response.json();
+      assert.equal(type, "error");
+      assert.deepEqual([error.type, error.code], ["invalid_request_error", "shield_refused"], name);
+      assert.match(error.message, /隱私遮蔽結果未通過驗證（redaction_invalid）/, name);
+      assert.doesNotMatch(error.message, /thinking|signature|cannot be modified|anthropic-beta|prompt is too long|private-secret/i);
+    }
+    const { failures } = await readDiagnostics(shield);
+    assert.deepEqual(failures.map(({ stage, reason }) => [stage, reason]), [["redaction", "redaction_invalid"], ["redaction", "redaction_invalid"]], name);
+  }
+  assert.equal(upstreamCalls, 0);
+});
+
+test("refusals name their own cause, and segment and malformed-prediction reasons stay retryable 503", async (t) => {
+  for (const [reason, cause] of [
+    ["redaction-frame-limit", "隱私遮蔽結果超出掃描回覆的大小上限"],
+    ["invalid-source-provenance", "隱私掃描的來源對應不一致"],
+    ["signed-block-mutation", "隱私掃描無法在不改動受保護欄位的情況下完成遮蔽"],
+  ]) {
+    const shield = await startShield(t, { targetOrigin: "http://127.0.0.1:1", decide: async () => { throw createShieldFailure("privacy_scan", reason, "refused"); } });
+    const response = await fetch(`${shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield": CAPABILITY }, body: "{}" });
+    assert.equal(response.status, 400, reason);
+    assert.equal(response.headers.get("x-should-retry"), "false", reason);
+    assert.equal((await response.json()).error.message.includes(`${cause}（${reason}）`), true, reason);
+  }
+  for (const reason of ["segment-coverage", "segment-cache-invalid", "redaction_invalid", "invalid-prediction", "unmapped-span", "frame_limit", "body_invalid"]) {
+    const shield = await startShield(t, { targetOrigin: "http://127.0.0.1:1", decide: async () => { throw createShieldFailure("privacy_scan", reason, "unavailable"); } });
+    const response = await fetch(`${shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield": CAPABILITY }, body: "{}" });
+    assert.equal(response.status, 503, reason);
+    assert.equal(response.headers.get("x-should-retry"), null, reason);
+    assert.deepEqual(await response.json(), { error: { code: "shield_unavailable" } });
+    assert.equal((await readDiagnostics(shield)).failures[0].reason, reason);
   }
 });
 
@@ -1103,7 +1160,8 @@ test("proxy blocks malformed redaction instead of forwarding the original reques
   const response = await fetch(`${shield.origin}/v1/messages`, {
     method: "POST", headers: { "x-airkit-shield": CAPABILITY }, body: '{"content":"privacy-raw-sentinel-must-not-escape"}',
   });
-  assert.equal(response.status, 503);
+  assert.equal(response.status, 400);
+  assert.doesNotMatch(await response.text(), /privacy-raw-sentinel/);
   assert.equal(upstreamCalls, 0);
 });
 

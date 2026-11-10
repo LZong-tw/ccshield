@@ -329,8 +329,8 @@ async function handleShieldRequest({ request, response, capability, controlCapab
     const failure = error?.shieldFailure;
     if (FAILURE_REASONS.get(failure?.stage)?.has(failure?.reason)) fail(failure.stage, failure.reason, inspection.bytes, { cause: failure.cause, queuedMs: failure.queuedMs, detail: failure.detail });
     else fail("evaluation", "evaluation_unavailable", inspection.bytes);
-    if (failure?.stage === "privacy_scan" && REFUSED_PRIVACY_REASONS.has(failure.reason)) {
-      await finish(response, { status: 400, code: "shield_refused", type: "invalid_request_error", retry: false, message: refusalMessage(failure.reason) });
+    if (isRefusal(failure)) {
+      await refuse(response, failure.reason);
     } else {
       await finish(response, { status: 503, code: "shield_unavailable", retryAfterSeconds: validRetryAfter(failure ?? {}), message: failure?.stage === "image_scan" ? IMAGE_MESSAGES[failure.reason] : undefined });
     }
@@ -343,7 +343,7 @@ async function handleShieldRequest({ request, response, capability, controlCapab
     const redactedBody = validateRedactedBody(decision.redactedBody);
     if (redactedBody === null) {
       fail("redaction", "redaction_invalid", inspection.bytes);
-      await finish(response, { status: 503, code: "shield_unavailable" });
+      await refuse(response, "redaction_invalid");
       return;
     }
     forwardBody = redactedBody;
@@ -355,7 +355,7 @@ async function handleShieldRequest({ request, response, capability, controlCapab
       const transformed = validateRedactedBody(decision.redactedBody);
       if (transformed === null) {
         fail("redaction", "redaction_invalid", inspection.bytes);
-        await finish(response, { status: 503, code: "shield_unavailable" });
+        await refuse(response, "redaction_invalid");
         return;
       }
       forwardBody = transformed;
@@ -496,17 +496,36 @@ export function createShieldFailure(stage, reason, message, { retryAfterSeconds,
 // same way. They answer 400 with x-should-retry: false: the Claude Code 2.1.322 client reads x-should-retry
 // first and otherwise retries only 408, 409, 429 and 5xx, and 400 is the plain invalid-request refusal (the
 // client folds 422 into 400 in places, so 422 would add nothing). Worker, model, timeout, asset and
-// malformed-prediction failures stay 503: a restart can clear them.
+// malformed-prediction failures stay 503: a restart can clear them. The segment reasons stay 503 too: a failed
+// segment composition evicts the cached segments it used, so the retry is the recovery.
 const REFUSED_PRIVACY_REASONS = new Set([
   "signed-block-mutation", "protocol-control-mutation", "protocol-graph-mutation", "invalid-protocol-graph",
   "protocol-id-collision", "protocol-id-limit", "conflicting-protocol-context", "json-key-collision", "invalid-json-topology",
-  "prediction-span-limit", "redaction-projection-limit", "redaction-match-limit", "redaction-body-limit",
-  "cross-field-span", "inconsistent-quoting", "unmapped-finding", "value-survived",
+  "prediction-span-limit", "redaction-projection-limit", "redaction-match-limit", "redaction-body-limit", "redaction-frame-limit",
+  "cross-field-span", "inconsistent-quoting", "unmapped-finding", "value-survived", "invalid-source-provenance",
 ]);
+
+// A redaction that fails its independent check is a pure function of the body and the scan result, so it is a
+// refusal as well, whether the daemon or this proxy caught it.
+function isRefusal(failure) {
+  return (failure?.stage === "privacy_scan" && REFUSED_PRIVACY_REASONS.has(failure.reason))
+    || (failure?.stage === "redaction" && failure.reason === "redaction_invalid");
+}
+
+const REFUSAL_CAUSES = {
+  redaction_invalid: "隱私遮蔽結果未通過驗證",
+  "redaction-frame-limit": "隱私遮蔽結果超出掃描回覆的大小上限",
+  "invalid-source-provenance": "隱私掃描的來源對應不一致",
+};
 
 // Shown by Claude Code as the error text. It names the reason only; where it tripped is in failures.jsonl.
 function refusalMessage(reason) {
-  return `Shield 拒絕送出此請求：隱私掃描無法在不改動受保護欄位的情況下完成遮蔽（${reason}）。同一內容重試結果相同，位置記錄於 ccshield failures.jsonl；如需略過可用 --no-shield 重新啟動。`;
+  const cause = REFUSAL_CAUSES[reason] ?? "隱私掃描無法在不改動受保護欄位的情況下完成遮蔽";
+  return `Shield 拒絕送出此請求：${cause}（${reason}）。同一內容重試結果相同，位置記錄於 ccshield failures.jsonl；如需略過可用 --no-shield 重新啟動。`;
+}
+
+function refuse(response, reason) {
+  return finish(response, { status: 400, code: "shield_refused", type: "invalid_request_error", retry: false, message: refusalMessage(reason) });
 }
 
 // Only a full queue, a cooperative model or projected timeout (whose worker keeps warming the unscanned windows), or an
@@ -529,7 +548,7 @@ async function cachedDecision({ decisionCache, decisionContext: contextSource, b
     const decision = await evaluate(sharedSignal, decisionContext.detectorVersions);
     const carriesBody = decision?.action === "redact" || (decision?.action === "require_approval" && decision.redactedBody !== undefined);
     const redactedBody = carriesBody ? validateRedactedBody(decision.redactedBody) : Buffer.alloc(0);
-    if (redactedBody === null) throw new Error("shield decision redaction is invalid");
+    if (redactedBody === null) throw createShieldFailure("redaction", "redaction_invalid", "shield decision redaction is invalid");
     const action = decision?.action;
     const reasonCodes = validReasonCodes(decision?.reasonCodes)
       ? decision.reasonCodes
