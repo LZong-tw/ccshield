@@ -493,9 +493,10 @@ export function createShieldFailure(stage, reason, message, { retryAfterSeconds,
 }
 
 // The adapter refuses these from the body and its cached prediction alone, so a retry of the same body fails the
-// same way. They answer 400 with x-should-retry: false: Claude Code's client retries 408, 409, 429 and 5xx only,
-// honours x-should-retry first, and 400 carries no status-only recovery path (422 can trigger its context-hint
-// fallback). Worker, model, timeout, asset and malformed-prediction failures stay 503: a restart can clear them.
+// same way. They answer 400 with x-should-retry: false: the Claude Code 2.1.322 client reads x-should-retry
+// first and otherwise retries only 408, 409, 429 and 5xx, and 400 is the plain invalid-request refusal (the
+// client folds 422 into 400 in places, so 422 would add nothing). Worker, model, timeout, asset and
+// malformed-prediction failures stay 503: a restart can clear them.
 const REFUSED_PRIVACY_REASONS = new Set([
   "signed-block-mutation", "protocol-control-mutation", "protocol-graph-mutation", "invalid-protocol-graph",
   "protocol-id-collision", "protocol-id-limit", "conflicting-protocol-context", "json-key-collision", "invalid-json-topology",

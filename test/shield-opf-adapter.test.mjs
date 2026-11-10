@@ -153,18 +153,31 @@ test("OPF a span homed in signed thinking still redacts the same text in unsigne
   assert.deepEqual(body.messages[0], fixture.messages[0]);
 });
 
-test("OPF a short non-empty signature still marks its thinking signed and stays byte-identical", () => {
-  const fixture = { model: "claude-fixture", messages: [
-    { role: "user", content: [{ type: "text", text: "Alice" }] },
-    { role: "assistant", content: [{ type: "thinking", thinking: "plan", signature: "Alice" }] },
-  ] };
-  const original = Buffer.from(JSON.stringify(fixture));
-  const scan = prepareOpfScan(original);
-  const result = adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice"));
-  assert.deepEqual(result.passthrough, [{ label: "private_person", at: "1.0", count: 1 }]);
-  const body = verifiedResult(original, result);
-  assert.equal(body.messages[0].content[0].text, "[redacted:private_person]");
-  assert.deepEqual(body.messages[1], fixture.messages[1]);
+test("OPF a signature not shaped like a provider token leaves its thinking locked", () => {
+  // Only the API's check of a real signature vouches for unredacted thinking; "x" or prose vouches for nothing.
+  for (const signature of ["Alice", "x", "not a signature at all, just words"]) {
+    const original = Buffer.from(JSON.stringify({ model: "claude-fixture", messages: [
+      { role: "user", content: [{ type: "text", text: "Alice" }] },
+      { role: "assistant", content: [{ type: "thinking", thinking: "Alice planned", signature }] },
+    ] }));
+    const scan = prepareOpfScan(original);
+    assert.deepEqual(adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice")),
+      { status: "unknown", findings: [], reason: "signed-block-mutation", detail: "signed:private_person:1.0" }, signature);
+  }
+});
+
+test("OPF a secret in signed thinking fails closed by label and block instead of passing through", () => {
+  const value = "sk-fixture-0000";
+  for (const userText of ["hi", `key ${value}`]) {
+    const original = Buffer.from(JSON.stringify({ model: "claude-fixture", messages: [
+      { role: "user", content: [{ type: "text", text: userText }] },
+      { role: "assistant", content: [{ type: "text", text: "ok" }, { type: "thinking", thinking: `use ${value}`, signature: `${OPAQUE}sig` }] },
+    ] }));
+    const scan = prepareOpfScan(original);
+    const result = adaptOpfPrediction(original, scan, prediction(scan.text, "secret", value));
+    assert.deepEqual(result, { status: "unknown", findings: [], reason: "signed-block-mutation", detail: "signed:secret:1.1" }, userText);
+    assert.doesNotMatch(JSON.stringify(result), /sk-fixture/);
+  }
 });
 
 test("OPF passthrough diagnostics list at most 16 label and block pairs", () => {

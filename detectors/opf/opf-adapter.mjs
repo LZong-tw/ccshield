@@ -257,11 +257,13 @@ export function adaptOpfPrediction(original, scan, result) {
       // A finding in prose is not replayed into a pinned control no span touched: a tool named
       // mcp__alice__lookup keeps its name when Alice is found in user text.
       if (canonical.opaque.nodes.has(node) || pinned.has(node) && !spannedPins.has(node)) return;
-      // The API rejects an edited signed block, so its hits are left in place and only counted.
+      // The API rejects an edited signed block, so its hits are left in place and only counted. A secret
+      // cannot be left in place: nothing downstream would block it, so it fails closed like locked thinking.
       const at = canonical.opaque.passthrough.nodes.get(node);
       if (at !== undefined) {
         matcher.scanWhole(node.value, (pattern) => {
           for (const label of labelsOf[pattern]) {
+            if (label === "secret") throw signedMutation(label, at);
             const key = `${label}:${at}`;
             if (skipped.has(key) || skipped.size < MAX_PASSTHROUGH_ENTRIES) skipped.set(key, (skipped.get(key) ?? 0) + 1);
           }
@@ -587,9 +589,9 @@ function hasDecodedResidual(node, matcher, opaque) {
 // Provider-issued values the API verifies byte for byte. Only these exact structural paths qualify, and a
 // duplicated key anywhere on the path disqualifies it, so a look-alike field elsewhere is still scanned.
 function collectOpaqueValues(root) {
-  // passthrough: signed thinking text (and a signature too short to be opaque) the API verifies against its
-  // signature; it is scanned for diagnostics but never rewritten. lockedThinking: thinking with no signature,
-  // which nothing upstream vouches for, so a finding in it still fails closed.
+  // passthrough: signed thinking text the API verifies against its opaque signature; it is scanned for
+  // diagnostics but never rewritten. lockedThinking: thinking without an opaque signature, which nothing
+  // upstream vouches for, so a finding in it still fails closed.
   const found = { entries: [], nodes: new Set(), lockedThinking: new Map(), passthrough: { entries: [], nodes: new Map() } };
   const only = (node, name) => {
     if (node?.type !== "object") return undefined;
@@ -624,13 +626,10 @@ function collectOpaqueValues(root) {
       if (role === "user" && type === "tool_result") each(only(block, "content"), (nested, index) => base64Source(nested, `${path}.content.${index}`));
       if (role !== "assistant") return;
       if (type === "thinking") {
-        const signature = only(block, "signature");
-        add(`${path}.signature`, signature);
         const thinking = only(block, "thinking");
-        if (signature?.type === "string" && signature.value !== "") {
-          pass(`${path}.thinking`, path, thinking);
-          pass(`${path}.signature`, path, signature);
-        } else if (thinking?.type === "string") found.lockedThinking.set(thinking, path);
+        // Only a signature shaped like a provider token counts; a short or prose one leaves its thinking locked.
+        if (add(`${path}.signature`, only(block, "signature"))) pass(`${path}.thinking`, path, thinking);
+        else if (thinking?.type === "string") found.lockedThinking.set(thinking, path);
       } else if (type === "redacted_thinking") add(`${path}.data`, only(block, "data"));
       else if (type === "server_tool_use" || type === "mcp_tool_use") add(`${path}.id`, only(block, "id"), PROTOCOL_ID);
       else if (type?.endsWith("_tool_result") && type !== "tool_result") {

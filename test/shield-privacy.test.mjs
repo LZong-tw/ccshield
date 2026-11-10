@@ -10,7 +10,7 @@ import { UNKNOWN_REASONS as ADAPTER_REASONS } from "../detectors/opf/opf-adapter
 import { OPF_OPEN_BUDGET_MS, OPF_STARTUP_TIMEOUT_MS, buildOpfWorkerArgs } from "../src/shield/opf-args.mjs";
 import { shieldPaths } from "../src/shield/paths.mjs";
 import { attestShieldCheckpoint } from "../src/shield/checkpoint.mjs";
-import { createPrivacyFilter, isVerifiedRedaction, privacyWorkerEnv, runPrivacyWorkerSelfTest } from "../src/shield/privacy.mjs";
+import { createPrivacyFilter, isVerifiedRedaction, privacyWorkerEnv, runPrivacyWorkerSelfTest, signedThinking } from "../src/shield/privacy.mjs";
 
 const sentinel = "privacy-raw-sentinel-must-not-escape";
 const provision = {
@@ -91,7 +91,7 @@ test("recent scans and the delivered result keep an allowlisted protocol-graph d
 });
 
 test("a signed-block detail and passthrough list carry only label and block location into diagnostics", async (t) => {
-  const thinking = (text) => ({ role: "assistant", content: [{ type: "thinking", thinking: text, signature: "EqQBsig" }] });
+  const thinking = (text) => ({ role: "assistant", content: [{ type: "thinking", thinking: text, signature: "EqQBCkYIBxgCKkBsig0123456789" }] });
   const signed = Buffer.from(JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text: "[EMAIL]" }] }, thinking(sentinel)] }));
   const replies = [
     { status: "unknown", reason: "signed-block-mutation", detail: "signed:email:1.0" },
@@ -1533,6 +1533,15 @@ test("runtime redaction proof lets a value survive only inside an unchanged prov
   const forged = body("Alice", signature, "user");
   assert.equal(isVerifiedRedaction({ original: forged, result: { ...result, redactedBody: body("[redacted:private_person]", signature, "user") } }), false,
     "a look-alike signature outside an assistant thinking block is ordinary text");
+});
+
+test("only thinking with a provider-shaped signature counts as signed, matching the OPF adapter", () => {
+  const body = (signature) => Buffer.from(JSON.stringify({ messages: [
+    { role: "assistant", content: [{ type: "thinking", thinking: "plan", signature }] },
+  ] }));
+  const opaque = "EqQBCkYIBxgCKkBsig0123456789";
+  assert.deepEqual(signedThinking(body(opaque)), [["0.0.thinking", "plan"], ["0.0.signature", opaque]]);
+  for (const signature of ["", "x", "Alice", "not a signature at all"]) assert.deepEqual(signedThinking(body(signature)), [], signature);
 });
 
 test("runtime redaction proof stays linear in the number of provider-signed fields", () => {

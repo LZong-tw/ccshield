@@ -662,15 +662,16 @@ function protectedValues(body) {
   return thinking && [...opaque, ...names, ...thinking];
 }
 
-// Assistant thinking with a non-empty signature, which the API checks against that signature and so must
-// arrive byte-identical; the OPF adapter leaves it untouched. A signature already listed as opaque is not repeated.
+// Assistant thinking whose signature is shaped like a provider token (the same OPAQUE_VALUE test as
+// opaqueValues), which the API checks against that signature and so must arrive byte-identical; the OPF
+// adapter leaves it untouched. A signature already listed as opaque is not repeated.
 export function signedThinking(body, opaquePaths = new Set()) {
   let root;
   try { root = JSON.parse(body.toString("utf8")); } catch { return null; }
   const entries = [];
   const each = (value, visit) => { if (Array.isArray(value)) value.forEach(visit); };
   each(root?.messages, (message, messageIndex) => each(message?.content, (block, blockIndex) => {
-    if (message?.role !== "assistant" || block?.type !== "thinking" || typeof block.signature !== "string" || block.signature === "") return;
+    if (message?.role !== "assistant" || block?.type !== "thinking" || typeof block.signature !== "string" || !OPAQUE_VALUE.test(block.signature)) return;
     const path = `${messageIndex}.${blockIndex}`;
     if (typeof block.thinking === "string") entries.push([`${path}.thinking`, block.thinking]);
     if (!opaquePaths.has(`${path}.signature`)) entries.push([`${path}.signature`, block.signature]);
