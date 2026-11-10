@@ -329,7 +329,11 @@ async function handleShieldRequest({ request, response, capability, controlCapab
     const failure = error?.shieldFailure;
     if (FAILURE_REASONS.get(failure?.stage)?.has(failure?.reason)) fail(failure.stage, failure.reason, inspection.bytes, { cause: failure.cause, queuedMs: failure.queuedMs, detail: failure.detail });
     else fail("evaluation", "evaluation_unavailable", inspection.bytes);
-    await finish(response, { status: 503, code: "shield_unavailable", retryAfterSeconds: validRetryAfter(failure ?? {}), message: failure?.stage === "image_scan" ? IMAGE_MESSAGES[failure.reason] : undefined });
+    if (failure?.stage === "privacy_scan" && REFUSED_PRIVACY_REASONS.has(failure.reason)) {
+      await finish(response, { status: 400, code: "shield_refused", type: "invalid_request_error", retry: false, message: refusalMessage(failure.reason) });
+    } else {
+      await finish(response, { status: 503, code: "shield_unavailable", retryAfterSeconds: validRetryAfter(failure ?? {}), message: failure?.stage === "image_scan" ? IMAGE_MESSAGES[failure.reason] : undefined });
+    }
     return;
   }
   const auditDecision = buildDecisionMetadata(decision, startedAt);
@@ -486,6 +490,22 @@ export function createShieldFailure(stage, reason, message, { retryAfterSeconds,
       ...(isGraphFailureDetail(detail) ? { detail } : {}),
     },
   });
+}
+
+// The adapter refuses these from the body and its cached prediction alone, so a retry of the same body fails the
+// same way. They answer 400 with x-should-retry: false: Claude Code's client retries 408, 409, 429 and 5xx only,
+// honours x-should-retry first, and 400 carries no status-only recovery path (422 can trigger its context-hint
+// fallback). Worker, model, timeout, asset and malformed-prediction failures stay 503: a restart can clear them.
+const REFUSED_PRIVACY_REASONS = new Set([
+  "signed-block-mutation", "protocol-control-mutation", "protocol-graph-mutation", "invalid-protocol-graph",
+  "protocol-id-collision", "protocol-id-limit", "conflicting-protocol-context", "json-key-collision", "invalid-json-topology",
+  "prediction-span-limit", "redaction-projection-limit", "redaction-match-limit", "redaction-body-limit",
+  "cross-field-span", "inconsistent-quoting", "unmapped-finding", "value-survived",
+]);
+
+// Shown by Claude Code as the error text. It names the reason only; where it tripped is in failures.jsonl.
+function refusalMessage(reason) {
+  return `Shield 拒絕送出此請求：隱私掃描無法在不改動受保護欄位的情況下完成遮蔽（${reason}）。同一內容重試結果相同，位置記錄於 ccshield failures.jsonl；如需略過可用 --no-shield 重新啟動。`;
 }
 
 // Only a full queue, a cooperative model or projected timeout (whose worker keeps warming the unscanned windows), or an
@@ -746,12 +766,13 @@ function waitForDrain(response, signal) {
   });
 }
 
-async function finish(response, { status, code, retryAfterSeconds, message }) {
+async function finish(response, { status, code, retryAfterSeconds, message, type = "api_error", retry }) {
   if (!response.headersSent) {
-    const body = Buffer.from(JSON.stringify(message === undefined ? { error: { code } } : { type: "error", error: { type: "api_error", code, message } }));
+    const body = Buffer.from(JSON.stringify(message === undefined ? { error: { code } } : { type: "error", error: { type, code, message } }));
     response.writeHead(status, {
       "content-type": "application/json", "content-length": String(body.byteLength),
       ...(retryAfterSeconds === undefined ? {} : { "retry-after": String(retryAfterSeconds) }),
+      ...(retry === undefined ? {} : { "x-should-retry": String(retry) }),
     });
     response.end(body);
   }

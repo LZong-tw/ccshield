@@ -17,6 +17,9 @@ const MAX_MATCH_HITS = 4 * MAX_PROOF_RANGES;
 // smaller bound and fall back to Buffer.indexOf without changing the survival check.
 const MAX_TRIE_UNITS = MAX_BODY_BYTES;
 const MAX_ORIGINAL_TRIE_BYTES = 256 * 1024;
+// Distinct label:block pairs reported for hits left in signed thinking; further pairs are not listed.
+const MAX_PASSTHROUGH_ENTRIES = 16;
+const SIGNED_DETAIL = /^signed:(?:[a-z_]+|-):\d{1,6}\.\d{1,6}$/;
 const MAX_PROOF_BATCH = 1024;
 const MAX_PROOF_ENTRIES = 128;
 const MAX_PROTOCOL_IDS = 4096;
@@ -205,14 +208,17 @@ export function adaptOpfPrediction(original, scan, result) {
       const first = firstSourceEndingAfter(scan.sources, span.start);
       const home = first < scan.sources.length && scan.sources[first].start <= span.start && span.end <= scan.sources[first].end ? first : -1;
       if (home >= 0 && pinned.has(canonical.sources[home].node)) continue;
-      kept += 1;
       let projected = false;
+      // A span wholly inside signed thinking still yields its fragment, so the same text elsewhere is redacted,
+      // but it does not have to be redacted itself.
+      let redactable = false;
       for (let index = first; index < scan.sources.length && scan.sources[index].start < span.end; index += 1) {
         const source = scan.sources[index];
         const start = Math.max(source.start, span.start);
         const end = Math.min(source.end, span.end);
         if (end <= start) continue;
         projected = true;
+        if (!canonical.opaque.passthrough.nodes.has(canonical.sources[index].node)) redactable = true;
         if (pinned.has(canonical.sources[index].node)) spannedPins.add(canonical.sources[index].node);
         const key = `${span.label}:${source.node.map[start - source.start].start}:${source.node.map[end - source.start - 1].end}`;
         if (projectedRanges.has(key)) continue;
@@ -222,6 +228,7 @@ export function adaptOpfPrediction(original, scan, result) {
         fragments.set(`${span.label}:${text}`, { label: span.label, text });
       }
       if (!projected) throw new Error("unmapped span");
+      if (redactable) kept += 1;
     }
     if (fragments.size && canonical.protocolIds.invalid) throw graphError("invalid protocol graph", canonical.protocolIds.invalid);
     if (fragments.size && canonical.protocolIds.overLimit) throw graphError("protocol id limit", "limit");
@@ -231,27 +238,43 @@ export function adaptOpfPrediction(original, scan, result) {
     // One pass finds the occurrences of every fragment; the replay below walks them fragment by fragment,
     // value by value, offset by offset, as a per-fragment search of every value would, without its
     // fragments x values cost on large bodies. Below MAX_MATCH_HITS that gives the same first failure and
-    // kept replacements. Past it, unsigned hits are dropped but each fragment's first signed hit is still
-    // kept, so a fragment that reaches a signed block fails as signed-block-mutation, as it would without
-    // the bound. The replay may then report a later failure, or the match limit, where the unbounded
-    // search would have failed first on a dropped hit.
+    // kept replacements. Past it, other hits are dropped but each fragment's first hit in unsigned thinking is
+    // still kept, so a fragment that reaches one fails as signed-block-mutation, as it would without the
+    // bound. The replay may then report a later failure, or the match limit, where the unbounded search would
+    // have failed first on a dropped hit. Hits in signed thinking are never replayed and never count.
     const decodedFragments = [...new Set([...fragments.values()].map(({ text }) => text))];
     const matcher = new FragmentMatcher(decodedFragments);
     const hits = decodedFragments.map(() => []);
-    // Later signed hits are never reached: the replay fails on the first.
-    const signedSeen = new Uint8Array(decodedFragments.length);
+    const labelsOf = decodedFragments.map(() => []);
+    const patternOf = new Map(decodedFragments.map((text, index) => [text, index]));
+    for (const { label, text } of fragments.values()) labelsOf[patternOf.get(text)].push(label);
+    // Later locked hits are never reached: the replay fails on the first.
+    const lockedSeen = new Uint8Array(decodedFragments.length);
+    const skipped = new Map();
     let hitCount = 0;
     let overflow = false;
     canonical.allValues.forEach((node, nodeIndex) => {
       // A finding in prose is not replayed into a pinned control no span touched: a tool named
       // mcp__alice__lookup keeps its name when Alice is found in user text.
       if (canonical.opaque.nodes.has(node) || pinned.has(node) && !spannedPins.has(node)) return;
-      const signed = canonical.opaque.signedText.has(node);
+      // The API rejects an edited signed block, so its hits are left in place and only counted.
+      const at = canonical.opaque.passthrough.nodes.get(node);
+      if (at !== undefined) {
+        matcher.scanWhole(node.value, (pattern) => {
+          for (const label of labelsOf[pattern]) {
+            const key = `${label}:${at}`;
+            if (skipped.has(key) || skipped.size < MAX_PASSTHROUGH_ENTRIES) skipped.set(key, (skipped.get(key) ?? 0) + 1);
+          }
+          return false;
+        });
+        return;
+      }
+      const locked = canonical.opaque.lockedThinking.has(node);
       // A hit that splits a surrogate pair is not an occurrence, so it never counts toward the bound.
       matcher.scanWhole(node.value, (pattern, end) => {
-        if (signed) {
-          if (signedSeen[pattern]) return false;
-          signedSeen[pattern] = 1;
+        if (locked) {
+          if (lockedSeen[pattern]) return false;
+          lockedSeen[pattern] = 1;
         } else if (hitCount >= MAX_MATCH_HITS) {
           overflow = true;
           return false;
@@ -260,13 +283,12 @@ export function adaptOpfPrediction(original, scan, result) {
         return false;
       });
     });
-    const patternOf = new Map(decodedFragments.map((text, index) => [text, index]));
     for (const fragment of fragments.values()) {
       const found = hits[patternOf.get(fragment.text)];
       for (let hit = 0; hit < found.length; hit += 2) {
         const node = canonical.allValues[found[hit]];
         const match = found[hit + 1];
-        if (canonical.opaque.signedText.has(node)) throw new Error("signed block mutation");
+        if (canonical.opaque.lockedThinking.has(node)) throw signedMutation(fragment.label, canonical.opaque.lockedThinking.get(node));
         if (!characterOffsets.has(node)) {
           const offsets = [];
           let codepoint = 0;
@@ -295,7 +317,11 @@ export function adaptOpfPrediction(original, scan, result) {
     if (overflow) throw new Error("redaction match limit");
     const replacements = [...replacementsByRange.values()].sort((a, b) => a.start - b.start || a.end - b.end);
     if (kept && !replacements.length) throw new Error("unmapped finding");
-    if (!replacements.length) return { status: "ok", findings: [] };
+    const passthrough = skipped.size ? { passthrough: [...skipped].map(([key, count]) => {
+      const [label, at] = key.split(":");
+      return { label, at, count };
+    }) } : {};
+    if (!replacements.length) return { status: "ok", findings: [], ...passthrough };
     const grouped = new Map();
     const ranges = [];
     for (const span of replacements) {
@@ -385,11 +411,13 @@ export function adaptOpfPrediction(original, scan, result) {
     // residual. The shape check above proved every control unchanged, and redaction rewrites values in place,
     // so the same index is the same node.
     const keptPins = new Set(canonical.allValues.flatMap((node, index) => pinned.has(node) && !spannedPins.has(node) ? [candidate.allValues[index]] : []));
-    const keptRanges = [...candidate.opaque.entries.map(({ node }) => node), ...keptPins].filter((node) => node.map.length > 0)
+    // Signed thinking travels byte-identical (validateOpaqueValues proved it), so a value it repeats is not a residual.
+    const passed = [...candidate.opaque.passthrough.nodes.keys()];
+    const keptRanges = [...candidate.opaque.entries.map(({ node }) => node), ...keptPins, ...passed].filter((node) => node.map.length > 0)
       .map((node) => node.type === "string" ? { start: node.map[0].start - 1, end: node.map.at(-1).end + 1 }
         : { start: node.map[0].start, end: node.map.at(-1).end });
     if (originalMatcher.includesOutside(redacted, keptRanges)) throw new Error("value survived");
-    if (hasDecodedResidual(candidate.root, matcher, new Set([...candidate.opaque.nodes, ...keptPins]))) throw new Error("value survived");
+    if (hasDecodedResidual(candidate.root, matcher, new Set([...candidate.opaque.nodes, ...keptPins, ...passed]))) throw new Error("value survived");
     const redactions = [];
     let proofCount = 0;
     for (const [label, spans] of grouped) {
@@ -402,12 +430,13 @@ export function adaptOpfPrediction(original, scan, result) {
       }
     }
     const findings = redactions.map(({ label, count }) => ({ label, count }));
-    return { status: "ok", findings, redactions, redactedBody: redacted.toString("base64") };
+    return { status: "ok", findings, redactions, redactedBody: redacted.toString("base64"), ...passthrough };
   } catch (error) {
     const reason = error instanceof Error && !(error instanceof SyntaxError)
       ? UNKNOWN_REASONS.get(error.message) ?? "adapter-error" : "adapter-error";
     const detail = reason === "adapter-error" ? undefined : error.graphDefect;
-    return GRAPH_DEFECTS.has(detail) || /^control:[a-z_]+:[a-z_]+:[a-z_-]+$/.test(detail ?? "") ? { status: "unknown", findings: [], reason, detail } : { status: "unknown", findings: [], reason };
+    return GRAPH_DEFECTS.has(detail) || /^control:[a-z_]+:[a-z_]+:[a-z_-]+$/.test(detail ?? "") || SIGNED_DETAIL.test(detail ?? "")
+      ? { status: "unknown", findings: [], reason, detail } : { status: "unknown", findings: [], reason };
   }
 }
 
@@ -558,7 +587,10 @@ function hasDecodedResidual(node, matcher, opaque) {
 // Provider-issued values the API verifies byte for byte. Only these exact structural paths qualify, and a
 // duplicated key anywhere on the path disqualifies it, so a look-alike field elsewhere is still scanned.
 function collectOpaqueValues(root) {
-  const found = { entries: [], nodes: new Set(), signedText: new Set() };
+  // passthrough: signed thinking text (and a signature too short to be opaque) the API verifies against its
+  // signature; it is scanned for diagnostics but never rewritten. lockedThinking: thinking with no signature,
+  // which nothing upstream vouches for, so a finding in it still fails closed.
+  const found = { entries: [], nodes: new Set(), lockedThinking: new Map(), passthrough: { entries: [], nodes: new Map() } };
   const only = (node, name) => {
     if (node?.type !== "object") return undefined;
     const matches = node.children.filter(({ key }) => key === name);
@@ -570,6 +602,11 @@ function collectOpaqueValues(root) {
     found.entries.push({ path, node });
     found.nodes.add(node);
     return true;
+  };
+  const pass = (path, at, node) => {
+    if (node?.type !== "string" || found.nodes.has(node)) return;
+    found.passthrough.entries.push({ path, node });
+    found.passthrough.nodes.set(node, at);
   };
   const base64Source = (block, path) => {
     const source = only(block, "source");
@@ -587,9 +624,13 @@ function collectOpaqueValues(root) {
       if (role === "user" && type === "tool_result") each(only(block, "content"), (nested, index) => base64Source(nested, `${path}.content.${index}`));
       if (role !== "assistant") return;
       if (type === "thinking") {
-        add(`${path}.signature`, only(block, "signature"));
+        const signature = only(block, "signature");
+        add(`${path}.signature`, signature);
         const thinking = only(block, "thinking");
-        if (thinking?.type === "string") found.signedText.add(thinking);
+        if (signature?.type === "string" && signature.value !== "") {
+          pass(`${path}.thinking`, path, thinking);
+          pass(`${path}.signature`, path, signature);
+        } else if (thinking?.type === "string") found.lockedThinking.set(thinking, path);
       } else if (type === "redacted_thinking") add(`${path}.data`, only(block, "data"));
       else if (type === "server_tool_use" || type === "mcp_tool_use") add(`${path}.id`, only(block, "id"), PROTOCOL_ID);
       else if (type?.endsWith("_tool_result") && type !== "tool_result") {
@@ -606,10 +647,20 @@ function collectOpaqueValues(root) {
 }
 
 function validateOpaqueValues(before, after) {
-  if (before.entries.length !== after.entries.length) throw new Error("signed block mutation");
-  for (const [index, { path, node }] of before.entries.entries()) {
-    if (after.entries[index].path !== path || after.entries[index].node.value !== node.value) throw new Error("signed block mutation");
-  }
+  const compare = (was, now) => {
+    for (let index = 0; index < Math.max(was.length, now.length); index += 1) {
+      if (was[index]?.path !== now[index]?.path || was[index]?.node.value !== now[index]?.node.value) {
+        throw signedMutation("-", (was[index] ?? now[index]).path.split(".", 2).join("."));
+      }
+    }
+  };
+  compare(before.entries, after.entries);
+  compare(before.passthrough.entries, after.passthrough.entries);
+}
+
+// Names where the signed-block rule tripped as label:messageIndex.blockIndex; never any text.
+function signedMutation(label, at) {
+  return graphError("signed block mutation", `signed:${label}:${at}`);
 }
 
 function validateSourceProvenance(scan, canonical) {

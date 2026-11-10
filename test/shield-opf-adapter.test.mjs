@@ -110,13 +110,94 @@ test("OPF look-alike opaque fields outside their exact protocol paths are still 
   assert.equal(prepareOpfScan(duplicated).text.includes("Alice"), true, "a duplicated key disqualifies the exemption");
 });
 
-test("OPF readable thinking text with a detected value fails closed as a signed block", () => {
+test("OPF signed thinking text travels byte-identical while the same value elsewhere is redacted", () => {
   const fixture = opaqueConversation();
   fixture.messages[1].content[0].thinking = "Alice asked for the forecast";
   const original = Buffer.from(JSON.stringify(fixture));
   const scan = prepareOpfScan(original);
-  assert.deepEqual(adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice")),
-    { status: "unknown", findings: [], reason: "signed-block-mutation" });
+  assert.equal(scan.text.includes("Alice asked"), true, "signed thinking is still scanned");
+  const result = adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice"));
+  assert.deepEqual(result.passthrough, [{ label: "private_person", at: "1.0", count: 1 }]);
+  const body = verifiedResult(original, result);
+  assert.equal(body.messages[0].content[0].text, "Contact [redacted:private_person] today");
+  assert.deepEqual(body.messages[1], fixture.messages[1], "the signed block and every opaque value are unchanged");
+  assert.equal(Buffer.from(result.redactedBody, "base64").includes(Buffer.from('"thinking":"Alice asked for the forecast","signature"')), true);
+});
+
+test("OPF a finding only in signed thinking is left in place and reported by label and block, never text", () => {
+  const signature = `${OPAQUE}sig`;
+  const fixture = { model: "claude-fixture", messages: [
+    { role: "user", content: [{ type: "text", text: "hi" }] },
+    { role: "assistant", content: [{ type: "text", text: "ok" }, { type: "thinking", thinking: "Alice and Alice again", signature }] },
+  ] };
+  const original = Buffer.from(JSON.stringify(fixture));
+  const scan = prepareOpfScan(original);
+  const result = adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice"));
+  assert.deepEqual(result, { status: "ok", findings: [], passthrough: [{ label: "private_person", at: "1.1", count: 2 }] });
+  assert.doesNotMatch(JSON.stringify(result), /Alice/);
+});
+
+test("OPF a span homed in signed thinking still redacts the same text in unsigned content", () => {
+  const fixture = { model: "claude-fixture", messages: [
+    { role: "assistant", content: [{ type: "thinking", thinking: "Alice asked", signature: `${OPAQUE}sig` }] },
+    { role: "user", content: [{ type: "text", text: "from Alice" }] },
+  ] };
+  const original = Buffer.from(JSON.stringify(fixture));
+  const scan = prepareOpfScan(original);
+  // The model reports the occurrence inside the thinking text only.
+  const result = adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice"));
+  assert.deepEqual(result.findings, [{ label: "private_person", count: 1 }]);
+  assert.deepEqual(result.passthrough, [{ label: "private_person", at: "0.0", count: 1 }]);
+  const body = verifiedResult(original, result);
+  assert.equal(body.messages[1].content[0].text, "from [redacted:private_person]");
+  assert.deepEqual(body.messages[0], fixture.messages[0]);
+});
+
+test("OPF a short non-empty signature still marks its thinking signed and stays byte-identical", () => {
+  const fixture = { model: "claude-fixture", messages: [
+    { role: "user", content: [{ type: "text", text: "Alice" }] },
+    { role: "assistant", content: [{ type: "thinking", thinking: "plan", signature: "Alice" }] },
+  ] };
+  const original = Buffer.from(JSON.stringify(fixture));
+  const scan = prepareOpfScan(original);
+  const result = adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice"));
+  assert.deepEqual(result.passthrough, [{ label: "private_person", at: "1.0", count: 1 }]);
+  const body = verifiedResult(original, result);
+  assert.equal(body.messages[0].content[0].text, "[redacted:private_person]");
+  assert.deepEqual(body.messages[1], fixture.messages[1]);
+});
+
+test("OPF passthrough diagnostics list at most 16 label and block pairs", () => {
+  const signature = `${OPAQUE}sig`;
+  const fixture = { model: "claude-fixture", messages: [
+    { role: "user", content: [{ type: "text", text: "hi" }] },
+    { role: "assistant", content: Array.from({ length: 20 }, () => ({ type: "thinking", thinking: "Alice", signature })) },
+  ] };
+  const original = Buffer.from(JSON.stringify(fixture));
+  const scan = prepareOpfScan(original);
+  const result = adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice"));
+  assert.equal(result.status, "ok");
+  assert.deepEqual(result.passthrough, Array.from({ length: 16 }, (_, index) => ({ label: "private_person", at: `1.${index}`, count: 1 })));
+});
+
+test("OPF thinking without a usable signature still fails closed and names the block", () => {
+  for (const block of [{ type: "thinking", thinking: "Alice asked" }, { type: "thinking", thinking: "Alice asked", signature: "" },
+    { type: "thinking", thinking: "Alice asked", signature: null }]) {
+    const original = Buffer.from(JSON.stringify({ model: "claude-fixture", messages: [
+      { role: "user", content: [{ type: "text", text: "Contact Alice" }] }, { role: "assistant", content: [{ type: "text", text: "ok" }, block] }] }));
+    const scan = prepareOpfScan(original);
+    assert.deepEqual(adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice")),
+      { status: "unknown", findings: [], reason: "signed-block-mutation", detail: "signed:private_person:1.1" }, JSON.stringify(block));
+  }
+});
+
+test("OPF a span rewriting the type of a signed block fails as a signed mutation located at that block", () => {
+  const original = Buffer.from(JSON.stringify({ model: "claude-fixture", messages: [
+    { role: "assistant", content: [{ type: "text", text: "Alice" }, { type: "thinking", thinking: "plan", signature: `${OPAQUE}sig` }] }] }));
+  const scan = prepareOpfScan(original);
+  const result = adaptOpfPrediction(original, scan, prediction(scan.text, "private_person", "Alice\ntype\nthinking"));
+  assert.equal(result.status, "unknown");
+  assert.deepEqual(result, { status: "unknown", findings: [], reason: "signed-block-mutation", detail: "signed:-:0.1" });
 });
 
 test("OPF account findings preserve legal paired Messages IDs and accepted privacy evidence", () => {
@@ -752,7 +833,7 @@ test("OPF spans crossing a control value boundary, malformed controls and thinki
     [base, "fixture\nmessages", "protocol-control-mutation"],
     [base, "user\ncontent\nAlice", "protocol-control-mutation"],
     [{ ...base, max_tokens: "4096" }, "4096", "protocol-control-mutation"],
-    [{ ...base, messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "Alice planned", signature: "opaque" }] }] },
+    [{ ...base, messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "Alice planned", signature: "" }] }] },
       "Alice", "signed-block-mutation"],
   ]) {
     const original = Buffer.from(JSON.stringify(fixture));
@@ -762,11 +843,11 @@ test("OPF spans crossing a control value boundary, malformed controls and thinki
   }
   // A dropped selector span must not mask the signed-block failure of another span.
   const original = Buffer.from(JSON.stringify({ ...base,
-    messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "Alice planned", signature: "opaque" }] }] }));
+    messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "Alice planned", signature: "" }] }] }));
   const scan = prepareOpfScan(original);
   assert.deepEqual(adaptOpfPrediction(original, scan, multiplePredictions(scan.text,
     [["private_person", "claude-fixture"], ["private_person", "Alice"]])),
-  { status: "unknown", findings: [], reason: "signed-block-mutation" });
+  { status: "unknown", findings: [], reason: "signed-block-mutation", detail: "signed:private_person:0.0" });
 });
 
 test("OPF known scalar and nested control knobs remain protocol controls in their own contexts", () => {
@@ -786,7 +867,7 @@ test("OPF known scalar and nested control knobs remain protocol controls in thei
     [{ ...base, tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 918273 }] }, "918273", dropped],
     [{ ...base, tools: [{ name: "inspect", input_schema: { type: "object" }, cache_control: { type: "ephemeral" } }] }, "ephemeral", dropped],
     [{ ...base, context_management: { edits: [{ type: "clear_tool_uses_20250919", trigger: { type: "input_tokens", value: 918273 } }] } }, "918273", locked()],
-    [{ ...base, messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "Alice", signature: "opaque" }] }] }, "Alice", locked("signed-block-mutation")],
+    [{ ...base, messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "Alice" }] }] }, "Alice", locked("signed-block-mutation")],
     [{ ...base, messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "QUJDRA==" } }] }] }, "base64", locked()],
   ];
   for (const [fixture, selected, expected] of cases) {
@@ -1131,9 +1212,9 @@ test("OPF span limit counts UTF-16 units, the unit the fragment matcher is bound
   assert.equal(UNKNOWN_REASONS.get("matcher pattern limit"), "prediction-span-limit");
 });
 
-function signedThenUserPrediction(thinking, userText, values) {
+function signedThenUserPrediction(thinking, userText, values, signature = `${OPAQUE}sig`) {
   const original = Buffer.from(JSON.stringify({ model: "claude-fixture", messages: [
-    { role: "assistant", content: [{ type: "thinking", thinking, signature: `${OPAQUE}sig` }] },
+    { role: "assistant", content: [{ type: "thinking", thinking, ...(signature === null ? {} : { signature }) }] },
     { role: "user", content: [{ type: "text", text: userText }] },
   ] }));
   const scan = prepareOpfScan(original);
@@ -1146,10 +1227,19 @@ function signedThenUserPrediction(thinking, userText, values) {
     detected_spans: spans });
 }
 
-test("OPF a fragment reaching a signed block fails as signed-block mutation even past the match-hit bound", () => {
-  // 40k user-text hits exceed the scan's hit bound, but the fragment's first value is signed thinking.
+test("OPF a fragment reaching unsigned thinking fails as signed-block mutation even past the match-hit bound", () => {
+  // 40k user-text hits exceed the scan's hit bound, but the fragment's first value is unsigned thinking.
+  assert.deepEqual(signedThenUserPrediction("Alice asked", "Alice ".repeat(40_000), ["Alice"], null),
+    { status: "unknown", findings: [], reason: "signed-block-mutation", detail: "signed:private_person:0.0" });
+});
+
+test("OPF hits left in signed thinking never count toward the match-hit bound", () => {
+  // Signed thinking is not replayed, so only the 40k user-text hits count and they alone exceed the bound.
   assert.deepEqual(signedThenUserPrediction("Alice asked", "Alice ".repeat(40_000), ["Alice"]),
-    { status: "unknown", findings: [], reason: "signed-block-mutation" });
+    { status: "unknown", findings: [], reason: "redaction-match-limit" });
+  const result = signedThenUserPrediction("Alice asked", "Alice ".repeat(3), ["Alice"]);
+  assert.deepEqual(result.findings, [{ label: "private_person", count: 3 }]);
+  assert.deepEqual(result.passthrough, [{ label: "private_person", at: "0.0", count: 1 }]);
 });
 
 test("OPF an earlier fragment's range limit wins over a later fragment's signed-block hit", () => {

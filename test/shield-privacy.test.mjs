@@ -90,6 +90,43 @@ test("recent scans and the delivered result keep an allowlisted protocol-graph d
   assert.doesNotMatch(JSON.stringify(filter.recentScans()), new RegExp(sentinel));
 });
 
+test("a signed-block detail and passthrough list carry only label and block location into diagnostics", async (t) => {
+  const thinking = (text) => ({ role: "assistant", content: [{ type: "thinking", thinking: text, signature: "EqQBsig" }] });
+  const signed = Buffer.from(JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text: "[EMAIL]" }] }, thinking(sentinel)] }));
+  const replies = [
+    { status: "unknown", reason: "signed-block-mutation", detail: "signed:email:1.0" },
+    { status: "unknown", reason: "signed-block-mutation", detail: `signed:${sentinel}:1.0` },
+    { status: "ok", findings: [{ label: "email", count: 1 }], redactions: [{ label: "email", count: 1, spans: [{ start: 41, end: 48 }] }],
+      redactedBody: signed.toString("base64"), passthrough: [{ label: "email", at: "1.0", count: 2 }] },
+    { status: "ok", findings: [], passthrough: [{ label: "email", at: sentinel, count: 1 }] },
+    { status: "ok", findings: [], passthrough: [{ label: "email", at: "1.0", count: 1, text: sentinel }] },
+  ];
+  let next = 0;
+  const worker = fakeWorker((message, emit) => {
+    if (message.type === "health") emit({ ...health(message), capabilities: ["cooperative-timeout"] });
+    if (message.type === "scan") emit({ type: "scan", id: message.id, ...replies[next++] });
+  });
+  const filter = await createPrivacyFilter({ provision, spawnWorker: () => worker, validateWorker });
+  t.after(() => filter.close());
+  const bodies = [Buffer.from('{"n":0}'), Buffer.from('{"n":1}'),
+    Buffer.from(JSON.stringify({ messages: [{ role: "user", content: [{ type: "text", text: "a@b.example" }] }, thinking(sentinel)] })),
+    Buffer.from('{"n":3}'), Buffer.from('{"n":4}')];
+  const results = [];
+  for (const body of bodies) results.push(await filter.scan(body));
+  assert.equal(results[0].detail, "signed:email:1.0");
+  assert.equal(results[1].detail, undefined);
+  assert.equal(results[2].status, "ok", "signed thinking may keep a value the model found");
+  assert.deepEqual(results[2].passthrough, [{ label: "email", at: "1.0", count: 2 }]);
+  assert.equal(results[2].redactedBody.includes(Buffer.from(sentinel)), true);
+  assert.equal("passthrough" in results[3], false);
+  assert.equal("passthrough" in results[4], false);
+  const recent = filter.recentScans();
+  assert.deepEqual(recent.map((scan) => scan.detail ?? null), ["signed:email:1.0", null, null, null, null]);
+  assert.deepEqual(recent[2].passthrough, [{ label: "email", at: "1.0", count: 2 }]);
+  assert.equal(recent.filter((scan) => "passthrough" in scan).length, 1);
+  assert.doesNotMatch(JSON.stringify(recent), new RegExp(sentinel));
+});
+
 test("recent scans keep only bounded window cache counts, status and allowlisted reasons", async (t) => {
   const replies = [
     { status: "ok", findings: [], cache: { hits: 3, misses: 1 } },

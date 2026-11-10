@@ -113,6 +113,11 @@ test("diagnostics include cumulative scan totals only when a totals source is co
 // that the proxy's failure allowlist misses fails here instead of degrading to privacy_unavailable.
 const PRIVACY_REASONS = [...new Set([...ADAPTER_REASONS.values(), "adapter-error", "model_timeout", "projected_timeout", "model_error", "model_killed",
   "redaction-too-large", "redaction-frame-limit", "segment-coverage", "segment-cache-invalid"])];
+// Refusals decided by the body and its cached prediction alone; a retry fails the same way, so they must not be 503.
+const REFUSED_REASONS = new Set(["signed-block-mutation", "protocol-control-mutation", "protocol-graph-mutation", "invalid-protocol-graph",
+  "protocol-id-collision", "protocol-id-limit", "conflicting-protocol-context", "json-key-collision", "invalid-json-topology",
+  "prediction-span-limit", "redaction-projection-limit", "redaction-match-limit", "redaction-body-limit",
+  "cross-field-span", "inconsistent-quoting", "unmapped-finding", "value-survived"]);
 
 test("diagnostics separate real daemon scan, policy and redaction failures while readiness remains healthy", async (t) => {
   let upstreamCalls = 0;
@@ -163,8 +168,19 @@ test("diagnostics separate real daemon scan, policy and redaction failures while
   ]) {
     mode = nextMode;
     const response = await fetch(`${daemon.shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield": CAPABILITY }, body: '{"private":"body-secret"}' });
-    assert.equal(response.status, 503, mode);
-    assert.deepEqual(await response.json(), { error: { code: "shield_unavailable" } });
+    const refused = stage === "privacy_scan" && REFUSED_REASONS.has(reason);
+    assert.equal(response.status, refused ? 400 : 503, mode);
+    assert.equal(response.headers.get("x-should-retry"), refused ? "false" : null, mode);
+    if (refused) {
+      assert.equal(response.headers.get("retry-after"), null, mode);
+      const { type, error } = await response.json();
+      assert.equal(type, "error");
+      assert.equal(error.type, "invalid_request_error");
+      assert.equal(error.code, "shield_refused");
+      assert.equal(error.message.includes(`（${reason}）`), true, mode);
+      // Claude Code treats a 400 naming a thinking block or signature as its own strip-and-retry case.
+      assert.doesNotMatch(error.message, /thinking|signature|cannot be modified|anthropic-beta|prompt is too long/i);
+    } else assert.deepEqual(await response.json(), { error: { code: "shield_unavailable" } });
     const latest = (await readDiagnostics(daemon.shield)).failures.at(-1);
     assert.equal(latest.stage, stage, mode); assert.equal(latest.reason, reason, mode);
     assert.equal(latest.bytes, 25);

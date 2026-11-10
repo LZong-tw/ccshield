@@ -135,7 +135,7 @@ test("a protocol-graph refusal reaches the log with its structural detail, and f
   t.after(() => shield.close());
   for (const _ of scans) {
     const response = await fetch(`${shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield": "c".repeat(32) }, body: "{}" });
-    assert.equal(response.status, 503);
+    assert.equal(response.status, 400);
     await response.arrayBuffer();
   }
   const [logged, forged] = await readFailureLog(path);
@@ -143,6 +143,39 @@ test("a protocol-graph refusal reaches the log with its structural detail, and f
   assert.equal(logged.detail, "control:value:schema:enum");
   assert.equal("detail" in forged, false);
   assert.doesNotMatch(await readFile(path, "utf8"), /Alice/);
+});
+
+test("a signed-block refusal answers 400 without retry and logs only its label and block location", async (t) => {
+  const path = join(await tempDir(t), "failures.jsonl");
+  const log = createFailureLog({ path });
+  const scans = [
+    { status: "unknown", findings: [], reason: "signed-block-mutation", detail: "signed:private_person:3.1", queuedMs: 0 },
+    { status: "unknown", findings: [], reason: "signed-block-mutation", detail: "signed:-:12.0", queuedMs: 0 },
+    { status: "unknown", findings: [], reason: "signed-block-mutation", detail: "signed:Alice Smith:3.1", queuedMs: 0 },
+    { status: "unknown", findings: [], reason: "signed-block-mutation", detail: "signed:private_person:3.1.thinking", queuedMs: 0 },
+  ];
+  let next = 0;
+  const shield = await startShieldProxy({
+    capability: "c".repeat(32), controlCapability: "d".repeat(32), targetOrigin: "http://127.0.0.1:9",
+    decide: async () => { const scan = scans[next++]; throw createShieldFailure("privacy_scan", scan.reason, "shield privacy worker unavailable", scan); },
+    onFailure: (entry) => log.append(entry),
+  });
+  t.after(() => shield.close());
+  for (const _ of scans) {
+    const response = await fetch(`${shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield": "c".repeat(32) }, body: "{}" });
+    assert.equal(response.status, 400);
+    assert.equal(response.headers.get("x-should-retry"), "false");
+    assert.equal(response.headers.get("retry-after"), null);
+    assert.match((await response.json()).error.message, /signed-block-mutation/);
+  }
+  const logged = await readFailureLog(path);
+  assert.deepEqual(logged.map((entry) => [entry.reason, entry.detail]), [
+    ["signed-block-mutation", "signed:private_person:3.1"],
+    ["signed-block-mutation", "signed:-:12.0"],
+    ["signed-block-mutation", undefined],
+    ["signed-block-mutation", undefined],
+  ]);
+  assert.doesNotMatch(await readFile(path, "utf8"), /Alice|thinking/);
 });
 
 test("the diagnostics ring and the persisted log share ts and launch for one failure", async (t) => {

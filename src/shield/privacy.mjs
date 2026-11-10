@@ -7,7 +7,7 @@ import { envNamesFor, readEnv } from "../compat-env.mjs";
 import { attestShieldCheckpoint } from "./checkpoint.mjs";
 import { OPF_MAX_SCAN_TIMEOUT_MS, OPF_OPEN_BUDGET_MS, isValidOpfWorkerArgs } from "./opf-args.mjs";
 import { laneWindowCachePath } from "./paths.mjs";
-import { isGraphFailureDetail, PRIVACY_PROTOCOL as PROTOCOL } from "./protocol.mjs";
+import { BLOCK_LOCATION, isGraphFailureDetail, PRIVACY_PROTOCOL as PROTOCOL } from "./protocol.mjs";
 const MAX_BODY_BYTES = 1_048_576;
 const MAX_FRAME_BYTES = 4 * 1_048_576; // base64 redacted body (≤1 MiB → ~1.4 MiB) plus findings must fit
 const DEFAULT_TIMEOUT_MS = 2_000;
@@ -24,7 +24,10 @@ const MAX_TOTAL = 4_294_967_295;
 // A fixed key set keeps the diagnostics payload bounded; everything else lands in "other".
 const TOTAL_FAILURE_REASONS = ["admission_limit", "queue_timeout", "scan_timeout", "model_timeout", "projected_timeout", "model_error", "model_killed", "worker_unavailable"];
 const REQUEST_FAILURE = Symbol("privacy request failure");
-const GRAPH_REASONS = new Set(["invalid-protocol-graph", "protocol-id-limit", "protocol-control-mutation"]);
+const GRAPH_REASONS = new Set(["invalid-protocol-graph", "protocol-id-limit", "protocol-control-mutation", "signed-block-mutation"]);
+// The adapter lists at most 16 label:block pairs left in signed thinking; diagnostics keep the first few.
+const MAX_PASSTHROUGH_ENTRIES = 16;
+const RECENT_PASSTHROUGH_ENTRIES = 4;
 const ADAPTER_UNKNOWN_REASONS = new Set([
   "invalid-prediction", "prediction-span-limit", "inconsistent-counts", "invalid-span", "unmapped-span", "cross-field-span",
   "inconsistent-quoting", "unmapped-finding", "redaction-too-large", "value-survived",
@@ -335,7 +338,7 @@ export async function createPrivacyFilter({ provision, paths, spawnWorker = defa
       if (own && cache) for (const name of DISK_COUNTS) if (cache[name] !== undefined) totals[name] = Math.min(MAX_TOTAL, totals[name] + cache[name]);
       recordScan(recent, {
         status: entry.outcome.status, reason: entry.outcome.reason ?? null, cache: own ? cache : null, segments: own ? segments : null,
-        detail: own ? detail : null, attached: entry.attached, elapsedMs: Date.now() - dispatchedAt, queuedMs: dispatchedAt - entry.admittedAt,
+        detail: own ? detail : null, passthrough: own ? result.passthrough ?? null : null, attached: entry.attached, elapsedMs: Date.now() - dispatchedAt, queuedMs: dispatchedAt - entry.admittedAt,
       });
       if (active === entry) active = null;
       void drain();
@@ -512,11 +515,12 @@ function ownCopy(result) {
   return Object.freeze({ ...result, ...(Buffer.isBuffer(result.redactedBody) ? { redactedBody: Buffer.from(result.redactedBody) } : {}) });
 }
 
-function recordScan(recent, { status, reason, cache, segments, detail, attached, elapsedMs, queuedMs }) {
+function recordScan(recent, { status, reason, cache, segments, detail, passthrough, attached, elapsedMs, queuedMs }) {
   const boundedMs = (value) => Math.min(3_600_000, Math.max(0, Math.floor(value)));
   // elapsedMs is worker time from dispatch; queuedMs is the wait from admission to dispatch.
   recent.push({
-    status, reason, ...(detail ? { detail } : {}), hits: cache?.hits ?? null, misses: cache?.misses ?? null, diskHits: cache?.diskHits ?? null,
+    status, reason, ...(detail ? { detail } : {}),
+    ...(passthrough ? { passthrough: passthrough.slice(0, RECENT_PASSTHROUGH_ENTRIES).map((entry) => ({ ...entry })) } : {}), hits: cache?.hits ?? null, misses: cache?.misses ?? null, diskHits: cache?.diskHits ?? null,
     segmentHits: segments?.hits ?? null, segmentMisses: segments?.misses ?? null,
     attached: Math.min(MAX_ATTACHED_WAITERS, attached), elapsedMs: boundedMs(elapsedMs), queuedMs: boundedMs(queuedMs),
   });
@@ -540,6 +544,9 @@ function normalizeScanReply(reply) {
     findings.push(Object.freeze({ label: finding.label, count: finding.count }));
   }
   const result = { status: "ok", findings: Object.freeze(findings) };
+  // Diagnostics only: a malformed list is dropped rather than failing a scan that is otherwise ok.
+  const passthrough = normalizePassthrough(reply.passthrough);
+  if (passthrough) result.passthrough = passthrough;
   if (reply.redactions !== undefined) {
     const redactions = normalizeRedactions(reply.redactions);
     if (redactions === null) return unavailable("redaction_invalid");
@@ -551,6 +558,17 @@ function normalizeScanReply(reply) {
     result.redactedBody = redactedBody;
   }
   return Object.freeze(result);
+}
+
+function normalizePassthrough(value) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_PASSTHROUGH_ENTRIES) return null;
+  const entries = [];
+  for (const entry of value) {
+    if (!isPlainObject(entry) || Object.keys(entry).length !== 3 || !KNOWN_LABELS.has(entry.label) || typeof entry.at !== "string" || !BLOCK_LOCATION.test(entry.at)
+      || !Number.isInteger(entry.count) || entry.count < 1 || entry.count > MAX_BODY_BYTES) return null;
+    entries.push(Object.freeze({ label: entry.label, at: entry.at, count: entry.count }));
+  }
+  return Object.freeze(entries);
 }
 
 function normalizeRedactions(value) {
@@ -584,11 +602,14 @@ export function isVerifiedRedaction({ original, result } = {}) {
   const after = protectedValues(result.redactedBody);
   if (!before || !after || before.length !== after.length
     || before.some(([path, value], index) => after[index][0] !== path || after[index][1] !== value)) return false;
-  // Provider-signed values travel unscanned and control names must reach the API unchanged, so an original
-  // value may survive only inside one of them. Each protected entry hides one literal, never every literal
-  // equal to it: a prose block that merely repeats a tool name is still checked.
+  // Provider-signed values travel unscanned, signed thinking and control names must reach the API unchanged,
+  // so an original value may survive only inside one of them. Each protected entry hides one literal, never
+  // every literal equal to it: a prose block that merely repeats a tool name is still checked.
   const tokens = new Map();
-  for (const token of after.map(([, value]) => JSON.stringify(value))) tokens.set(token, (tokens.get(token) ?? 0) + 1);
+  for (const [, value] of after) {
+    const token = Buffer.from(JSON.stringify(value)).toString("latin1");
+    tokens.set(token, (tokens.get(token) ?? 0) + 1);
+  }
   const visible = withoutTokens(result.redactedBody, tokens);
   const counts = new Map();
   for (const redaction of result.redactions) {
@@ -637,7 +658,24 @@ export function opaqueValues(body) {
 function protectedValues(body) {
   const opaque = opaqueValues(body);
   const names = opaque && controlNames(body);
-  return names && [...opaque, ...names];
+  const thinking = names && signedThinking(body, new Set(opaque.map(([path]) => path)));
+  return thinking && [...opaque, ...names, ...thinking];
+}
+
+// Assistant thinking with a non-empty signature, which the API checks against that signature and so must
+// arrive byte-identical; the OPF adapter leaves it untouched. A signature already listed as opaque is not repeated.
+export function signedThinking(body, opaquePaths = new Set()) {
+  let root;
+  try { root = JSON.parse(body.toString("utf8")); } catch { return null; }
+  const entries = [];
+  const each = (value, visit) => { if (Array.isArray(value)) value.forEach(visit); };
+  each(root?.messages, (message, messageIndex) => each(message?.content, (block, blockIndex) => {
+    if (message?.role !== "assistant" || block?.type !== "thinking" || typeof block.signature !== "string" || block.signature === "") return;
+    const path = `${messageIndex}.${blockIndex}`;
+    if (typeof block.thinking === "string") entries.push([`${path}.thinking`, block.thinking]);
+    if (!opaquePaths.has(`${path}.signature`)) entries.push([`${path}.signature`, block.signature]);
+  }));
+  return entries;
 }
 
 // Names the API resolves against each other (a tool definition, the tool_choice and tool_use blocks naming it)
@@ -659,7 +697,8 @@ export function controlNames(body) {
 
 // One pass over the body's string literals: a body with thousands of opaque entries must not stall the event loop.
 // tokens maps each literal to how many occurrences to drop; occurrences past that count stay visible.
-// Tokens are ASCII JSON literals, so a latin1 view compares them exactly; a match nested in an escaped quote never counts.
+// Tokens are the UTF-8 bytes of JSON.stringify(value) read as latin1, so a latin1 view of the body compares them
+// exactly; a literal escaped differently stays visible (fail closed), and a match nested in an escaped quote never counts.
 function withoutTokens(body, tokens) {
   const pieces = [];
   let from = 0;
