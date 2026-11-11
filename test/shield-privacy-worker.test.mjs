@@ -94,6 +94,55 @@ test("regex-v1 leaves coding-session lookalikes alone", () => {
   }
 });
 
+test("regex-v1 redacts Taiwan mobile numbers in every written form", () => {
+  for (const number of ["0912-345-678", "0912345678", "0912 345 678", "+886 912-345-678", "+886912345678", "+886 912345678", "+886-912-345-678"]) {
+    const { findings, text } = redactedText(`call ${number} now`);
+    assert.deepEqual(findings, [{ label: "phone", count: 1 }], number);
+    assert.equal(text, "call [redacted:phone] now", number);
+  }
+  assert.equal(redactedText("手機0912345678。").text, "手機[redacted:phone]。");
+  for (const input of ["0912345678 0987654321", "0912-345-678, 0987-654-321", "2026-11-11 14:00 0912345678"]) {
+    assert.equal(redactedText(input).findings[0].label, "phone", input);
+    assert.doesNotMatch(redactedText(input).text, /09\d{2}/, input);
+  }
+});
+
+test("regex-v1 redacts checksum-valid Taiwan national IDs and resident certificates as ssn", () => {
+  for (const id of ["A123456789", "F223456786", "Z123456780", "I123456781", "O287654328", "B812345672"]) {
+    const { findings, text } = redactedText(`id ${id}.`);
+    assert.deepEqual(findings, [{ label: "ssn", count: 1 }], id);
+    assert.equal(text, "id [redacted:ssn].", id);
+  }
+});
+
+test("a Taiwan mobile number and national ID on one line both fire", () => {
+  const { findings, text } = redactedText("手機 0912-345-678  身分證 A123456789");
+  assert.deepEqual(findings, [{ label: "phone", count: 1 }, { label: "ssn", count: 1 }]);
+  assert.equal(text, "手機 [redacted:phone]  身分證 [redacted:ssn]");
+});
+
+// One input per lookalike: scan() replaces every byte occurrence of a matched
+// value, so a valid number sharing a string would mask the negative.
+test("Taiwan phone and ID rules leave longer digit runs and invalid IDs alone", () => {
+  for (const input of [
+    "0912345678901234",
+    "order 0912345678901",
+    "timestamp 2026091234",
+    "timestamp 20260912345678",
+    "0912 345 678 901",
+    "version 0912345678.1",
+    "ref x0912345678",
+    "ref 0912345678x",
+    "09123-45-678 and 0912-345678 and 0912 345-678",
+    "checksum-invalid A123456788",
+    "lowercase a123456789",
+    "embedded XA123456789 and A1234567890 and A123456789B and A123456789_x",
+    "checksum-valid but gender digit 3 A323456783",
+  ]) {
+    assert.deepEqual(redactedText(input).findings, [], input);
+  }
+});
+
 test("a preamble email in the system field is exempt (string form)", () => {
   const reply = scanJson({
     system: "You are Claude Code. Security contact: noreply@anthropic.com.",

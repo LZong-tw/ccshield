@@ -79,6 +79,19 @@ const RULES = [
   // A phone number must say it is one: a leading + country code, or a
   // parenthesised area code. Bare digit runs are timestamps and IDs.
   { label: "phone", pattern: /(?<![\w+])\+\d{1,3}[ -]?(?:\(\d{1,4}\)[ -]?)?\d{2,4}(?:[ -]?\d{2,4}){1,3}(?![\w-])|(?<![\w)])\(\d{2,4}\) ?\d{3,4}[ -]\d{4}(?![\w-])/g },
+  // The one bare-digit exception: a Taiwan mobile number is exactly 10 digits
+  // starting 09, written whole or as 4-3-3 with one consistent separator. The
+  // boundaries keep it out of longer digit runs — timestamps, card numbers,
+  // order IDs — and out of dotted versions; the space-grouped form must not
+  // continue into another digit group. The +886 branch overlaps the rule
+  // above; scan() dedups identical label/value pairs.
+  { label: "phone", pattern: /(?<![\w.+-])(?:\+886[ -]?9|09)\d{2}(?:-\d{3}-\d{3}(?![\w-])| \d{3} \d{3}(?![\w-]| \d)|\d{6}(?![\w-]|\.\d))/g },
+
+  // Taiwan national ID and the 2021 resident certificate: a letter, then 1/2
+  // (citizen) or 8/9 (resident), then eight digits. Only checksum-valid values
+  // fire, which rules out nine in ten random lookalikes. There is no national
+  // ID label in the protocol; `ssn` is the closest of the eight.
+  { label: "ssn", pattern: /\b[A-Z][1289]\d{8}\b/g, accept: isTaiwanNationalId },
 
   // Bearer-style tokens with a recognisable issuer prefix that Gitleaks'
   // default rules do not already confirm. A generic long-string rule would
@@ -131,6 +144,16 @@ function isCardNumber(value) {
     sum += digit;
   }
   return sum % 10 === 0;
+}
+
+// Letter codes are not alphabetical past H: I, O, W, X, Y, Z were assigned later.
+const TW_ID_LETTER = Object.fromEntries([..."ABCDEFGHJKLMNPQRSTUVXYWZIO"].map((letter, index) => [letter, 10 + index]));
+
+function isTaiwanNationalId(value) {
+  const code = TW_ID_LETTER[value[0]];
+  const digits = [Math.floor(code / 10), code % 10, ...value.slice(1).split("").map(Number)];
+  const weights = [1, 9, 8, 7, 6, 5, 4, 3, 2, 1, 1];
+  return digits.reduce((sum, digit, index) => sum + digit * weights[index], 0) % 10 === 0;
 }
 
 function scan(original) {
