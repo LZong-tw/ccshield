@@ -11,6 +11,7 @@ import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 
 import { prepareOpfScan, adaptOpfPrediction, FragmentMatcher, UNKNOWN_REASONS } from "../detectors/opf/opf-adapter.mjs";
+import { opfWindowGroups } from "../detectors/opf/privacy-opf-worker.mjs";
 import { buildOpfWorkerArgs } from "../src/shield/opf-args.mjs";
 import { isGraphFailureDetail } from "../src/shield/protocol.mjs";
 import { createPrivacyFilter, isVerifiedRedaction } from "../src/shield/privacy.mjs";
@@ -1913,12 +1914,13 @@ class Result:
     def __init__(self, text):
         selected = os.getenv("CCSHIELD_TEST_PREDICTION_VALUE")
         value = selected if selected and selected in text else "alice@example.com" if "alice@example.com" in text else "person@example.org"
-        start = text.index(value)
+        # A window group without the value predicts nothing, as the real model would.
+        spans = [] if value not in text else [{"label": "private_email", "start": text.index(value), "end": text.index(value) + len(value), "text": value, "placeholder": "<PRIVATE_EMAIL>"}]
         self.payload = {
             "schema_version": 1,
-            "summary": {"output_mode": "typed", "span_count": 1, "by_label": {"private_email": 1}, "decoded_mismatch": False},
+            "summary": {"output_mode": "typed", "span_count": len(spans), "by_label": {"private_email": len(spans)} if spans else {}, "decoded_mismatch": False},
             "text": text,
-            "detected_spans": [{"label": "private_email", "start": start, "end": start + len(value), "text": value, "placeholder": "<PRIVATE_EMAIL>"}],
+            "detected_spans": spans,
             "redacted_text": text.replace(value, "<PRIVATE_EMAIL>"),
         }
     def to_dict(self):
@@ -2136,6 +2138,18 @@ syncBuiltinESMExports();
       assert.equal(reply.status, "ok");
       assert.ok(Buffer.byteLength(result.stdout) <= 4 * 1048576);
       assert.doesNotMatch(Buffer.from(reply.redactedBody, "base64").toString(), /Alice/);
+    });
+    await t.test("worker shifts spans from a later window group back onto the joined scan text", () => {
+      // The 17000-character part ends its group, so the email is found in the second group at offset 8.
+      const grouped = Buffer.from(JSON.stringify({ pad: "x".repeat(17_000), content: "mail person@example.org now" }));
+      assert.deepEqual(opfWindowGroups(prepareOpfScan(grouped)).map((group) => group.length), [3 + 1 + 17_000, 7 + 1 + 27]);
+      const request = JSON.stringify({ protocol: "airkit-privacy-ndjson-v1", id: "grouped", type: "scan", body: grouped.toString("base64") }) + "\n";
+      const result = spawnSync(process.execPath, args, { input: request, encoding: "utf8", timeout: runTimeout });
+      const [reply] = parseReplies(result);
+      assert.equal(reply.status, "ok", result.stderr);
+      assert.deepEqual(reply.findings, [{ label: "private_email", count: 1 }]);
+      assert.equal(JSON.parse(Buffer.from(reply.redactedBody, "base64")).content, "mail [redacted:private_email] now");
+      assert.equal(reply.segmentHits + reply.segmentMisses, 2);
     });
     await t.test("worker exact serialized frame boundary includes newline and fails closed for hostile IDs", () => {
       const FRAME = 4 * 1048576;
@@ -2853,4 +2867,38 @@ test("OPF verifier still sees a finding in prose that repeats a kept control nam
     body.messages[0].content[1].text = name;
     assert.equal(isVerifiedRedaction({ original, result: { ...result, redactedBody: Buffer.from(JSON.stringify(body)) } }), false);
   }
+});
+
+test("OPF window groups cut only at part starts, so an edit invalidates only the groups it touches", () => {
+  const words = "the quick brown fox jumps over the lazy dog while the shield scans every window".split(" ");
+  const text = (index) => Array.from({ length: 12 + (index * 7) % 40 }, (_, at) => words[(index * 13 + at * 5) % words.length]).join(" ") + ` #${index}${index % 2 ? " #reply" : ""}`;
+  const chat = (messages) => Buffer.from(JSON.stringify({ model: "m", max_tokens: 1,
+    messages: messages.map((content) => ({ role: content.endsWith("#reply") ? "assistant" : "user", content: [{ type: "text", text: content }] })) }));
+  const base = Array.from({ length: 400 }, (_, index) => text(index));
+  base[200] = "x".repeat(17_000);
+  const groups = (messages) => {
+    const scan = prepareOpfScan(chat(messages));
+    const result = opfWindowGroups(scan);
+    assert.equal(result.join("\n"), scan.text);
+    return result;
+  };
+  const before = groups(base);
+  assert.ok(before.length > 5, `expected hash and size cuts, got ${before.length} groups`);
+  const changed = (messages) => { const old = new Set(before); return groups(messages).filter((group) => !old.has(group)).length; };
+  const edited = [...base]; edited[1] = `injected reminder text, about fifty characters. ${edited[1]}`;
+  const inserted = [...base]; inserted.splice(3, 0, "a new early message");
+  const deleted = [...base]; deleted.splice(3, 1);
+  const appended = [...base, "the next turn"];
+  for (const [name, messages] of [["edit", edited], ["insert", inserted], ["delete", deleted], ["append", appended]]) {
+    assert.ok(changed(messages) <= 2, `${name} changed ${changed(messages)} of ${before.length} groups`);
+  }
+  assert.equal(changed(appended), 1);
+});
+
+test("OPF window groups slice by code point, so astral characters keep later groups aligned", () => {
+  const body = Buffer.from(JSON.stringify({ content: "😀 emoji 𝒳 first", pad: "y".repeat(16_384), tail: "after" }));
+  const scan = prepareOpfScan(body);
+  const groups = opfWindowGroups(scan);
+  assert.equal(groups.join("\n"), scan.text);
+  assert.deepEqual(groups, [`content\n😀 emoji 𝒳 first\npad\n${"y".repeat(16_384)}`, "tail\nafter"]);
 });

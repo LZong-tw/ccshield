@@ -2,7 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createReadStream, readFileSync } from "node:fs";
+import { createReadStream, readFileSync, realpathSync } from "node:fs";
 import { lstat, readFile, readdir, realpath } from "node:fs/promises";
 import { availableParallelism } from "node:os";
 import { createInterface } from "node:readline";
@@ -164,16 +164,63 @@ def read_requests():
 threading.Thread(target=read_requests, daemon=True).start()
 warming = None
 
+# Memory misses include windows the disk tier then served; only the rest ran a forward.
+def computed_windows():
+    snapshot = cache.snapshot()
+    return snapshot["misses"] - snapshot.get("disk_hits", 0)
+
+# Each group is redacted on its own, so OPF windows restart at every group and an edit in one group
+# leaves the cached windows of every other group intact. Groups join with the scan's own part separator,
+# so the merged text equals the scan text and the adapter's text check proves the groups cover it.
+# Returns the merged prediction and how many non-empty groups were served wholly from cache.
+def redact_groups(groups):
+    spans, redacted, warnings, modes, mismatch, offset, cached, computed = [], [], [], set(), False, 0, 0, 0
+    for group in groups:
+        if group:
+            computed_before = computed_windows()
+            result = model.redact(group).to_dict()
+            if result["text"] != group:
+                raise RuntimeError("group text changed")
+            if computed_windows() == computed_before:
+                cached += 1
+            else:
+                computed += 1
+            modes.add(result["summary"]["output_mode"])
+            mismatch = mismatch or result["summary"]["decoded_mismatch"] is not False
+            spans.extend(dict(span, start=span["start"] + offset, end=span["end"] + offset) for span in result["detected_spans"])
+            redacted.append(result["redacted_text"])
+            if result.get("warning") is not None:
+                warnings.append(result["warning"])
+        else:
+            redacted.append("")
+        offset += len(group) + 1
+    if len(modes) != 1:
+        raise RuntimeError("inconsistent output modes")
+    by_label = {}
+    for span in spans:
+        by_label[span["label"]] = by_label.get(span["label"], 0) + 1
+    prediction = {"schema_version": 1, "text": chr(10).join(groups), "detected_spans": spans,
+                  "redacted_text": chr(10).join(redacted),
+                  "summary": {"output_mode": modes.pop(), "span_count": len(spans),
+                              "by_label": dict(sorted(by_label.items())), "decoded_mismatch": mismatch}}
+    if warnings:
+        prediction["warning"] = " ".join(dict.fromkeys(warnings))
+    return prediction, {"segmentHits": cached, "segmentMisses": computed}
+
+def valid_groups(value):
+    return (isinstance(value, list) and 0 < len(value) and all(isinstance(group, str) for group in value)
+            and any(value))
+
 def warm():
     global warming
-    text, spent = warming
+    groups, spent = warming
     started = monotonic()
     try:
         cache.begin_scan(WARM_SECONDS - spent, interrupt=lambda: not inbox.empty())
-        model.redact(text)
+        redact_groups(groups)
         warming = None
     except cache_module.ScanInterrupted:
-        warming = (text, spent + monotonic() - started)
+        warming = (groups, spent + monotonic() - started)
     except Exception:
         warming = None
     finally:
@@ -201,24 +248,28 @@ while True:
         seconds = budget_ms / 1000 - (monotonic() - received)
         if seconds <= 0:
             raise cache_module.CooperativeScanTimeout("scan budget spent before start")
-        # OPF windows are 4096 tokens with stride 4096, so this is exactly the forward count.
-        token_ids = runtime.encoding.encode(request["text"], allowed_special="all")
-        windows = max(1, ceil(len(token_ids) / 4096))
+        groups = request["groups"]
+        if not valid_groups(groups):
+            raise RuntimeError("invalid groups")
+        # OPF windows are 4096 tokens with stride 4096 from each group's start, so this is exactly the forward count.
+        group_ids = [runtime.encoding.encode(group, allowed_special="all") for group in groups if group]
+        windows = sum(ceil(len(token_ids) / 4096) for token_ids in group_ids)
         # The same int32 (1, n) tokens and all-true mask predict_text builds, so the projection prices only
         # the windows neither cache tier holds; a mismatch would just price every window cold again.
         planned = (torch.tensor([token_ids[start:start + 4096]], device="cpu", dtype=torch.int32)
-                   for start in range(0, len(token_ids), 4096))
+                   for token_ids in group_ids for start in range(0, len(token_ids), 4096))
         cold = cache.cold_windows((tokens, torch.ones_like(tokens, dtype=torch.bool)) for tokens in planned)
         cache.begin_scan(seconds, total_windows=windows, cold_windows=cold)
-        result = model.redact(request["text"]).to_dict()
+        result, segments = redact_groups(groups)
         cache.check_deadline()
-        reply = json.dumps({"id": request["id"], "prediction": result, "cache": window_counts(before, windows)}, ensure_ascii=False)
+        reply = json.dumps({"id": request["id"], "prediction": result,
+                            "cache": {**window_counts(before, windows), **segments}}, ensure_ascii=False)
         cache.check_deadline()
         print(reply, flush=True)
-        if warming is not None and warming[0] == request["text"]:
+        if warming is not None and warming[0] == request["groups"]:
             warming = None
     except cache_module.CooperativeScanTimeout as timeout:
-        warming = (request["text"], 0.0) if WARM_SECONDS > 0 else None
+        warming = (request["groups"], 0.0) if WARM_SECONDS > 0 else None
         reply = {"id": request["id"], "error": "model_timeout", "projected": timeout.projected is True,
                  "warming": warming is not None, "cache": window_counts(before, windows)}
         if timeout.remaining_ms is not None:
@@ -269,7 +320,41 @@ function windowCounts(value) {
   if (!value || typeof value !== "object" || !count(value.hits) || !count(value.misses)) return {};
   const cache = { hits: value.hits, misses: value.misses };
   for (const name of OPTIONAL_COUNTS) if (count(value[name])) cache[name] = value[name];
-  return { cache };
+  // Groups served wholly from cache versus groups that ran a forward; the daemon reads them top-level.
+  const segments = count(value.segmentHits) && count(value.segmentMisses)
+    ? { segmentHits: value.segmentHits, segmentMisses: value.segmentMisses } : {};
+  return { cache, ...segments };
+}
+
+// A part this long always ends its window group. Cutting after it, not before, keeps the preceding parts
+// as its leading context: cutting before it measurably lost findings in its first line.
+const GROUP_LARGE_PART_CHARS = 16_384;
+// A shorter part ends one when its own digest says so, about one part in GROUP_HASH_MODULUS of at
+// least GROUP_HASH_MIN_CHARS, which bounds groups in a long run of short messages. Tiny parts (keys,
+// roles, block types) repeat in every message and never cut.
+const GROUP_HASH_MIN_CHARS = 64;
+const GROUP_HASH_MODULUS = 48;
+
+// Splits the scan text into window groups at part starts. Each cut depends only on the part it
+// follows, never on anything earlier, so an edit, insertion or deletion moves at most the cuts of the
+// parts it touches and every other group keeps its exact windows (and their cached logits). A size cap
+// would make cuts depend on earlier parts and cascade again, so a long run of short parts that never
+// cuts stays one group, no worse than whole-text windowing. Groups are code-point slices that join with
+// the "\n" part separator back into the scan text, which the adapter checks.
+export function opfWindowGroups(scan) {
+  const chars = Array.from(scan.text);
+  const starts = [0];
+  for (let index = 1; index < scan.sources.length; index += 1) {
+    const { start, end } = scan.sources[index - 1];
+    if (endsGroup(chars.slice(start, end).join(""), end - start)) starts.push(scan.sources[index].start);
+  }
+  return starts.map((start, index) => chars.slice(start, index + 1 < starts.length ? starts[index + 1] - 1 : chars.length).join(""));
+}
+
+function endsGroup(part, length) {
+  if (length >= GROUP_LARGE_PART_CHARS) return true;
+  return length >= GROUP_HASH_MIN_CHARS
+    && createHash("sha256").update(part).digest().readUInt32BE(0) % GROUP_HASH_MODULUS === 0;
 }
 
 // The projected time to finish the unscanned windows, which the idle worker keeps warming.
@@ -502,7 +587,7 @@ async function main() {
     return starting;
   };
   // Python owns the budget; this backstop only fires when it stops answering.
-  const query = (current, text, budgetMs) => new Promise((resolve) => {
+  const query = (current, groups, budgetMs) => new Promise((resolve) => {
     if (current.dead) { resolve(null); return; }
     const id = createHash("sha256").update(String(Date.now())).update(String(Math.random())).digest("hex");
     let timedOut = false;
@@ -512,7 +597,7 @@ async function main() {
       if (reply && reply.id !== id) current.fail();
       resolve(reply?.id === id ? reply : { error: timedOut ? "model_killed" : "model_error" });
     };
-    current.child.stdin.write(`${JSON.stringify({ id, text, budgetMs })}\n`);
+    current.child.stdin.write(`${JSON.stringify({ id, groups, budgetMs })}\n`);
   });
   const handle = async (request, current) => {
     if (request.type !== "scan" || !validBase64(request.body)) return { type: request.type, id: request.id, status: "unknown" };
@@ -523,7 +608,7 @@ async function main() {
       if (original.length === 0 || original.length > MAX_BODY_BYTES) throw new Error("invalid body");
       const scan = prepareOpfScan(original);
       if (scan.text === "") return { type: "scan", id: request.id, status: "ok", findings: [] };
-      const reply = current ? await query(current, scan.text, budgetMs) : null;
+      const reply = current ? await query(current, opfWindowGroups(scan), budgetMs) : null;
       // Window cache hits and misses per scan, so retry convergence is visible without any request content.
       const cache = windowCounts(reply?.cache);
       // A projected refusal stops ahead of the deadline with budget left; only a scan that ran out of time is a model_timeout.
@@ -598,4 +683,7 @@ async function main() {
   }
 }
 
-main().catch(() => { process.stdin.destroy(); process.exitCode = 1; });
+// Imported by tests for opfWindowGroups; only the spawned entry point runs the worker.
+// import.meta.main is too new for the supported Node range, so compare the resolved entry path.
+const isEntry = () => { try { return pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url; } catch { return false; } };
+if (isEntry()) main().catch(() => { process.stdin.destroy(); process.exitCode = 1; });
