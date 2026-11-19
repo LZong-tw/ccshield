@@ -4,10 +4,62 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream, readFileSync, realpathSync } from "node:fs";
 import { lstat, readFile, readdir, realpath } from "node:fs/promises";
-import { availableParallelism } from "node:os";
+import { availableParallelism, userInfo } from "node:os";
 import { createInterface } from "node:readline";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+
+// Known local false positives the model reports, dropped before the pinned adapter sees the prediction.
+// Each rule needs the span's exact shape plus the text before it inside the same source string; anything
+// else stays redacted. The adapter replays every kept span's text everywhere, so a value dropped here is
+// still redacted wherever another, non-exempt span reports the same text.
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Claude Code's own session and task directories: /private/tmp/claude-501/<project>/<session>/tasks/...
+// and ~/.claude/projects/<project>/<session>/..., plus the files under a session's tool-results/.
+const CLAUDE_SESSION_DIR = /(?:\/claude-\d+|\.claude\/projects)\/[^\s/]+\/$/;
+const TOOL_RESULTS_DIR = /\/tool-results\/$/;
+// Confluence page and space ids are 7-11 digits; 12-digit values (AWS accounts) never match.
+const CONFLUENCE_ID = /^\d{7,11}$/;
+const CONFLUENCE_PATH_ID = /(?:atlassian\.net\/wiki\/spaces\/[^\s/]+\/pages|\/rest\/api\/(?:content|space))\/$|\bcontent:$/;
+// Field-shaped ids count only inside a source that is itself Confluence output.
+const CONFLUENCE_SOURCE = /atlassian\.net|confluence|\blive_doc\b|entityType:\s*"?content/i;
+const CONFLUENCE_FIELD_ID = /(?:\b(?:Space |Parent )?ID:[ \t]*|["']?\b(?:id|spaceId|parentId|pageId|contentId)["']?[ \t]*:[ \t]*["']?)$/;
+
+function localUsername() {
+  try { const name = userInfo().username; return /^[\w.-]{4,}$/.test(name) ? name : null; } catch { return null; }
+}
+
+export function exemptLocalSpan(span, chars, sources, username = localUsername()) {
+  const source = sources.find((candidate) => candidate.start <= span.start && span.end <= candidate.end);
+  if (!source) return false;
+  const lineStart = Math.max(source.start, span.start - 200);
+  const before = chars.slice(lineStart, span.start).join("").split("\n").at(-1);
+  const text = span.text;
+  if (span.label === "private_person") {
+    // The login name in /Users/<name>, -Users-<name> and com.<name>.* is a handle, not a person's name.
+    return username !== null && text.replace(/^[/~-]*(?:Users[/-])?/, "").replace(/[/.-]+$/, "") === username;
+  }
+  if (span.label === "secret") {
+    return (UUID.test(text) && CLAUDE_SESSION_DIR.test(before)) || (TOOL_RESULTS_DIR.test(before) && /^[\w-]{6,64}$/.test(text));
+  }
+  if (span.label === "account_number" && CONFLUENCE_ID.test(text)) {
+    if (CONFLUENCE_PATH_ID.test(before)) return true;
+    return CONFLUENCE_FIELD_ID.test(before) && CONFLUENCE_SOURCE.test(chars.slice(source.start, source.end).join(""));
+  }
+  return false;
+}
+
+// Returns the prediction unchanged unless a span is exempt; summary counts are rebuilt for the adapter's checks.
+export function withoutLocalFalsePositives(scan, prediction, username = localUsername()) {
+  if (!Array.isArray(prediction?.detected_spans) || prediction.detected_spans.length === 0) return prediction;
+  const chars = Array.from(scan.text);
+  const kept = prediction.detected_spans.filter((span) => !(typeof span?.text === "string"
+    && Number.isInteger(span.start) && Number.isInteger(span.end) && exemptLocalSpan(span, chars, scan.sources, username)));
+  if (kept.length === prediction.detected_spans.length) return prediction;
+  const byLabel = {};
+  for (const { label } of kept) byLabel[label] = (byLabel[label] ?? 0) + 1;
+  return { ...prediction, detected_spans: kept, summary: { ...prediction.summary, span_count: kept.length, by_label: byLabel } };
+}
 
 const PROTOCOL = "airkit-privacy-ndjson-v1";
 const VERSION = "opf-1-client-exempt";
@@ -616,7 +668,7 @@ async function main() {
         reason: reply.projected === true ? "projected_timeout" : "model_timeout", ...retryAfter(reply), ...cache };
       if (reply?.error || !reply?.prediction) return { type: "scan", id: request.id, status: "unknown",
         reason: reply?.error === "model_killed" ? "model_killed" : "model_error", ...cache };
-      return { type: "scan", id: request.id, ...adaptOpfPrediction(original, scan, reply.prediction), ...cache };
+      return { type: "scan", id: request.id, ...adaptOpfPrediction(original, scan, withoutLocalFalsePositives(scan, reply.prediction)), ...cache };
     } catch { return { type: "scan", id: request.id, status: "unknown" }; }
   };
   const pending = new Set();
@@ -683,7 +735,7 @@ async function main() {
   }
 }
 
-// Imported by tests for opfWindowGroups; only the spawned entry point runs the worker.
+// Imported by tests for opfWindowGroups and the span exemptions; only the spawned entry point runs the worker.
 // import.meta.main is too new for the supported Node range, so compare the resolved entry path.
 const isEntry = () => { try { return pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url; } catch { return false; } };
 if (isEntry()) main().catch(() => { process.stdin.destroy(); process.exitCode = 1; });
