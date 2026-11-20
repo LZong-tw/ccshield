@@ -1,5 +1,7 @@
 const ACTIONS = new Set(["allow", "block", "require_approval", "redact"]);
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
+// Media decisions pass through validation but are never stored (write refuses them), so they may carry a full request body.
+const MAX_UNCACHED_BODY_BYTES = 32 * 1024 * 1024;
 // The audit validates the media values; the cache only carries them.
 const MEDIA_FIELDS = ["noCache", "imageCount", "documentCount", "mediaOutcome"];
 
@@ -31,6 +33,7 @@ export function createDecisionCache({ clock = () => Date.now(), ttlMs = 30_000, 
   const write = (value) => {
     const key = keyFor(value);
     const decision = validateDecision(value);
+    if (decision.noCache === true) throw new TypeError("shield decision cache does not store an uncached decision");
     const now = clock();
     entries.delete(key);
     entries.set(key, { decision, expiresAt: now + ttlMs });
@@ -105,7 +108,7 @@ function validateDecision(value) {
   const key = validateKey(value);
   if (!ACTIONS.has(value.action)) throw new TypeError("shield decision cache action is invalid");
   if (!Number.isInteger(value.transformCount) || value.transformCount < 0 || value.transformCount > 1_000_000) throw new TypeError("shield decision cache transform count is invalid");
-  if (!Buffer.isBuffer(value.body) || value.body.byteLength > MAX_BODY_BYTES) throw new TypeError("shield decision cache transformed body is invalid");
+  if (!Buffer.isBuffer(value.body) || value.body.byteLength > (value.noCache === true ? MAX_UNCACHED_BODY_BYTES : MAX_BODY_BYTES)) throw new TypeError("shield decision cache transformed body is invalid");
   if (!Array.isArray(value.reasonCodes) || value.reasonCodes.length === 0 || value.reasonCodes.length > 32
     || value.reasonCodes.some((code) => !/^[A-Za-z0-9._-]{1,128}$/.test(code))) {
     throw new TypeError("shield decision cache reason codes are invalid");
