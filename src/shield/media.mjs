@@ -251,6 +251,11 @@ export function patchMedia(raw, replacements) {
 }
 
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const STAND_IN_PREFIX = {
+  "image/png": PNG_MAGIC,
+  "image/jpeg": Buffer.from([0xff, 0xd8, 0xff]),
+  "image/gif": Buffer.from("GIF89a", "latin1"),
+};
 
 // Replaces each image with its normalized PNG and rewrites media_type to match,
 // then re-extracts the patched body: the bytes a scanner verified must be
@@ -270,4 +275,42 @@ export function patchImages(raw, patches) {
     && after.images.every((image) => !expected.has(image.path) || (image.mime === "image/png" && image.bytes.equals(expected.get(image.path))));
   if (!ok) throw new Error("shield image splice did not verify");
   return patched;
+}
+
+// Twelve bytes that pass the type check for `mime` and carry the image's index,
+// so a stand-in is 16 base64 characters and no two in one body are equal.
+function standIn(mime, index) {
+  const bytes = Buffer.alloc(12);
+  if (mime === "image/webp") {
+    bytes.write("RIFF", 0, "latin1");
+    bytes.writeUInt32LE(index, 4);
+    bytes.write("WEBP", 8, "latin1");
+  } else {
+    STAND_IN_PREFIX[mime].copy(bytes);
+    bytes.writeUInt32BE(index, 8);
+  }
+  return bytes;
+}
+
+// The text detectors have a 1 MiB budget that image payloads would eat. They
+// get this skeleton instead: the same JSON with every extracted image's data
+// swapped for a stand-in of the same type, which still reads as that image.
+export function imageSkeleton(raw, images) {
+  return patchMedia(raw, images.map((image, index) => ({ rawOffset: image.rawOffset, rawLength: image.rawLength, text: standIn(image.mime, index).toString("base64") })));
+}
+
+const sameImages = (found, images, bytesAt) => found.reasonCodes.length === 0
+  && found.images.length === images.length
+  && found.images.every((image, index) => image.path === images[index].path && image.mime === images[index].mime && image.bytes.equals(bytesAt(index)));
+
+// Puts the payloads back into a skeleton the text detectors may have redacted.
+// Redaction moves offsets, so each stand-in is found again by re-reading the
+// skeleton, and must still be its own image at its own path; the restored body
+// must then carry exactly the original images.
+export function restoreImages(skeleton, images) {
+  const found = extractMedia(skeleton);
+  if (!sameImages(found, images, (index) => standIn(images[index].mime, index))) throw new Error("shield image skeleton did not verify");
+  const restored = patchMedia(skeleton, found.images.map((image, index) => ({ rawOffset: image.rawOffset, rawLength: image.rawLength, text: images[index].bytes.toString("base64") })));
+  if (!sameImages(extractMedia(restored), images, (index) => images[index].bytes)) throw new Error("shield image restore did not verify");
+  return restored;
 }

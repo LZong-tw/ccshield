@@ -14,7 +14,7 @@ import { openPrivacyDetector } from "./shield/privacy-detector.mjs";
 import { createPrivacyFilter, isVerifiedRedaction } from "./shield/privacy.mjs";
 import { createFailureLog } from "./shield/failure-log.mjs";
 import { createShieldFailure as shieldFailure, startShieldProxy } from "./shield/proxy.mjs";
-import { DOCUMENT_COVERAGE, extractMedia, mediaOutcomeFor, patchImages } from "./shield/media.mjs";
+import { DOCUMENT_COVERAGE, extractMedia, imageSkeleton, mediaOutcomeFor, patchImages, restoreImages } from "./shield/media.mjs";
 import { createImageInspector } from "../shield-image/inspector.mjs";
 import { checkImageReadiness } from "../shield-image/readiness.mjs";
 import { createImageWorker } from "../shield-image/worker.mjs";
@@ -213,8 +213,8 @@ async function bootShieldDaemon(boot, {
       // Documents and unscannable images stop here, before any scanner sees them. Base64 images go
       // through the image worker below, or forward unscanned when no worker is provisioned.
       if (media.reasonCodes.length > 0) return shape({ action: "block", reasonCodes: media.reasonCodes, transformCount: 0 });
-      // Masked images are spliced in first, so the text scanners and any text
-      // redaction work on exactly the body that will leave.
+      // Masked images are spliced in first, so the body that leaves carries
+      // exactly the image bytes the worker verified.
       let scanBody = body;
       let imageSecrets = 0;
       let imagePii = [];
@@ -243,17 +243,26 @@ async function bootShieldDaemon(boot, {
         // The audit row reports what the worker did, not the pre-scan default.
         mediaFacts.mediaOutcome = imageSecrets > 0 ? "blocked_secret" : "scanned";
       }
-      const facts = classifyShieldRequest({ body: scanBody, launcherContext });
+      // Images have their own path above, so the text detectors see the body with each image
+      // payload swapped for a stand-in; any text redaction is spliced back around the images.
+      const scanImages = scanBody === body ? media.images : extractMedia(scanBody).images;
+      const textBody = scanImages.length > 0 ? imageSkeleton(scanBody, scanImages) : scanBody;
+      const withImages = (redacted) => {
+        if (scanImages.length === 0) return redacted;
+        try { return restoreImages(redacted, scanImages); }
+        catch { throw shieldFailure("redaction", "redaction_invalid", "shield privacy redaction is invalid"); }
+      };
+      const facts = classifyShieldRequest({ body: textBody, launcherContext });
       let secretScan;
       let confirmedSecret;
       try {
-        secretScan = await scanner.scan(scanBody);
+        secretScan = await scanner.scan(textBody);
         secretScan = { findings: withImageSecrets(secretScan.findings, imageSecrets) };
         confirmedSecret = secretScan.findings.length > 0;
       } catch { throw shieldFailure("secret_scan", "scanner_unavailable", "shield secret scanner unavailable"); }
       let privacyScan;
       try {
-        privacyScan = confirmedSecret ? { status: "ok", findings: [] } : await privacy.scan(scanBody, { signal, version: detectorVersions.privacy });
+        privacyScan = confirmedSecret ? { status: "ok", findings: [] } : await privacy.scan(textBody, { signal, version: detectorVersions.privacy });
       } catch { throw shieldFailure("privacy_scan", "privacy_unavailable", "shield privacy worker unavailable"); }
       if (privacyScan?.status !== "ok") throw shieldFailure("privacy_scan", privacyScan?.reason, "shield privacy worker unavailable", privacyScan ?? {});
       let piiFindings;
@@ -273,13 +282,13 @@ async function bootShieldDaemon(boot, {
       } catch { throw shieldFailure("policy", "policy_unavailable", "shield policy unavailable"); }
       if (confirmedSecret && decision.action !== "block") throw shieldFailure("policy", "secret_block_invalid", "shield confirmed secret must be blocked");
       const textRedacted = privacyScan.findings.length > 0;
-      if (decision.action === "redact" && (textRedacted || imageTransforms === 0) && !isVerifiedRedaction({ original: scanBody, result: privacyScan })) {
+      if (decision.action === "redact" && (textRedacted || imageTransforms === 0) && !isVerifiedRedaction({ original: textBody, result: privacyScan })) {
         throw shieldFailure("redaction", "redaction_invalid", "shield privacy redaction is invalid");
       }
       if (imageTransforms === 0) {
         return shape({
           ...decision,
-          ...(decision.action === "redact" ? { redactedBody: privacyScan.redactedBody, transformCount: privacyScan.redactions.reduce((total, item) => total + item.count, 0) } : {}),
+          ...(decision.action === "redact" ? { redactedBody: withImages(privacyScan.redactedBody), transformCount: privacyScan.redactions.reduce((total, item) => total + item.count, 0) } : {}),
         });
       }
       // Normalized images always leave as transformed bytes, so an allow
@@ -289,7 +298,7 @@ async function bootShieldDaemon(boot, {
       return shape({
         ...decision,
         action: decision.action === "allow" ? "redact" : decision.action,
-        redactedBody: textTransforms > 0 ? privacyScan.redactedBody : scanBody,
+        redactedBody: textTransforms > 0 ? withImages(privacyScan.redactedBody) : scanBody,
         transformCount: textTransforms + imageTransforms,
         imageTransformCount: imageTransforms,
       });

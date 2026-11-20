@@ -755,7 +755,61 @@ test("oversized inspection is blocked before contacting upstream", async (t) => 
   const diagnostic = (await readDiagnostics(shield)).failures.at(-1);
   assert.equal(diagnostic.stage, "body_read");
   assert.equal(diagnostic.reason, "body_too_large");
-  assert.equal(diagnostic.bytes, 1_048_576);
+  assert.equal(diagnostic.bytes, 1_048_577);
+});
+
+// About 1.48 MB of PNG base64 over nine blocks, the shape that tripped the old 1 MiB read cap.
+function screenshotBody(text, { data = (bytes) => bytes.toString("base64"), count = 9 } = {}) {
+  const png = (seed) => Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(122_993, seed)]);
+  const images = Array.from({ length: count }, (_, index) => ({ type: "image", source: { type: "base64", media_type: "image/png", data: data(png(index + 1)) } }));
+  return Buffer.from(JSON.stringify({ model: "claude-sonnet-5", messages: [{ role: "user", content: [...images, { type: "text", text }] }] }));
+}
+
+async function forwardsLarge(t, body) {
+  const forwarded = [];
+  const upstream = await startFixture(t, async (request, response) => {
+    forwarded.push(Buffer.from(await readBody(request), "latin1"));
+    response.end("{}");
+  });
+  const decided = [];
+  const shield = await startShield(t, { targetOrigin: upstream.origin, decide: async ({ body: seen }) => { decided.push(seen); return { action: "allow" }; } });
+  const result = await fetch(`${shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield": CAPABILITY }, body });
+  return { result, forwarded, decided, shield };
+}
+
+test("image payloads do not count toward the text cap, and leave byte for byte", async (t) => {
+  const body = screenshotBody("what changed between these?");
+  assert.ok(body.length > 1_400_000);
+  const { result, forwarded, decided } = await forwardsLarge(t, body);
+  assert.equal(result.status, 200);
+  assert.deepEqual(decided, [body], "the evaluator sees the whole request");
+  assert.equal(forwarded.length, 1);
+  assert.ok(forwarded[0].equals(body), "upstream receives the images unchanged");
+});
+
+test("text over the cap beside images, or images the media walk cannot vouch for, are still body_too_large", async (t) => {
+  const bodies = {
+    text: screenshotBody("x".repeat(1_048_577)),
+    escaped: Buffer.from(screenshotBody("hi").toString("latin1").replaceAll('"data":"i', '"data":"\\u0069'), "latin1"),
+    unpadded: screenshotBody("hi", { data: (bytes) => bytes.toString("base64").replace(/=+$/, "") }),
+    unparseable: Buffer.concat([screenshotBody("hi"), Buffer.from("}")]),
+  };
+  for (const [name, body] of Object.entries(bodies)) {
+    const { result, forwarded, decided, shield } = await forwardsLarge(t, body);
+    assert.equal(result.status, 403, name);
+    assert.deepEqual(await result.json(), { error: { code: "shield_blocked" } }, name);
+    assert.equal(decided.length + forwarded.length, 0, name);
+    const diagnostic = (await readDiagnostics(shield)).failures.at(-1);
+    assert.deepEqual([diagnostic.stage, diagnostic.reason, diagnostic.bytes], ["body_read", "body_too_large", body.length], name);
+  }
+});
+
+test("a body over the 32 MiB raw cap is blocked before evaluation", async (t) => {
+  const { result, forwarded, decided, shield } = await forwardsLarge(t, Buffer.alloc(32 * 1024 * 1024 + 1, 0x20));
+  assert.equal(result.status, 403);
+  assert.equal(decided.length + forwarded.length, 0);
+  const diagnostic = (await readDiagnostics(shield)).failures.at(-1);
+  assert.deepEqual([diagnostic.stage, diagnostic.reason, diagnostic.bytes], ["body_read", "body_too_large", 32 * 1024 * 1024]);
 });
 
 test("zero-body liveness probes forward to upstream without a policy decision", async (t) => {
@@ -1611,6 +1665,38 @@ async function readBody(request) {
   for await (const chunk of request) chunks.push(chunk);
   return Buffer.concat(chunks).toString("utf8");
 }
+
+test("an approved request forwards a spliced body larger than the old 1 MiB and 4 MiB bounds", async (t) => {
+  // Normalized PNGs can outgrow the originals, so the transformed body may exceed the inbound one.
+  const original = screenshotBody("before");
+  const spliced = screenshotBody("after", { count: 40 });
+  assert.ok(spliced.length > 4 * 1024 * 1024);
+  for (const cached of [false, true]) {
+    const received = [];
+    const upstream = await startFixture(t, async (request, response) => {
+      received.push(Buffer.from(await readBody(request), "latin1"));
+      response.end("ok");
+    });
+    const grant = {};
+    const shield = await startShield(t, {
+      targetOrigin: upstream.origin,
+      approvalBroker: { async request() { return grant; }, consume: (value) => value === grant },
+      ...(cached ? {
+        decisionCache: createDecisionCache(),
+        decisionContext: () => ({ lane: "subscription", destinationClass: "subscription", policyVersion: "2026.09.02.2", detectorVersions: { gitleaks: "8.24.0" } }),
+      } : {}),
+      decide: async () => ({
+        action: "require_approval", reasonCodes: ["internal_repository_code"], lane: "subscription", destinationClass: "subscription",
+        bundleVersion: "2026.09.02.2", detectorVersions: { gitleaks: "8.24.0" },
+        noCache: true, imageCount: 9, documentCount: 0, mediaOutcome: "scanned", transformCount: 9, imageTransformCount: 9, redactedBody: spliced,
+      }),
+    });
+    const result = await fetch(`${shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield": CAPABILITY }, body: original });
+    assert.equal(result.status, 200, `cached=${cached}`);
+    assert.equal(received.length, 1);
+    assert.ok(received[0].equals(spliced), `cached=${cached}`);
+  }
+});
 
 test("an approved request with normalized images forwards the spliced body, not the original", async (t) => {
   for (const cached of [false, true]) {

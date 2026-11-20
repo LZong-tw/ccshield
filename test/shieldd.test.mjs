@@ -714,7 +714,7 @@ test("daemon blocks an image it cannot inspect by source", async () => {
   assert.deepEqual(calls, { scanner: 0, privacy: 0, policy: 0 });
 });
 
-test("daemon forwards base64 images unscanned through the normal text pipeline, uncached", async () => {
+test("daemon forwards base64 images unscanned, still running the text pipeline, uncached", async () => {
   const { calls, decide } = await mediaDecide();
   const decision = await decide(mediaBody(pngBlock, pngBlock));
   assert.equal(decision.action, "allow");
@@ -911,7 +911,7 @@ test("a clean text request plus a PII image is redacted with the text unchanged 
   assert.equal(decision.mediaOutcome, "scanned");
   assert.equal(decision.imageTransformCount, 2);
   assert.deepEqual(calls.policy[0].piiFindings, [{ category: "email", count: 1 }]);
-  assert.deepEqual(sourceOf(calls.privacy[0]).data, MASKED_PNG.toString("base64"), "text scanners see the spliced body");
+  assert.deepEqual(sourceOf(calls.privacy[0]), { type: "base64", media_type: "image/png", data: "iVBORw0KGgoAAAAA" }, "text scanners see the spliced body with the image payload swapped for a stand-in");
   assert.equal(calls.inspect[0][0].lastTurn, true);
 });
 
@@ -967,6 +967,103 @@ test("text redaction runs on the spliced body, so both the text and the image ar
   assert.equal(parsed.messages[0].content[0].text, "[WORD]");
   assert.equal(parsed.messages[0].content[1].source.data, MASKED_PNG.toString("base64"));
   assert.equal(decision.transformCount, 2);
+});
+
+// Screenshot-sized PNGs: nine of them are about 1.48 MB of base64, past the old 1 MiB read cap.
+const bigPng = (seed) => Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(122_992, seed)]);
+const bigBlocks = (count) => Array.from({ length: count }, (_, index) => ({ type: "image", source: { type: "base64", media_type: "image/png", data: bigPng(index + 1).toString("base64") } }));
+const imagesIn = (body) => JSON.parse(body.toString("utf8")).messages[0].content.filter((block) => block.type === "image").map((block) => block.source);
+const assertSkeleton = (bodies) => {
+  for (const body of bodies) {
+    assert.ok(body.length <= 1_048_576, `a text detector saw ${body.length} bytes`);
+    assert.ok(imagesIn(body).every((source) => source.data.length === 16), "text detectors see stand-ins, not payloads");
+  }
+};
+
+test("a large screenshot history goes through the image worker as before; text detectors see only the skeleton", async () => {
+  const { calls, decide } = await imageDecide();
+  const decision = await decide(mediaBody(...bigBlocks(9)));
+  assert.deepEqual(calls.inspect[0].map(({ bytes }) => bytes), bigBlocks(9).map((block) => Buffer.from(block.source.data, "base64")), "the worker gets every original image");
+  assert.equal(decision.action, "redact");
+  assert.equal(decision.mediaOutcome, "scanned");
+  assert.equal(decision.imageTransformCount, 9);
+  assert.equal(decision.imageCount, 9);
+  assert.equal(calls.scanner.length, 1);
+  assertSkeleton([...calls.scanner, ...calls.privacy]);
+  assert.ok(imagesIn(decision.redactedBody).every((source) => source.media_type === "image/png" && source.data === MASKED_PNG.toString("base64")));
+  assert.equal(JSON.parse(decision.redactedBody.toString("utf8")).messages[0].content[0].text, "look");
+});
+
+test("a launch override with a large screenshot history forwards it unscanned and scans only the text", async () => {
+  const { calls, decide } = await imageDecide({ ready: false });
+  const decision = await decide(mediaBody(...bigBlocks(9)), { allowUnscannedImages: true });
+  assert.equal(calls.inspect.length, 0);
+  assert.equal(decision.action, "allow");
+  assert.equal(decision.mediaOutcome, "unscanned_override");
+  assert.equal(Object.hasOwn(decision, "redactedBody"), false, "the original body is what leaves");
+  assertSkeleton([...calls.scanner, ...calls.privacy]);
+});
+
+test("a duplicate key beside a large screenshot history blocks before any scanner", async () => {
+  const { calls, decide } = await mediaDecide();
+  const body = Buffer.from(mediaBody(...bigBlocks(9)).toString("utf8").replace('"model"', '"model":"x","model"'));
+  const decision = await decide(body);
+  assert.equal(decision.action, "block");
+  assert.deepEqual(decision.reasonCodes, ["media_duplicate_key"]);
+  assert.deepEqual(calls, { scanner: 0, privacy: 0, policy: 0 });
+});
+
+test("through the real proxy, text redacted after large images leaves with the original images, and the audit keeps only the text", async (t) => {
+  let forwarded;
+  const upstream = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    forwarded = Buffer.concat(chunks);
+    response.end("{}");
+  });
+  upstream.listen(0, "127.0.0.1");
+  await once(upstream, "listening");
+  t.after(() => new Promise((resolve) => upstream.close(resolve)));
+  const evidence = [];
+  const recorder = createShieldDecisionRecorder({ store: { recordEvent: (event, value) => evidence.push(value) } });
+  const scanned = [];
+  const email = "alice@example.invalid";
+  const daemon = await startDaemon({
+    config: { ...config, targetOrigin: `http://127.0.0.1:${upstream.address().port}` },
+    paths,
+    readPolicyBundle: async () => ({ bundle: {}, publicKey: "pinned-ed25519-public-key" }),
+    createDecisionRecorder: async () => recorder,
+    createScanner: async () => ({ version: "8.24.0", scan: async (body) => { scanned.push(Buffer.from(body)); return { findings: [] }; } }),
+    createPrivacy: async () => ({
+      version: "privacy-1",
+      async scan(body) {
+        scanned.push(Buffer.from(body));
+        const start = body.indexOf(email);
+        return { status: "ok", findings: [{ label: "email", count: 1 }], redactions: [{ label: "email", count: 1, spans: [{ start, end: start + email.length }] }], redactedBody: Buffer.from(body.toString("utf8").replace(email, "[EMAIL]")) };
+      },
+      close() {},
+    }),
+    loadPolicy: async () => ({
+      version: "2026.09.02.4",
+      detectorVersions: { gitleaks: "8.24.0", privacy: "privacy-1" },
+      async evaluate({ piiFindings }) { return piiFindings.length ? { action: "redact", reasonCodes: ["subscription-pii"], redactions: [] } : { action: "allow", reasonCodes: ["policy_allow"], redactions: [] }; },
+    }),
+    writePolicyState: async () => {},
+    writeIdentity: async () => {},
+  });
+  t.after(() => daemon.shield.close());
+  // Forty screenshots, past the decision cache's old 4 MiB body bound too; the email comes after them.
+  const images = bigBlocks(40);
+  const body = Buffer.from(JSON.stringify({ model: "claude-sonnet-5", messages: [{ role: "user", content: [...images, { type: "text", text: `mail ${email}` }] }] }));
+  assert.ok(body.length > 4 * 1024 * 1024);
+  const response = await fetch(`${daemon.shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield": config.capability, "content-type": "application/json" }, body });
+  assert.equal(response.status, 200);
+  assertSkeleton(scanned);
+  assert.deepEqual(forwarded, Buffer.from(body.toString("utf8").replace(email, "[EMAIL]")), "only the email changed on the way out");
+  assert.deepEqual(imagesIn(forwarded), images.map((block) => block.source));
+  assert.equal(evidence.length, 1);
+  assert.ok(evidence[0].originalText.includes(email) && evidence[0].redactedText.includes("[EMAIL]"));
+  assert.ok(evidence[0].originalText.length < 64 * 1024 && evidence[0].redactedText.length < 64 * 1024, "evidence stores the skeleton, not the payloads");
 });
 
 test("daemon publishes image coverage and republishes it when readiness settles", async () => {
