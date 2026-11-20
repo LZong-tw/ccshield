@@ -670,13 +670,14 @@ const pdfBlock = { type: "document", source: { type: "base64", media_type: "appl
 
 async function mediaDecide() {
   const calls = { scanner: 0, privacy: 0, policy: 0 };
+  const seen = [];
   let decide;
   await startDaemon({
     config,
     paths,
     readPolicyBundle: async () => ({ bundle: {}, publicKey: "pinned-ed25519-public-key" }),
-    createPrivacy: async () => ({ version: "privacy-1", async scan() { calls.privacy += 1; return { status: "ok", findings: [], redactions: [] }; }, close() {} }),
-    createScanner: async () => ({ version: "8.24.0", scan: async () => { calls.scanner += 1; return { findings: [] }; } }),
+    createPrivacy: async () => ({ version: "privacy-1", async scan(body) { calls.privacy += 1; seen.push(Buffer.from(body)); return { status: "ok", findings: [], redactions: [] }; }, close() {} }),
+    createScanner: async () => ({ version: "8.24.0", scan: async (body) => { calls.scanner += 1; seen.push(Buffer.from(body)); return { findings: [] }; } }),
     loadPolicy: async () => ({
       version: "2026.09.02.4",
       detectorVersions: { gitleaks: "8.24.0", privacy: "privacy-1" },
@@ -686,7 +687,7 @@ async function mediaDecide() {
     startProxy: async (options) => { decide = options.decide; return { origin: "http://127.0.0.1:8811", close: async () => {} }; },
     writeIdentity: async () => {},
   });
-  return { calls, decide: (body) => decide({ body }) };
+  return { calls, seen, decide: (body) => decide({ body }) };
 }
 
 test("daemon blocks a document before any scanner runs and marks the decision uncacheable", async () => {
@@ -714,9 +715,11 @@ test("daemon blocks an image it cannot inspect by source", async () => {
   assert.deepEqual(calls, { scanner: 0, privacy: 0, policy: 0 });
 });
 
-test("daemon forwards base64 images unscanned, still running the text pipeline, uncached", async () => {
-  const { calls, decide } = await mediaDecide();
-  const decision = await decide(mediaBody(pngBlock, pngBlock));
+test("daemon forwards base64 images unscanned through the normal text pipeline, uncached", async () => {
+  const { calls, seen, decide } = await mediaDecide();
+  const body = mediaBody(pngBlock, pngBlock);
+  const decision = await decide(body);
+  assert.ok(seen.length === 2 && seen.every((scanned) => scanned.equals(body)), "with no image worker the text scanners see the image payloads");
   assert.equal(decision.action, "allow");
   assert.equal(decision.noCache, true);
   assert.equal(decision.imageCount, 2);
@@ -994,14 +997,50 @@ test("a large screenshot history goes through the image worker as before; text d
   assert.equal(JSON.parse(decision.redactedBody.toString("utf8")).messages[0].content[0].text, "look");
 });
 
-test("a launch override with a large screenshot history forwards it unscanned and scans only the text", async () => {
+const textTooLarge = (error) => error?.shieldFailure?.stage === "body_read" && error.shieldFailure.reason === "text_too_large";
+
+test("images no worker inspects stay in the text budget: a launch override or no worker scans every payload as text", async () => {
   const { calls, decide } = await imageDecide({ ready: false });
-  const decision = await decide(mediaBody(...bigBlocks(9)), { allowUnscannedImages: true });
+  const small = mediaBody(...bigBlocks(2));
+  const decision = await decide(small, { allowUnscannedImages: true });
   assert.equal(calls.inspect.length, 0);
   assert.equal(decision.action, "allow");
   assert.equal(decision.mediaOutcome, "unscanned_override");
   assert.equal(Object.hasOwn(decision, "redactedBody"), false, "the original body is what leaves");
-  assertSkeleton([...calls.scanner, ...calls.privacy]);
+  const scanned = [...calls.scanner, ...calls.privacy];
+  assert.ok(scanned.length === 2 && scanned.every((seen) => seen.equals(small)), "the text scanners see the image payloads");
+
+  await assert.rejects(decide(mediaBody(...bigBlocks(9)), { allowUnscannedImages: true }), textTooLarge);
+  const none = await mediaDecide();
+  await assert.rejects(none.decide(mediaBody(...bigBlocks(9))), textTooLarge);
+  assert.equal(calls.scanner.length + calls.privacy.length, 2, "an override over budget reaches no scanner");
+  assert.deepEqual(none.calls, { scanner: 0, privacy: 0, policy: 0 });
+});
+
+test("a history with more images than the inspector keeps cached blocks before the worker", async () => {
+  const { calls, decide } = await imageDecide();
+  const accepted = await decide(mediaBody(...bigBlocks(32)));
+  assert.equal(accepted.mediaOutcome, "scanned");
+  const decision = await decide(mediaBody(...bigBlocks(33)));
+  assert.equal(decision.action, "block");
+  assert.deepEqual(decision.reasonCodes, ["media_image_limit_blocked"]);
+  assert.equal(decision.mediaOutcome, "blocked_source");
+  assert.equal(decision.noCache, true);
+  assert.equal(calls.inspect.length, 1, "the over-limit body never reaches the worker");
+  assert.equal(calls.scanner.length, 1);
+});
+
+test("stand-ins longer than tiny payloads cannot push the scanned text past the budget", async () => {
+  const { calls, decide } = await imageDecide();
+  const tiny = { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "/9j/" } };
+  const base = JSON.parse(mediaBody(...Array(32).fill(tiny)).toString("utf8"));
+  const pad = 1_048_576 - 100 - Buffer.byteLength(JSON.stringify(base));
+  base.messages[0].content[0].text += "x".repeat(pad);
+  const body = Buffer.from(JSON.stringify(base));
+  assert.equal(body.length, 1_048_476);
+  await assert.rejects(decide(body), textTooLarge);
+  assert.equal(calls.inspect.length, 1);
+  assert.equal(calls.scanner.length + calls.privacy.length, 0);
 });
 
 test("a duplicate key beside a large screenshot history blocks before any scanner", async () => {
@@ -1033,6 +1072,8 @@ test("through the real proxy, text redacted after large images leaves with the o
     paths,
     readPolicyBundle: async () => ({ bundle: {}, publicKey: "pinned-ed25519-public-key" }),
     createDecisionRecorder: async () => recorder,
+    readImageProvision: async () => ({ version: "image-0123456789ab", path: "/opt/w", sha256: "a".repeat(64) }),
+    createImageScanner: async () => ({ isReady: () => true, inspect: async (list) => list.map(({ bytes }) => ({ status: "ok", bytes, maskCount: 0, lowConfidenceMasked: 0, piiFindings: [] })), close() {} }),
     createScanner: async () => ({ version: "8.24.0", scan: async (body) => { scanned.push(Buffer.from(body)); return { findings: [] }; } }),
     createPrivacy: async () => ({
       version: "privacy-1",
@@ -1045,15 +1086,15 @@ test("through the real proxy, text redacted after large images leaves with the o
     }),
     loadPolicy: async () => ({
       version: "2026.09.02.4",
-      detectorVersions: { gitleaks: "8.24.0", privacy: "privacy-1" },
+      detectorVersions: imageVersions,
       async evaluate({ piiFindings }) { return piiFindings.length ? { action: "redact", reasonCodes: ["subscription-pii"], redactions: [] } : { action: "allow", reasonCodes: ["policy_allow"], redactions: [] }; },
     }),
     writePolicyState: async () => {},
     writeIdentity: async () => {},
   });
   t.after(() => daemon.shield.close());
-  // Forty screenshots, past the decision cache's old 4 MiB body bound too; the email comes after them.
-  const images = bigBlocks(40);
+  // Thirty-two screenshots, past the decision cache's old 4 MiB body bound too; the email comes after them.
+  const images = bigBlocks(32);
   const body = Buffer.from(JSON.stringify({ model: "claude-sonnet-5", messages: [{ role: "user", content: [...images, { type: "text", text: `mail ${email}` }] }] }));
   assert.ok(body.length > 4 * 1024 * 1024);
   const response = await fetch(`${daemon.shield.origin}/v1/messages`, { method: "POST", headers: { "x-airkit-shield": config.capability, "content-type": "application/json" }, body });
@@ -1063,7 +1104,10 @@ test("through the real proxy, text redacted after large images leaves with the o
   assert.deepEqual(imagesIn(forwarded), images.map((block) => block.source));
   assert.equal(evidence.length, 1);
   assert.ok(evidence[0].originalText.includes(email) && evidence[0].redactedText.includes("[EMAIL]"));
-  assert.ok(evidence[0].originalText.length < 64 * 1024 && evidence[0].redactedText.length < 64 * 1024, "evidence stores the skeleton, not the payloads");
+  assert.ok(evidence[0].originalText.length < 64 * 1024 && evidence[0].redactedText.length < 64 * 1024, "evidence stores the text, not the payloads");
+  const digests = images.map((block) => createHash("sha256").update(Buffer.from(block.source.data, "base64")).digest("hex"));
+  assert.deepEqual(imagesIn(Buffer.from(evidence[0].originalText)).map((source) => source.data), digests, "each image is recorded by its sha256");
+  assert.deepEqual(imagesIn(Buffer.from(evidence[0].redactedText)).map((source) => source.data), digests);
 });
 
 test("daemon publishes image coverage and republishes it when readiness settles", async () => {

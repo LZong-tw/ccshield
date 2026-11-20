@@ -13,7 +13,7 @@ import { loadShieldPolicy } from "./shield/policy.mjs";
 import { openPrivacyDetector } from "./shield/privacy-detector.mjs";
 import { createPrivacyFilter, isVerifiedRedaction } from "./shield/privacy.mjs";
 import { createFailureLog } from "./shield/failure-log.mjs";
-import { createShieldFailure as shieldFailure, startShieldProxy } from "./shield/proxy.mjs";
+import { INSPECTION_MAX_BYTES, createShieldFailure as shieldFailure, startShieldProxy } from "./shield/proxy.mjs";
 import { DOCUMENT_COVERAGE, extractMedia, imageSkeleton, mediaOutcomeFor, patchImages, restoreImages } from "./shield/media.mjs";
 import { createImageInspector } from "../shield-image/inspector.mjs";
 import { checkImageReadiness } from "../shield-image/readiness.mjs";
@@ -219,7 +219,11 @@ async function bootShieldDaemon(boot, {
       let imageSecrets = 0;
       let imagePii = [];
       let imageTransforms = 0;
-      if (images && media.images.length > 0 && !overridden) {
+      const inspectImages = images !== null && media.images.length > 0 && !overridden;
+      if (inspectImages && media.images.length > MAX_INSPECTED_IMAGES) {
+        return { ...shape({ action: "block", reasonCodes: ["media_image_limit_blocked"], transformCount: 0 }), mediaOutcome: mediaOutcomeFor(["media_image_limit_blocked"]) };
+      }
+      if (inspectImages) {
         if (!images.isReady()) {
           throw imageCoverage === "pending"
             ? shieldFailure("image_scan", "image_pending", "shield image worker is still starting", { retryAfterSeconds: 30 })
@@ -243,10 +247,13 @@ async function bootShieldDaemon(boot, {
         // The audit row reports what the worker did, not the pre-scan default.
         mediaFacts.mediaOutcome = imageSecrets > 0 ? "blocked_secret" : "scanned";
       }
-      // Images have their own path above, so the text detectors see the body with each image
-      // payload swapped for a stand-in; any text redaction is spliced back around the images.
-      const scanImages = scanBody === body ? media.images : extractMedia(scanBody).images;
+      // Images the worker inspected above leave the text budget: the text detectors see the body
+      // with each payload swapped for a stand-in, and any text redaction is spliced back around
+      // the images. Images nothing else inspects stay in the text, as every byte that leaves must
+      // pass some detector.
+      const scanImages = !inspectImages ? [] : scanBody === body ? media.images : extractMedia(scanBody).images;
       const textBody = scanImages.length > 0 ? imageSkeleton(scanBody, scanImages) : scanBody;
+      if (textBody.byteLength > INSPECTION_MAX_BYTES) throw shieldFailure("body_read", "text_too_large", "shield text inspection budget exceeded");
       const withImages = (redacted) => {
         if (scanImages.length === 0) return redacted;
         try { return restoreImages(redacted, scanImages); }
@@ -314,6 +321,7 @@ async function bootShieldDaemon(boot, {
       targetOrigin: config.targetOrigin,
       allowDestinationLeases: true,
       decide,
+      imagesInspected: images !== null,
       // Policy activation restarts this daemon after identity quiescence. This
       // cache is process-local, so no terminal decision survives that boundary.
       decisionCache: createCache(),
@@ -417,10 +425,15 @@ function withImageSecrets(findings, count) {
 }
 
 const IMAGE_TIMEOUT_MS = 60_000;
+// Every turn resends the whole history, so a body converges only when all of its
+// images stay cached between turns; the inspector's cache is FIFO and shared by
+// every session. Half the cache per body leaves room for a second session.
+export const IMAGE_CACHE_SIZE = 64;
+export const MAX_INSPECTED_IMAGES = IMAGE_CACHE_SIZE / 2;
 
 async function createDefaultImageScanner({ image, scanSecrets, scanPrivacy, context, onReadiness }) {
   const worker = createImageWorker({ path: image.path, sha256: image.sha256 });
-  const inspector = createImageInspector({ worker, scanSecrets, scanPrivacy, context, timeoutMs: IMAGE_TIMEOUT_MS });
+  const inspector = createImageInspector({ worker, scanSecrets, scanPrivacy, context, timeoutMs: IMAGE_TIMEOUT_MS, cacheSize: IMAGE_CACHE_SIZE });
   let state = { ready: false, reason: "pending" };
   // The first Vision request takes ~30 s; readiness runs in the background and
   // only image requests wait on it.

@@ -2,13 +2,13 @@ import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { readApprovalChannelRegistration, requestApprovalChannel } from "./approval-channel.mjs";
 import { classifyShieldRequest } from "./classify.mjs";
-import { extractMedia, imageSkeleton } from "./media.mjs";
+import { extractMedia, imageSkeleton, patchMedia } from "./media.mjs";
 import { isGraphFailureDetail } from "./protocol.mjs";
 
-// The text detectors inspect at most 1 MiB. Image payloads have their own
-// inspection path and do not count toward it, so the raw body may be as large
-// as the Messages API accepts.
-const INSPECTION_MAX_BYTES = 1_048_576;
+// The text detectors inspect at most 1 MiB. Image payloads the image worker
+// inspects do not count toward it, so the raw body may be as large as the
+// Messages API accepts; the daemon measures the exact text it scans.
+export const INSPECTION_MAX_BYTES = 1_048_576;
 const BODY_MAX_BYTES = 32 * 1024 * 1024;
 // Phase 5 transition: /_ccshield/ and x-ccshield-* are the new names; the
 // /_airkit/shield/ and x-airkit-shield* spellings stay accepted until Stage C.
@@ -19,7 +19,7 @@ const DIAGNOSTICS_PATH = DIAGNOSTICS_PATHS[0];
 const SHIELD_HEADER = /^x-(?:airkit-shield|ccshield)(?:-|$)/i;
 const FAILURE_REASONS = new Map([
   ["readiness", new Set(["not_ready", "readiness_failed"])],
-  ["body_read", new Set(["body_read_failed", "body_too_large"])],
+  ["body_read", new Set(["body_read_failed", "body_too_large", "text_too_large"])],
   ["evaluation", new Set(["evaluation_unavailable"])],
   ["media_scan", new Set(["media_scan_failed"])],
   ["image_scan", new Set(["image_pending", "image_unavailable", "image_timeout", "image_queue_full", "image_scan_unavailable", "image_splice_invalid"])],
@@ -72,7 +72,7 @@ const IMAGE_MESSAGES = Object.freeze({
 });
 const LAUNCH_ID = /^[a-f0-9]{32}$/;
 
-export async function startShieldProxy({ capability, controlCapability, targetOrigin, allowDestinationLeases = false, decide, decisionCache = null, decisionContext = null, approvalBroker = null, recordShieldDecision = null, onDecision = null, onImageOverrideChange = null, isReady = null, scanStats = null, scanTotals = null, onFailure = null, now = Date.now, port = 0 } = {}) {
+export async function startShieldProxy({ capability, controlCapability, targetOrigin, allowDestinationLeases = false, decide, decisionCache = null, decisionContext = null, approvalBroker = null, recordShieldDecision = null, onDecision = null, onImageOverrideChange = null, imagesInspected = false, isReady = null, scanStats = null, scanTotals = null, onFailure = null, now = Date.now, port = 0 } = {}) {
   assertCapability(capability);
   assertCapability(controlCapability);
   const target = targetOrigin === undefined && allowDestinationLeases ? null : assertFixedTarget(targetOrigin);
@@ -102,7 +102,7 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
   const failures = [];
   const readiness = { reason: null };
   const server = createServer((request, response) => {
-    void handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, expiredLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision: record, isReady, approvalChannels, imageOverrides, onImageOverrideChange, now, failures, readiness, onFailure, scanStats, scanTotals });
+    void handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, expiredLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision: record, isReady, approvalChannels, imageOverrides, onImageOverrideChange, imagesInspected: imagesInspected === true, now, failures, readiness, onFailure, scanStats, scanTotals });
   });
   await listenLoopback(server, port);
   const address = server.address();
@@ -116,7 +116,7 @@ export async function startShieldProxy({ capability, controlCapability, targetOr
   };
 }
 
-async function handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, expiredLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision, isReady, approvalChannels, imageOverrides, onImageOverrideChange, now, failures, readiness, onFailure, scanStats, scanTotals }) {
+async function handleShieldRequest({ request, response, capability, controlCapability, target, allowDestinationLeases, destinationLeases, expiredLeases, decide, decisionCache, decisionContext, approvalBroker, recordShieldDecision, isReady, approvalChannels, imageOverrides, onImageOverrideChange, imagesInspected, now, failures, readiness, onFailure, scanStats, scanTotals }) {
   const startedAt = Date.now();
   const fail = (stage, reason, bytes = 0, { cause, queuedMs, detail } = {}) =>
     recordFailure(failures, onFailure, { stage, reason, bytes, elapsedMs: Date.now() - startedAt, cause, queuedMs, detail, launchId: shieldHeader(request, "launch") });
@@ -314,8 +314,16 @@ async function handleShieldRequest({ request, response, capability, controlCapab
     await finish(response, { status: 503, code: "shield_unavailable" });
     return;
   }
-  if (inspection.tooLarge || textBytes(inspection.body) > INSPECTION_MAX_BYTES) {
+  if (inspection.tooLarge) {
     fail("body_read", "body_too_large", inspection.bytes);
+    await finish(response, { status: 403, code: "shield_blocked" });
+    return;
+  }
+  const launchId = shieldHeader(request, "launch");
+  const allowUnscannedImages = typeof launchId === "string" && imageOverrides.has(launchId);
+  // Image payloads leave the text budget only when the image worker will inspect them.
+  if (textBytes(inspection.body, imagesInspected && !allowUnscannedImages) > INSPECTION_MAX_BYTES) {
+    fail("body_read", "text_too_large", inspection.bytes);
     await finish(response, { status: 403, code: "shield_blocked" });
     return;
   }
@@ -323,8 +331,6 @@ async function handleShieldRequest({ request, response, capability, controlCapab
   if (lifecycle.signal.aborted) return;
   let decision;
   try {
-    const launchId = shieldHeader(request, "launch");
-    const allowUnscannedImages = typeof launchId === "string" && imageOverrides.has(launchId);
     const evaluate = async (signal = lifecycle.signal, detectorVersions) => await decide({ method: request.method ?? "GET", path, bytes: inspection.bytes, body: inspection.body, signal, launcherContext, allowUnscannedImages, ...(detectorVersions ? { detectorVersions } : {}) });
     decision = decisionCache === null || launcherContext !== null || allowUnscannedImages
       ? await evaluate()
@@ -336,6 +342,9 @@ async function handleShieldRequest({ request, response, capability, controlCapab
     else fail("evaluation", "evaluation_unavailable", inspection.bytes);
     if (isRefusal(failure)) {
       await refuse(response, failure.reason);
+    } else if (failure?.stage === "body_read") {
+      // The daemon measured the text it would scan and found it over budget: the same block as above.
+      await finish(response, { status: 403, code: "shield_blocked" });
     } else {
       await finish(response, { status: 503, code: "shield_unavailable", retryAfterSeconds: validRetryAfter(failure ?? {}), message: failure?.stage === "image_scan" ? IMAGE_MESSAGES[failure.reason] : undefined });
     }
@@ -708,18 +717,26 @@ function isLivenessProbe(method, contentLength) {
   return Number.isInteger(parsed) && parsed === 0;
 }
 
-// What the text detectors would see. Anything the media walk cannot vouch for
-// as an image counts in full, so a body that does not parse stays at 1 MiB.
-function textBytes(body) {
-  if (body.byteLength <= INSPECTION_MAX_BYTES) return body.byteLength;
-  try { return imageSkeleton(body, extractMedia(body).images).byteLength; } catch { return body.byteLength; }
+// A lower bound on what the text detectors will see, so an obvious overflow
+// stops here. Images count in full unless the worker inspects them, and so
+// does anything the media walk cannot vouch for. The daemon checks the exact
+// text it scans, which also catches stand-ins longer than tiny payloads.
+function textBytes(body, imagesExempt) {
+  if (!imagesExempt || body.byteLength <= INSPECTION_MAX_BYTES) return body.byteLength;
+  try {
+    const media = extractMedia(body);
+    return media.reasonCodes.length > 0 ? body.byteLength : imageSkeleton(body, media.images).byteLength;
+  } catch { return body.byteLength; }
 }
 
-// A redaction's evidence is the text it changed; image payloads would only
-// bloat the encrypted store, and their transforms are counted on the row.
+// A redaction's evidence is the text it changed. Each image payload is stored
+// as its sha256, so the row still says which image bytes came in and left.
 function evidenceText(body, decision) {
   if (!(decision?.imageCount > 0)) return body.toString("utf8");
-  try { return imageSkeleton(body, extractMedia(body).images).toString("utf8"); } catch { return body.toString("utf8"); }
+  try {
+    const { images } = extractMedia(body);
+    return patchMedia(body, images.map(({ rawOffset, rawLength, bytes }) => ({ rawOffset, rawLength, text: createHash("sha256").update(bytes).digest("hex") }))).toString("utf8");
+  } catch { return body.toString("utf8"); }
 }
 
 async function readInspection(request) {

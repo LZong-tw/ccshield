@@ -1,6 +1,6 @@
 const ACTIONS = new Set(["allow", "block", "require_approval", "redact"]);
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
-// Media decisions pass through validation but are never stored, so they may carry a full request body.
+// Media decisions pass through validation but are never stored (write refuses them), so they may carry a full request body.
 const MAX_UNCACHED_BODY_BYTES = 32 * 1024 * 1024;
 // The audit validates the media values; the cache only carries them.
 const MEDIA_FIELDS = ["noCache", "imageCount", "documentCount", "mediaOutcome"];
@@ -33,6 +33,7 @@ export function createDecisionCache({ clock = () => Date.now(), ttlMs = 30_000, 
   const write = (value) => {
     const key = keyFor(value);
     const decision = validateDecision(value);
+    if (decision.noCache === true) throw new TypeError("shield decision cache does not store an uncached decision");
     const now = clock();
     entries.delete(key);
     entries.set(key, { decision, expiresAt: now + ttlMs });

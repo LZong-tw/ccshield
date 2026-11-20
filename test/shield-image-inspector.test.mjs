@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { ImageInspectError, createImageInspector } from "../shield-image/inspector.mjs";
 import { buildSyntheticBody, findingsFromPrivacy, spanToCodePoints } from "../shield-image/synthetic.mjs";
+import { IMAGE_CACHE_SIZE, MAX_INSPECTED_IMAGES } from "../src/shieldd.mjs";
 import { png } from "./fixtures/image-corpus.mjs";
 
 const EMAIL = "alice@example.invalid";
@@ -184,6 +185,24 @@ test("history images resent after a restart do not count toward maxImages", asyn
   const results = await inspector(worker, { limits: { maxImages: 2 } }).inspect([...history, { bytes: img("n"), lastTurn: true }]);
   assert.equal(results.length, 6);
   assert.ok(results.every((result) => result.status === "ok"));
+});
+
+test("two sessions at the daemon's per-body image cap stay cached from one turn to the next", async () => {
+  const worker = fakeWorker({});
+  const shield = inspector(worker, { cacheSize: IMAGE_CACHE_SIZE });
+  const history = (tag, count = MAX_INSPECTED_IMAGES) => Array.from({ length: count }, (_, i) => ({ bytes: img(`${tag}${i}`), lastTurn: false }));
+  for (const tag of ["a", "b"]) await shield.inspect(history(tag));
+  const warm = worker.calls.length;
+  for (const tag of ["a", "b"]) await shield.inspect(history(tag));
+  assert.equal(worker.calls.length, warm, "the second turn of both sessions makes no worker call");
+
+  // Why the cap exists: one image past the cache and every turn rescans the whole history.
+  const thrashing = fakeWorker({});
+  const small = inspector(thrashing, { cacheSize: IMAGE_CACHE_SIZE });
+  await small.inspect(history("c", IMAGE_CACHE_SIZE + 1));
+  const first = thrashing.calls.length;
+  await small.inspect(history("c", IMAGE_CACHE_SIZE + 1));
+  assert.equal(thrashing.calls.length, 2 * first);
 });
 
 test("the queue deadline and the pending cap fail closed", async () => {

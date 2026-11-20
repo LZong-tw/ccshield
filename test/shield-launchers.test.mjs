@@ -130,6 +130,18 @@ test("decision cache reuses only exact terminal retry metadata and invalidates t
   assert.equal(expired.source, "evaluated");
 });
 
+test("decision cache refuses to store an uncached media decision, whatever its body size", () => {
+  const cache = createDecisionCache();
+  const decision = {
+    body: Buffer.alloc(1), action: "redact", detectorVersions: { Gitleaks: "1" }, destinationClass: "subscription", lane: "subscription",
+    policyVersion: "policy-1", requestDigest: "a".repeat(64), reasonCodes: ["pii_redacted"], transformCount: 1,
+    noCache: true, imageCount: 1, documentCount: 0, mediaOutcome: "scanned",
+  };
+  assert.throws(() => cache.set(decision), /does not store an uncached decision/);
+  assert.throws(() => cache.set({ ...decision, body: Buffer.alloc(8 * 1024 * 1024) }), TypeError);
+  assert.throws(() => cache.set({ ...decision, noCache: false, body: Buffer.alloc(4 * 1024 * 1024 + 1) }), /transformed body is invalid/);
+});
+
 test("decision cache atomically identifies concurrent exact retry provenance without retaining request input", async () => {
   const cache = createDecisionCache();
   const key = {
